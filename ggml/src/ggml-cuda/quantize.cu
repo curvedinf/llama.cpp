@@ -361,7 +361,7 @@ static __global__ void quantize_mmq_q8_1(
         return;
     }
 
-    const float d = 1.0f / d_inv;
+    const float d = amax * (1.0f/127.0f);
 
     if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
         y[ib].ds4[iqs/32] = make_half2(d, sum);

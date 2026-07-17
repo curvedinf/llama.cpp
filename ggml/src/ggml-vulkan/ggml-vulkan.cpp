@@ -16793,14 +16793,18 @@ static void ggml_vk_replay_graph_cache(ggml_backend_vk_context * ctx, const vk_g
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
+        // descriptor updates are batched into one driver call per chunk; they only need
+        // to be complete before the chunk is submitted, not before commands are recorded
+        std::vector<vk::WriteDescriptorSet> writes;
+        writes.reserve(chunk.n_ops);
+
         for (uint32_t i = 0; i < chunk.n_ops; i++, op_idx++) {
             const vk_graph_cache_op &op = entry->ops[op_idx];
             switch (op.kind) {
             case vk_graph_cache_op::kind_t::DISPATCH: {
                 GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
                 vk::DescriptorSet &descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
-                vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, op.n_descriptors, vk::DescriptorType::eStorageBuffer, nullptr, op.descriptors.data() };
-                ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+                writes.emplace_back(descriptor_set, 0, 0, op.n_descriptors, vk::DescriptorType::eStorageBuffer, nullptr, op.descriptors.data());
                 compute_ctx->s->buffer->buf.pushConstants(op.pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, (uint32_t)op.push_constants.size(), op.push_constants.data());
                 compute_ctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, op.pipeline->pipeline);
                 compute_ctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, op.pipeline->layout, 0, { descriptor_set }, {});
@@ -16820,6 +16824,10 @@ static void ggml_vk_replay_graph_cache(ggml_backend_vk_context * ctx, const vk_g
                 deferred_memset(op.memset_ptr, op.memset_value, op.memset_size, &compute_ctx->memsets);
                 break;
             }
+        }
+
+        if (!writes.empty()) {
+            ctx->device->device.updateDescriptorSets(writes, {});
         }
 
         // end and submit the chunk, mirroring ggml_vk_compute_forward

@@ -409,6 +409,118 @@ ggml_backend_dev_t llama_memory_recurrent::state_device() const {
     return nullptr;
 }
 
+// block layout of the rows of one state tensor type (r_l or s_l) within a snapshot blob:
+// the rows of all layers are stored densely, in layer order
+struct llama_rs_row_block {
+    int    first  = -1; // first layer with a tensor
+    int    n      = 0;  // number of layers with a tensor
+    size_t rb     = 0;  // bytes per row
+    size_t stride = 0;  // byte stride between consecutive tensors (0 = non-uniform, copy per layer)
+};
+
+static llama_rs_row_block llama_rs_row_block_layout(const std::vector<ggml_tensor *> & tensors, uint32_t n_layer) {
+    llama_rs_row_block res;
+
+    int prev = -1;
+
+    bool uniform = true;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const auto * t = tensors[il];
+        if (!t) {
+            continue;
+        }
+
+        if (res.first < 0) {
+            res.first = il;
+            res.rb    = ggml_row_size(t->type, t->ne[0]);
+        } else {
+            if (ggml_row_size(t->type, t->ne[0]) != res.rb || t->buffer != tensors[res.first]->buffer) {
+                uniform = false;
+            }
+        }
+
+        if (prev >= 0 && uniform) {
+            const size_t s = (const uint8_t *) t->data - (const uint8_t *) tensors[prev]->data;
+            if (res.stride == 0) {
+                res.stride = s;
+            } else if (res.stride != s) {
+                uniform = false;
+            }
+        }
+
+        prev = il;
+
+        res.n++;
+    }
+
+    if (!uniform) {
+        res.stride = 0;
+    }
+
+    return res;
+}
+
+// copy `n` rows of `rb` bytes into/out of the state tensors of one type
+// is_get: device -> blob, else blob -> device
+static void llama_rs_row_block_copy(
+        ggml_backend_t backend,
+        const std::vector<ggml_tensor *> & tensors,
+        const llama_rs_row_block & blk,
+        uint32_t row,
+        uint8_t * data,
+        bool is_get) {
+    if (blk.n == 0) {
+        return;
+    }
+
+    if (blk.stride != 0) {
+        // the tensors are uniformly strided within the same buffer - issue a single
+        // strided copy spanning all of them; the 2d copy api bounds-checks against the
+        // anchor tensor's size, so use a synthetic tensor that covers the whole span
+        const auto * anchor = tensors[blk.first];
+
+        const size_t span = row*blk.rb + (blk.n - 1)*blk.stride + blk.rb;
+
+        ggml_tensor t_span = {};
+
+        t_span.type   = GGML_TYPE_I8;
+        t_span.buffer = anchor->buffer;
+        t_span.data   = anchor->data;
+
+        t_span.ne[0] = span;
+        t_span.ne[1] = 1;
+        t_span.ne[2] = 1;
+        t_span.ne[3] = 1;
+
+        t_span.nb[0] = 1;
+        t_span.nb[1] = span;
+        t_span.nb[2] = span;
+        t_span.nb[3] = span;
+
+        if (is_get) {
+            ggml_backend_tensor_get_2d_async(backend, &t_span, data, row*blk.rb, blk.rb, blk.n, blk.stride, blk.rb);
+        } else {
+            ggml_backend_tensor_set_2d_async(backend, &t_span, data, row*blk.rb, blk.rb, blk.n, blk.stride, blk.rb);
+        }
+        return;
+    }
+
+    // non-uniform layout - copy per layer
+    int i = 0;
+    for (size_t il = 0; il < tensors.size(); ++il) {
+        if (!tensors[il]) {
+            continue;
+        }
+        if (is_get) {
+            ggml_backend_tensor_get_async(backend, tensors[il], data + i*blk.rb, row*blk.rb, blk.rb);
+        } else {
+            ggml_backend_tensor_set(tensors[il], data + i*blk.rb, row*blk.rb, blk.rb);
+        }
+        i++;
+    }
+}
+
 bool llama_memory_recurrent::snapshot_prefix_state(ggml_backend_t backend, llama_seq_id seq_id, ggml_backend_buffer_ptr & out_buf, size_t & out_size) const {
     if (backend == nullptr) {
         return false;
@@ -433,16 +545,11 @@ bool llama_memory_recurrent::snapshot_prefix_state(ggml_backend_t backend, llama
 
     const uint32_t n_layer = hparams.n_layer();
 
-    size_t total = 0;
+    // blob layout: rows of all r tensors (layer order), then rows of all s tensors
+    const auto blk_r = llama_rs_row_block_layout(r_l, n_layer);
+    const auto blk_s = llama_rs_row_block_layout(s_l, n_layer);
 
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il]) {
-            total += ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-        }
-        if (s_l[il]) {
-            total += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-        }
-    }
+    const size_t total = blk_r.n*blk_r.rb + blk_s.n*blk_s.rb;
 
     auto * dev = state_device();
     if (dev == nullptr) {
@@ -458,18 +565,9 @@ bool llama_memory_recurrent::snapshot_prefix_state(ggml_backend_t backend, llama
 
     uint8_t * dst = (uint8_t *) ggml_backend_buffer_get_base(out_buf.get());
 
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il]) {
-            const size_t rb = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-            ggml_backend_tensor_get_async(backend, r_l[il], dst, row*rb, rb);
-            dst += rb;
-        }
-        if (s_l[il]) {
-            const size_t rb = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-            ggml_backend_tensor_get_async(backend, s_l[il], dst, row*rb, rb);
-            dst += rb;
-        }
-    }
+    // one strided copy per tensor type (falls back to per-layer copies if the layout is not uniform)
+    llama_rs_row_block_copy(backend, r_l, blk_r, row, dst,                    /*is_get=*/true);
+    llama_rs_row_block_copy(backend, s_l, blk_s, row, dst + blk_r.n*blk_r.rb, /*is_get=*/true);
 
     return true;
 }
@@ -486,16 +584,10 @@ bool llama_memory_recurrent::restore_prefix_state(ggml_backend_t backend, llama_
 
     const uint32_t n_layer = hparams.n_layer();
 
-    size_t total = 0;
+    const auto blk_r = llama_rs_row_block_layout(r_l, n_layer);
+    const auto blk_s = llama_rs_row_block_layout(s_l, n_layer);
 
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il]) {
-            total += ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-        }
-        if (s_l[il]) {
-            total += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-        }
-    }
+    const size_t total = blk_r.n*blk_r.rb + blk_s.n*blk_s.rb;
 
     if (total != data_size) {
         return false;
@@ -521,18 +613,31 @@ bool llama_memory_recurrent::restore_prefix_state(ggml_backend_t backend, llama_
         ggml_backend_synchronize(backend);
     }
 
-    const uint8_t * src = data;
+    uint8_t * src = (uint8_t *) data;
 
-    for (uint32_t il = 0; il < n_layer; ++il) {
-        if (r_l[il]) {
-            const size_t rb = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-            ggml_backend_tensor_set(r_l[il], src, e*rb, rb);
-            src += rb;
+    if (backend != nullptr) {
+        llama_rs_row_block_copy(backend, r_l, blk_r, e, src,                    /*is_get=*/false);
+        llama_rs_row_block_copy(backend, s_l, blk_s, e, src + blk_r.n*blk_r.rb, /*is_get=*/false);
+
+        ggml_backend_synchronize(backend);
+    } else {
+        // no backend handle - per-layer synchronous copies
+        int i = 0;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (r_l[il]) {
+                ggml_backend_tensor_set(r_l[il], src + i*blk_r.rb, e*blk_r.rb, blk_r.rb);
+                i++;
+            }
         }
-        if (s_l[il]) {
-            const size_t rb = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-            ggml_backend_tensor_set(s_l[il], src, e*rb, rb);
-            src += rb;
+
+        src += blk_r.n*blk_r.rb;
+
+        i = 0;
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (s_l[il]) {
+                ggml_backend_tensor_set(s_l[il], src + i*blk_s.rb, e*blk_s.rb, blk_s.rb);
+                i++;
+            }
         }
     }
 

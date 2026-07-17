@@ -24,6 +24,14 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | 0dc74e3 | upstream reference (`build` dir, pre block-pool) | 17295.12 | 1315.89 | - | measured |
 | 2026-07-17 | 1ed3129 | HEAD baseline ("initial stable build of block pool kv") | 16318.88 | 968.89 | PP -5.6%, TG -26.4% vs upstream | measured |
 | 2026-07-17 | this | async recurrent prefix state snapshots | 15790.55 | 1237.40 | TG +27.7%, PP -3.2% vs 1ed3129 | committed |
+| 2026-07-17 | aa5a59f | (debug) fix GGML_VK_PERF_LOGGER assert with pending async copies | - | - | tooling only | committed |
+| 2026-07-17 | this | strided 2D snapshot copies (38 -> 2 per snapshot) | 15976.04 | 1262.97 | TG +2.1%, PP +1.2% vs prev | committed |
+
+Reference points for remaining prefix-machinery cost (same build, env toggles):
+- `LLAMA_PREFIX_CACHE_DISABLE=1`: PP 16765.07, TG 1367.39
+- snapshots off, chains/blocks on (experiment): PP 16736.91, TG 1364.79
+=> all of the remaining prefix cost is the state snapshot readback (~19 MB x
+   ~528 pinned-buffer D2H snapshots per run); chain feeding is free.
 
 ## Findings
 

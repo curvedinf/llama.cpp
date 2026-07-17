@@ -16909,7 +16909,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // flush any pending async copies (e.g. input or snapshot readbacks) so the
+        // timestamped command buffer starts from a clean state
+        if (!ctx->compute_ctx.expired()) {
+            ggml_vk_synchronize(ctx);
+        }
+
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);

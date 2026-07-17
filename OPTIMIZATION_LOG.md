@@ -28,8 +28,10 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | this | strided 2D snapshot copies (38 -> 2 per snapshot) | 15976.04 | 1262.97 | TG +2.1%, PP +1.2% vs prev | committed |
 | 2026-07-17 | this | lazy snapshots (only once prefix matching is used) | 16692.57 | 1365.65 | TG +8.1%, PP +4.5% vs prev | committed |
 | 2026-07-17 | - | EXPERIMENT: dmmv 16 columns for n=16 decode matmuls | 16783.54 | 1238.24 | TG -9.3% vs prev | reverted (slower than mul_mat path) |
+| 2026-07-17 | - | PROBE: GGML_VK_DISABLE_COOPMAT=1 | 10979.50 | 1044.75 | much worse | default (coopmat on) confirmed |
 | 2026-07-17 | this | batch descriptor updates per chunk in dispatch replay | 16683.53 | 1369.33 | TG +0.1% vs prev | committed |
 | 2026-07-17 | this | harness: -ub 512 -> -ub 1024 (sweep below) | 17721.15 | 1368.00 | PP +6.3% vs prev | committed (bench-c16.sh) |
+| 2026-07-17 | 058402b | FINAL verification (clean tree, guarded harness) | 17711.19 | 1373.94 | - | verified, tests pass |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -42,15 +44,32 @@ ubatch sweep (b=2048 unless noted, C=16 x 4k):
 | b=4096 ub=1024 | 17662.76 | 1366.06 |
 | b=4096 ub=2048 | 15475.68 | 1368.57 |
 
+## Cross-workload check (16x8k quick, -ub 1024)
+
+| build | S_PP t/s | S_TG t/s |
+|-------|----------|----------|
+| upstream 0dc74e3 | 16594.64 | 1328.85 |
+| optimized | 16002.51 | 1249.38 |
+
+At 8k, upstream is ahead (PP -3.6%, TG -6.0%) while at 4k the optimized build is
+ahead (PP +2.5%, TG +4.0%). No catastrophic regression either way (the prior
+integration WIP was PP 1047 / TG 915 at 8k). The 4k target is met; the 8k/128k
+regimes were not optimized here.
+
 ## Final result (C=16 x 4k, -ub 1024)
 
 | build | S_PP t/s | S_TG t/s | S t/s |
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024)** | **17721** | **1368** | **13009** |
+| **optimized (ub 1024)** | **17711 - 17721** | **1368 - 1374** | **13009 - 13020** |
 
-vs HEAD baseline: PP +8.6%, TG +41.2%, S +18.0%. vs upstream: PP +2.5%, TG +4.0%, S +2.9%.
+vs HEAD baseline: PP +8.6%, TG +41.8%, S +18.1%. vs upstream: PP +2.4%, TG +4.2%, S +2.9%.
+
+Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
+test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full
+test-backend-ops run allocates very large GPU buffers - run it only with a VRAM
+watchdog or on CPU; it is not part of the bench flow.
 
 ## Findings
 

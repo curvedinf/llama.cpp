@@ -27,12 +27,25 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | aa5a59f | (debug) fix GGML_VK_PERF_LOGGER assert with pending async copies | - | - | tooling only | committed |
 | 2026-07-17 | this | strided 2D snapshot copies (38 -> 2 per snapshot) | 15976.04 | 1262.97 | TG +2.1%, PP +1.2% vs prev | committed |
 | 2026-07-17 | this | lazy snapshots (only once prefix matching is used) | 16692.57 | 1365.65 | TG +8.1%, PP +4.5% vs prev | committed |
+| 2026-07-17 | - | EXPERIMENT: dmmv 16 columns for n=16 decode matmuls | 16783.54 | 1238.24 | TG -9.3% vs prev | reverted (slower than mul_mat path) |
+| 2026-07-17 | this | batch descriptor updates per chunk in dispatch replay | 16683.53 | 1369.33 | TG +0.1% vs prev | committed |
+| 2026-07-17 | 37e04f1 | FINAL (verification runs) | 16740.53 / 16677.15 | 1365.94 / 1363.09 | - | verified, tests pass |
 
 Reference points for remaining prefix-machinery cost (same build, env toggles):
 - `LLAMA_PREFIX_CACHE_DISABLE=1`: PP 16765.07, TG 1367.39
 - snapshots off, chains/blocks on (experiment): PP 16736.91, TG 1364.79
 => all of the remaining prefix cost is the state snapshot readback (~19 MB x
    ~528 pinned-buffer D2H snapshots per run); chain feeding is free.
+
+## Final result (C=16 x 4k)
+
+| build | S_PP t/s | S_TG t/s | S t/s |
+|-------|----------|----------|-------|
+| upstream 0dc74e3 | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
+| HEAD baseline 1ed3129 | 16318 | 968 | 11025 |
+| **optimized (37e04f1)** | **16677 - 16740** | **1363 - 1369** | **12441 - 12482** |
+
+vs HEAD baseline: PP +2.4%, TG +40.8%. vs upstream: PP -3.5%, TG +3.8%.
 
 ## Findings
 
@@ -51,9 +64,36 @@ Reference points for remaining prefix-machinery cost (same build, env toggles):
   synchronizes the backend first (rare path). Snapshot cost dropped to ~1 ms
   per snapshot (mostly the pinned allocation).
   Result: TG 968.89 -> 1237.40 t/s (+27.7%).
+- Snapshot readback batched: per-type state tensors are uniformly strided in one
+  buffer, so 38 copies/barriers became 2 strided 2D copies (synthetic span tensor
+  to satisfy the 2D api bounds check). TG +2.1%.
+- Snapshots made lazy: they are pure overhead for workloads that never match
+  prefixes. Now taken only after the first prefix_match/prefix_copy. TG +8.1%.
+- Decode is dispatch-rate limited: ~640 graph nodes per step at C=16, GPU per
+  step ~10 ms, CPU per step ~0.65 ms (submit/replay ~0.45 ms of it). Barriers
+  per run: 2959 (HEAD, merged-range barriers) vs 5645 (upstream).
+- dmmv (dequant-mul-mat-vec) extended to 16 columns was SLOWER than the mul_mat
+  path at n=16 (-9.3% TG) - serialized per-op timings (GGML_VK_PERF_LOGGER)
+  mislead; wall-clock is the arbiter. Reverted.
+- PP residual gap to upstream (-3.5%): decomposes into ~1.4% op-sum difference
+  (matmuls +2.8% on some shapes, GATED_DELTA_NET_IDX vs GDN +7 ms over 128
+  ubatches) and ~1-2% graph-optimizer effectiveness difference (opt on/off:
+  upstream gains +3.7% from graph-opt, HEAD +1.4%; ggml_vk_graph_optimize is
+  byte-identical - the different graph composition changes fusion/sort outcomes).
 - HEAD adds two cache layers: llama-level graph cache (`LLAMA_GRAPH_CACHE_SIZE`,
   default 8) and a Vulkan dispatch cache (record/replay of the command stream,
   `GGML_VK_DISABLE_DISPATCH_CACHE=1` to disable).
-- Bug: `GGML_VK_PERF_LOGGER=1` aborts in HEAD at
-  `ggml-vulkan.cpp:16912` (`GGML_ASSERT(ctx->compute_ctx.expired())`); upstream
-  is fine. Debug-only path, but it blocks per-op GPU profiling of HEAD.
+- Fixed (aa5a59f): `GGML_VK_PERF_LOGGER=1` aborted in HEAD at graph compute entry
+  when async copies were pending; now flushes first.
+
+## Future directions (not done)
+
+- Direct GDN state write-back into the store ring rows (skip the gdn_out
+  snapshot + 18 x 16 MB ggml_cpy per step, ~0.6-1 ms/step): needs the recurrent
+  store sized >= 2 x n_seq_max rows (currently n_seq_max = 16, so every row
+  aliases a read row every step and in-kernel writes would race between
+  workgroups). Requires a memory sizing policy change.
+- Fewer/larger kernels per step (fusion of the delta-net elementwise chains);
+  ~420 of the ~640 nodes per step are small elementwise/copy ops.
+- MTP speculative decoding is out of scope for this harness but is the natural
+  big lever for this model family.

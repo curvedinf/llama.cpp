@@ -3223,6 +3223,39 @@ private:
                                 n_past = 0;
                             }
 
+                            // reuse a block-aligned prefix cached from other sequences (e.g. a
+                            //   shared system prompt) via the KV block prefix cache
+                            bool did_prefix_copy = false;
+
+                            if (slot.task->params.cache_prompt &&
+                                slot.prompt.tokens.empty() &&
+                                !slot.prompt.tokens.has_mtmd &&
+                                !input_tokens.has_mtmd &&
+                                ctx_dft == nullptr) {
+                                const auto & prompt_tokens = input_tokens.get_tokens();
+
+                                // note: query one token short so that at least one token is
+                                //   always left to process [TAG_PROMPT_LOGITS]
+                                const auto pm = llama_memory_prefix_match(ctx_tgt, prompt_tokens.data(), (int32_t) prompt_tokens.size() - 1);
+
+                                if (pm.handle != 0) {
+                                    if ((int32_t) pm.n_tokens > n_past) {
+                                        if (llama_memory_prefix_copy(ctx_tgt, slot.id, pm.handle)) {
+                                            slot.prompt.tokens.insert(llama_tokens(prompt_tokens.begin(), prompt_tokens.begin() + pm.n_tokens));
+
+                                            n_past = pm.n_tokens;
+
+                                            did_prefix_copy = true;
+
+                                            SLT_INF(slot, "reused %d tokens via prefix cache\n", pm.n_tokens);
+                                        }
+                                        // note: the handle is consumed by llama_memory_prefix_copy either way
+                                    } else {
+                                        llama_memory_prefix_release(ctx_tgt, pm.handle);
+                                    }
+                                }
+                            }
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3281,7 +3314,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min >= pos_min_thold && !did_prefix_copy) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),

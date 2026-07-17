@@ -1206,6 +1206,22 @@ struct llm_graph_context {
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
 
+    // split variants of build_rs for consumers that read the state store in place
+    // (indexed GDN) instead of through a gathered copy:
+    // - build_rs_store_zero clears the scratch state row, must run before the store is read
+    // - build_rs_store_extra stages the extra states (n_seqs .. n_rs), must run after the
+    //   store is read since read rows can alias the copy destinations
+    void build_rs_store_zero(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size) const;
+
+    void build_rs_store_extra(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
+
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,
         const llama_ubatch & ubatch,

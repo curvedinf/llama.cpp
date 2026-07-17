@@ -361,9 +361,22 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    const char * LLAMA_PREFIX_CACHE_DISABLE = getenv("LLAMA_PREFIX_CACHE_DISABLE");
+    prefix_enabled = LLAMA_PREFIX_CACHE_DISABLE ? !atoi(LLAMA_PREFIX_CACHE_DISABLE) : true;
+
+    chains.resize(LLAMA_MAX_SEQ);
 }
 
 void llama_kv_cache::clear(bool data) {
+    prefix.clear();
+
+    for (auto & chain : chains) {
+        chain.reset();
+    }
+
+    inflight_valid = false;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -393,46 +406,29 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
+        // registered blocks are retained by the pinned cells - only the token chain is affected
+        chains[seq_id].truncate(p0);
+
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        uint32_t new_head = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-            }
-        }
+        const uint32_t new_head = cells.seq_rm_range(seq_id, p0, p1);
 
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
     } else {
-        // match any sequence
+        // match any sequence - hard removal, the registered blocks are unregistered first
         for (uint32_t s = 0; s < n_stream; ++s) {
+            std::vector<llama_prefix_cache::loc_t> locs;
+            prefix.remove_range(s, p0, p1, locs);
+            prefix_unregister(locs);
+
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
 
-            uint32_t new_head = cells.size();
-
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1)) {
-                    continue;
-                }
-
-                cells.rm(i);
-
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-            }
+            const uint32_t new_head = cells.rm_range(p0, p1);
 
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
@@ -466,6 +462,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             return;
         }
 
+        // the destination sequence sees the same tokens - it can share the token chain
+        chains[seq_id_dst] = chains[seq_id_src];
+
         if (p0 < 0) {
             p0 = 0;
         }
@@ -474,13 +473,19 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             p1 = std::numeric_limits<llama_pos>::max();
         }
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
+        for (uint32_t b = cells.block_lo(); b < cells.block_hi(); ++b) {
+            if (cells.block_is_free(b) || cells.block_pos_max(b) < p0 || cells.block_pos_min(b) >= p1) {
                 continue;
             }
 
-            if (cells.seq_has(i, seq_id_src)) {
-                cells.seq_add(i, seq_id_dst);
+            for (uint32_t i = cells.cell_begin(b); i < cells.cell_end(b); ++i) {
+                if (!cells.pos_in(i, p0, p1)) {
+                    continue;
+                }
+
+                if (cells.seq_has(i, seq_id_src)) {
+                    cells.seq_add(i, seq_id_dst);
+                }
             }
         }
 
@@ -501,17 +506,37 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
+    // the destination stream is fully reset - unregister its cached blocks first
+    {
+        std::vector<llama_prefix_cache::loc_t> locs;
+        prefix.remove_stream(s1, locs);
+        prefix_unregister(locs);
+    }
+
+    chains[seq_id_dst].reset();
+
     // enqueue the copy operation - the buffer copy will be performed during the next update
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
     v_cells[s1].reset();
-    for (uint32_t i = 0; i < v_cells[s0].size(); ++i) {
-        if (v_cells[s0].seq_has(i, seq_id_src)) {
-            llama_pos pos   = v_cells[s0].pos_get(i);
-            llama_pos shift = v_cells[s0].get_shift(i);
 
-            llama_kv_cell_ext ext = v_cells[s0].ext_get(i);
+    const auto & cells_src = v_cells[s0];
+
+    for (uint32_t b = cells_src.block_lo(); b < cells_src.block_hi(); ++b) {
+        if (cells_src.block_is_free(b)) {
+            continue;
+        }
+
+        for (uint32_t i = cells_src.cell_begin(b); i < cells_src.cell_end(b); ++i) {
+            if (!cells_src.seq_has(i, seq_id_src)) {
+                continue;
+            }
+
+            llama_pos pos   = cells_src.pos_get(i);
+            llama_pos shift = cells_src.get_shift(i);
+
+            llama_kv_cell_ext ext = cells_src.ext_get(i);
 
             if (shift != 0) {
                 pos -= shift;
@@ -544,18 +569,26 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    auto & head  = v_heads[seq_to_stream[seq_id]];
+    const uint32_t strm = seq_to_stream[seq_id];
 
-    uint32_t new_head = cells.size();
+    // cells of other sequences in the stream are removed - conservatively drop all
+    //   cached blocks of the stream, since they may become partially filled
+    {
+        std::vector<llama_prefix_cache::loc_t> locs;
+        prefix.remove_stream(strm, locs);
+        prefix_unregister(locs);
+    }
 
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.seq_keep(i, seq_id)) {
-            if (new_head == cells.size()) {
-                new_head = i;
-            }
+    for (llama_seq_id s = 0; s < (llama_seq_id) chains.size(); ++s) {
+        if (s != seq_id && s < (llama_seq_id) seq_to_stream.size() && seq_to_stream[s] == strm) {
+            chains[s].reset();
         }
     }
+
+    auto & cells = v_cells[strm];
+    auto & head  = v_heads[strm];
+
+    const uint32_t new_head = cells.seq_keep_all(seq_id);
 
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
@@ -594,15 +627,30 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (!cells.pos_in(i, p0, p1)) {
+    // shifted cells change positions - drop the affected cached blocks and the token chain
+    {
+        std::vector<llama_prefix_cache::loc_t> locs;
+        prefix.remove_range(seq_to_stream[seq_id], p0, p1, locs);
+        prefix_unregister(locs);
+    }
+
+    chains[seq_id].kill();
+
+    for (uint32_t b = cells.block_lo(); b < cells.block_hi(); ++b) {
+        if (cells.block_is_free(b) || cells.block_pos_max(b) < p0 || cells.block_pos_min(b) >= p1) {
             continue;
         }
 
-        if (cells.seq_has(i, seq_id)) {
-            if (cells.pos_add(i, shift)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
+        for (uint32_t i = cells.cell_begin(b); i < cells.cell_end(b); ++i) {
+            if (!cells.pos_in(i, p0, p1)) {
+                continue;
+            }
+
+            if (cells.seq_has(i, seq_id)) {
+                if (cells.pos_add(i, shift)) {
+                    if (new_head == cells.size()) {
+                        new_head = i;
+                    }
                 }
             }
         }
@@ -641,13 +689,28 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (!cells.pos_in(i, p0, p1)) {
+    // divided cells change positions - drop the affected cached blocks and the token chain
+    {
+        std::vector<llama_prefix_cache::loc_t> locs;
+        prefix.remove_range(seq_to_stream[seq_id], p0, p1, locs);
+        prefix_unregister(locs);
+    }
+
+    chains[seq_id].kill();
+
+    for (uint32_t b = cells.block_lo(); b < cells.block_hi(); ++b) {
+        if (cells.block_is_free(b) || cells.block_pos_max(b) < p0 || cells.block_pos_min(b) >= p1) {
             continue;
         }
 
-        if (cells.seq_has(i, seq_id)) {
-            cells.pos_div(i, d);
+        for (uint32_t i = cells.cell_begin(b); i < cells.cell_end(b); ++i) {
+            if (!cells.pos_in(i, p0, p1)) {
+                continue;
+            }
+
+            if (cells.seq_has(i, seq_id)) {
+                cells.pos_div(i, d);
+            }
         }
     }
 }
@@ -762,7 +825,23 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     for (const auto & ubatch : ubatches) {
         // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
+        auto sinfo_new = find_slot(ubatch, false);
+
+        // on allocation pressure, evict unreferenced cached prefix blocks (LRU) and retry
+        while (sinfo_new.empty()) {
+            bool progress = false;
+
+            for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                progress = progress || prefix_evict_one(seq_to_stream[ubatch.seq_id_unq[s]]);
+            }
+
+            if (!progress) {
+                break;
+            }
+
+            sinfo_new = find_slot(ubatch, false);
+        }
+
         if (sinfo_new.empty()) {
             success = false;
             break;
@@ -891,6 +970,426 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     return updated;
 }
 
+//
+// prefix cache
+//
+
+llama_prefix_match llama_kv_cache::prefix_match(const llama_token * tokens, int32_t n_tokens) {
+    uint64_t handle = 0;
+
+    llama_prefix_match res { prefix_match_ex(tokens, n_tokens, false, handle), handle };
+
+    return res;
+}
+
+uint32_t llama_kv_cache::prefix_match_ex(const llama_token * tokens, int32_t n_tokens, bool need_state, uint64_t & out_handle) {
+    out_handle = 0;
+
+    if (!prefix_enabled || other) {
+        return 0;
+    }
+
+    return prefix.match(tokens, n_tokens, need_state, out_handle);
+}
+
+bool llama_kv_cache::prefix_copy(llama_seq_id seq_id, uint64_t handle) {
+    const auto * hashes = prefix.handle_hashes(handle);
+
+    bool ok = false;
+
+    if (hashes && prefix_enabled && !other) {
+        ok = prefix_copy_impl(seq_id, *hashes);
+    }
+
+    prefix.release(handle);
+
+    return ok;
+}
+
+void llama_kv_cache::prefix_release(uint64_t handle) {
+    prefix.release(handle);
+}
+
+void llama_kv_cache::prefix_notify(const llama_ubatch & ubatch) {
+    std::vector<seq_end> ends;
+
+    prefix_notify_ex(ubatch, ends);
+}
+
+void llama_kv_cache::prefix_notify_ex(const llama_ubatch & ubatch, std::vector<seq_end> & out) {
+    if (!prefix_enabled || !inflight_valid) {
+        return;
+    }
+
+    inflight_valid = false;
+
+    // embedding-only ubatches carry no token ids
+    if (other || ubatch.token == nullptr) {
+        return;
+    }
+
+    const auto & sinfo = inflight_sinfo;
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const uint32_t strm = sinfo.strm[s];
+
+        auto & cells = v_cells[strm];
+
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t i = s*sinfo.size() + ii;
+
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+
+            auto & chain = chains[seq];
+
+            if (!chain.feed(ubatch.pos[i], ubatch.token[i])) {
+                continue;
+            }
+
+            // a full block was completed - register it if its cells are physically aligned
+            const uint32_t b = sinfo.idxs[s][ii]/llama_kv_cells::block_size;
+
+            if (!prefix_block_matches(cells, b, chain.last_p0)) {
+                continue;
+            }
+
+            const llama_prefix_cache::loc_t loc { strm, b, chain.last_p0 };
+
+            const auto res = prefix.insert(chain.last_hash, chain.last_tokens, loc);
+            if (res.second) {
+                cells.block_pin(b);
+            }
+        }
+    }
+
+    // report aligned sequence ends (used by hybrid memory for recurrent state snapshots)
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq = ubatch.seq_id_unq[s];
+
+        const auto & chain = chains[seq];
+
+        if (chain.next_pos <= 0 || chain.next_pos%(llama_pos) llama_prefix_cache::block_size != 0 || chain.hashes.empty()) {
+            continue;
+        }
+
+        seq_end end;
+
+        end.seq_id  = seq;
+        end.pos_end = chain.next_pos;
+        end.hash    = chain.last_hash;
+
+        memcpy(end.tokens, chain.last_tokens, sizeof(end.tokens));
+
+        out.push_back(end);
+    }
+}
+
+void llama_kv_cache::prefix_set_state(uint64_t hash, const llama_token * tokens, std::vector<uint8_t> state) {
+    prefix.set_state(hash, tokens, std::move(state));
+}
+
+const std::vector<uint8_t> * llama_kv_cache::prefix_handle_state(uint64_t handle) const {
+    return prefix.handle_state(handle);
+}
+
+void llama_kv_cache::prefix_set_enabled(bool enabled) {
+    prefix_enabled = enabled;
+}
+
+void llama_kv_cache::prefix_note_applied(const slot_info & sinfo) {
+    if (!prefix_enabled) {
+        return;
+    }
+
+    inflight_sinfo = sinfo;
+    inflight_valid = true;
+}
+
+bool llama_kv_cache::prefix_evict_one(uint32_t stream) {
+    if (!prefix_enabled) {
+        return false;
+    }
+
+    auto & cells = v_cells[stream];
+
+    std::vector<llama_prefix_cache::loc_t> cands;
+
+    prefix.evict_candidates(stream, std::numeric_limits<uint32_t>::max(), cands);
+
+    for (const auto & loc : cands) {
+        // only cache-owned blocks actually free memory
+        if (!cells.block_all_seqless(loc.block)) {
+            continue;
+        }
+
+        prefix.remove_loc(loc);
+
+        cells.block_unpin(loc.block);
+
+        return true;
+    }
+
+    return false;
+}
+
+void llama_kv_cache::prefix_unregister(const std::vector<llama_prefix_cache::loc_t> & locs) {
+    for (const auto & loc : locs) {
+        if (prefix.remove_loc(loc)) {
+            v_cells[loc.stream].block_unpin(loc.block);
+        }
+    }
+}
+
+bool llama_kv_cache::prefix_block_matches(const llama_kv_cells & cells, uint32_t b, llama_pos p0) const {
+    if (cells.cell_end(b) - cells.cell_begin(b) != llama_kv_cells::block_size) {
+        return false;
+    }
+
+    if (!cells.block_is_full(b)) {
+        return false;
+    }
+
+    for (uint32_t j = 0; j < llama_kv_cells::block_size; ++j) {
+        const uint32_t i = cells.cell_begin(b) + j;
+
+        if (cells.is_empty(i) || cells.pos_get(i) != p0 + (llama_pos) j) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::prefix_copy_impl(llama_seq_id seq_id, const std::vector<uint64_t> & hashes) {
+    const uint32_t n_block = hashes.size();
+
+    if (n_block == 0) {
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const uint32_t s1 = seq_to_stream[seq_id];
+
+    auto & cells = v_cells[s1];
+
+    // the destination sequence must be empty
+    if (cells.seq_pos_max(seq_id) != -1) {
+        return false;
+    }
+
+    std::vector<uint32_t> attached;
+    std::vector<uint32_t> allocated;
+    std::vector<llama_prefix_cache::loc_t> registered;
+
+    bool ok = true;
+
+    for (uint32_t k = 0; k < n_block && ok; ++k) {
+        const llama_pos p0 = (llama_pos) k*llama_prefix_cache::block_size;
+
+        const auto * e = prefix.find(hashes[k]);
+        if (!e || e->locs.empty()) {
+            ok = false;
+            break;
+        }
+
+        // prefer a location in the destination stream (zero-copy re-attach)
+        const llama_prefix_cache::loc_t * loc_same = nullptr;
+        const llama_prefix_cache::loc_t * loc_any  = nullptr;
+
+        for (const auto & loc : e->locs) {
+            if (loc.stream == s1) {
+                if (prefix_block_matches(v_cells[loc.stream], loc.block, p0)) {
+                    loc_same = &loc;
+                    break;
+                }
+            } else if (!loc_any && prefix_block_matches(v_cells[loc.stream], loc.block, p0)) {
+                loc_any = &loc;
+            }
+        }
+
+        if (loc_same) {
+            // the cells already hold the right contents and positions - re-attach them
+            for (uint32_t j = 0; j < llama_kv_cells::block_size; ++j) {
+                const uint32_t i = cells.cell_begin(loc_same->block) + j;
+
+                cells.seq_add(i, seq_id);
+
+                attached.push_back(i);
+            }
+
+            continue;
+        }
+
+        if (!loc_any) {
+            ok = false;
+            break;
+        }
+
+        // allocate 32 cells in the destination stream, evicting cached blocks on pressure
+        std::vector<uint32_t> idxs;
+
+        cells.alloc_find(llama_kv_cells::block_size, idxs);
+
+        while (idxs.size() < llama_kv_cells::block_size && prefix_evict_one(s1)) {
+            idxs.clear();
+            cells.alloc_find(llama_kv_cells::block_size, idxs);
+        }
+
+        if (idxs.size() < llama_kv_cells::block_size) {
+            ok = false;
+            break;
+        }
+
+        std::sort(idxs.begin(), idxs.end());
+
+        const auto & cells_src = v_cells[loc_any->stream];
+
+        const uint32_t c0 = cells_src.cell_begin(loc_any->block);
+
+        for (uint32_t j = 0; j < llama_kv_cells::block_size; ++j) {
+            cells.pos_set(idxs[j], p0 + (llama_pos) j);
+            cells.seq_add(idxs[j], seq_id);
+            cells.ext_set(idxs[j], cells_src.ext_get(c0 + j));
+        }
+
+        // copy the K/V data in contiguous runs
+        for (uint32_t j0 = 0; j0 < llama_kv_cells::block_size; ) {
+            uint32_t j1 = j0 + 1;
+            while (j1 < llama_kv_cells::block_size && idxs[j1] == idxs[j1 - 1] + 1) {
+                ++j1;
+            }
+
+            copy_cells(loc_any->stream, c0 + j0, s1, idxs[j0], j1 - j0);
+
+            j0 = j1;
+        }
+
+        allocated.insert(allocated.end(), idxs.begin(), idxs.end());
+
+        // register the destination block as an additional location if it is physically aligned
+        if (idxs.front()%llama_kv_cells::block_size == 0 && idxs.back() - idxs.front() == llama_kv_cells::block_size - 1) {
+            const llama_prefix_cache::loc_t loc { s1, idxs.front()/llama_kv_cells::block_size, p0 };
+
+            const auto res = prefix.insert(hashes[k], e->tokens, loc);
+            if (res.second) {
+                cells.block_pin(loc.block);
+                registered.push_back(loc);
+            }
+        }
+    }
+
+    if (!ok) {
+        prefix_unregister(registered);
+
+        for (const auto i : allocated) {
+            cells.rm(i);
+        }
+
+        for (const auto i : attached) {
+            cells.seq_rm(i, seq_id);
+        }
+
+        return false;
+    }
+
+    // the destination sequence now owns the same token chain
+    auto & chain = chains[seq_id];
+
+    chain.reset();
+    chain.hashes   = hashes;
+    chain.next_pos = (llama_pos) n_block*llama_prefix_cache::block_size;
+
+    // move the stream head past the copied cells
+    uint32_t idx_max = 0;
+
+    for (const auto i : allocated) {
+        idx_max = std::max(idx_max, i);
+    }
+
+    for (const auto i : attached) {
+        idx_max = std::max(idx_max, i);
+    }
+
+    if (idx_max + 1 > v_heads[s1]) {
+        v_heads[s1] = idx_max + 1;
+    }
+
+    return true;
+}
+
+void llama_kv_cache::copy_cells(uint32_t ssrc, uint32_t csrc, uint32_t sdst, uint32_t cdst, uint32_t n) {
+    size_t n_views = 0;
+
+    for (const auto & layer : layers) {
+        n_views += 2; // k
+
+        if (layer.v) {
+            n_views += v_trans ? 2*(size_t) layer.v->ne[0] : 2;
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ n_views*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context for cell copies\n", __func__);
+        return;
+    }
+
+    const uint32_t kv_size = get_size();
+
+    // views created in a fresh context have no storage - point them at the parent tensor's
+    auto view_2d = [&](ggml_tensor * t, int64_t ne0, int64_t ne1, size_t nb1, size_t offset) {
+        ggml_tensor * v = ggml_view_2d(ctx.get(), t, ne0, ne1, nb1, offset);
+        v->buffer = t->buffer;
+        v->data   = (char *) t->data + offset;
+        return v;
+    };
+
+    auto view_1d = [&](ggml_tensor * t, int64_t ne0, size_t offset) {
+        ggml_tensor * v = ggml_view_1d(ctx.get(), t, ne0, offset);
+        v->buffer = t->buffer;
+        v->data   = (char *) t->data + offset;
+        return v;
+    };
+
+    for (const auto & layer : layers) {
+        ggml_tensor * k = layer.k;
+
+        ggml_tensor * k_src = view_2d(k, k->ne[0], n, k->nb[1], ssrc*k->nb[2] + csrc*k->nb[1]);
+        ggml_tensor * k_dst = view_2d(k, k->ne[0], n, k->nb[1], sdst*k->nb[2] + cdst*k->nb[1]);
+
+        ggml_backend_tensor_copy(k_src, k_dst);
+
+        ggml_tensor * v = layer.v;
+        if (!v) {
+            continue;
+        }
+
+        if (!v_trans) {
+            ggml_tensor * v_src = view_2d(v, v->ne[0], n, v->nb[1], ssrc*v->nb[2] + csrc*v->nb[1]);
+            ggml_tensor * v_dst = view_2d(v, v->ne[0], n, v->nb[1], sdst*v->nb[2] + cdst*v->nb[1]);
+
+            ggml_backend_tensor_copy(v_src, v_dst);
+        } else {
+            // cells are strided across the transposed V cache - copy row by row
+            const int64_t n_embd_v_gqa = v->ne[0];
+
+            for (int64_t j = 0; j < n_embd_v_gqa; ++j) {
+                ggml_tensor * v_src = view_1d(v, n, ssrc*v->nb[2] + ((size_t) j*kv_size + csrc)*v->nb[0]);
+                ggml_tensor * v_dst = view_1d(v, n, sdst*v->nb[2] + ((size_t) j*kv_size + cdst)*v->nb[0]);
+
+                ggml_backend_tensor_copy(v_src, v_dst);
+            }
+        }
+    }
+}
+
 llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch, bool cont) const {
 
     if (debug > 0) {
@@ -994,6 +1493,67 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (n_tokens > cells.size()) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            return { };
+        }
+
+        if (!cont) {
+            // allocate empty cells with the block allocator - partially-used blocks first,
+            //   then free blocks. the blocks themselves are updated in apply_ubatch()
+            cells.alloc_find(n_tokens, res.idxs[s]);
+
+            if (res.idxs[s].size() < n_tokens && n_swa > 0) {
+                // not enough empty cells - reuse cells with SWA-masked positions, starting
+                //   from the current head
+                uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
+
+                // if we have enough unused cells before the current head ->
+                //   better to start searching from the beginning of the cache, hoping to fill it
+                if (head_cur > cells.get_used() + 2*n_tokens) {
+                    head_cur = 0;
+                }
+
+                uint32_t n_tested = 0;
+
+                while (res.idxs[s].size() < n_tokens && n_tested < cells.size()) {
+                    if (head_cur >= cells.size()) {
+                        head_cur = 0;
+                    }
+
+                    const auto idx = head_cur;
+
+                    head_cur++;
+                    n_tested++;
+
+                    // the cell can be reused if it is occupied only by one sequence and its
+                    //   position is masked by the SWA, using the current max pos for that
+                    //   sequence in the cache
+                    // pinned (prefix-cached) blocks are never reused
+                    if (cells.is_empty(idx) || cells.seq_count(idx) != 1 || cells.block_ref(idx/llama_kv_cells::block_size) != 0) {
+                        continue;
+                    }
+
+                    const llama_seq_id seq_id_cell = cells.seq_get(idx);
+                    const llama_pos    pos_cell    = cells.pos_get(idx);
+
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        res.idxs[s].push_back(idx);
+                    }
+                }
+            }
+
+            // we didn't find a suitable slot - return empty result
+            if (res.idxs[s].size() < n_tokens) {
+                return { };
+            }
+
+            // keep the indices sorted - helps the contiguous fast path of the state restore
+            std::sort(res.idxs[s].begin(), res.idxs[s].end());
+
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1002,16 +1562,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
-            return { };
-        }
-
         uint32_t n_tested = 0;
 
         // for continuous slots, we test that all tokens in the ubatch fit, starting from the current head
-        // for non-continuous slots, we test the tokens one by one
-        const uint32_t n_test = cont ? n_tokens : 1;
+        const uint32_t n_test = n_tokens;
 
         while (true) {
             if (head_cur + n_test > cells.size()) {
@@ -1026,42 +1580,29 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 head_cur++;
                 n_tested++;
 
-                //const llama_pos    pos    = ubatch.pos[i];
-                //const llama_seq_id seq_id = ubatch.seq_id[i][0];
-
                 // can we use this cell? either:
                 //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
+                //  - the cell is occupied only by one sequence and its position is masked by
+                //    the SWA, using current max pos for that sequence in the cache
+                //    pinned (prefix-cached) blocks are never reused
                 //                always insert in the cell with minimum pos
                 bool can_use = cells.is_empty(idx);
 
-                if (!can_use && cells.seq_count(idx) == 1) {
+                if (!can_use && cells.seq_count(idx) == 1 && cells.block_ref(idx/llama_kv_cells::block_size) == 0) {
                     const llama_pos pos_cell = cells.pos_get(idx);
 
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
+                    const llama_seq_id seq_id_cell = cells.seq_get(idx);
 
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
-                        }
+                    // SWA mask
+                    if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                        can_use = true;
                     }
                 }
 
                 if (can_use) {
                     res.idxs[s].push_back(idx);
                 } else {
-                    if (cont) {
-                        break;
-                    }
+                    break;
                 }
             }
 
@@ -1069,9 +1610,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 break;
             }
 
-            if (cont) {
-                res.idxs[s].clear();
-            }
+            res.idxs[s].clear();
 
             if (n_tested >= cells.size()) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
@@ -2034,6 +2573,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
+    if (seq_id != -1) {
+        // the restored cells have unknown tokens - the chain restarts empty
+        chains[seq_id].reset();
+    }
+
     uint32_t n_stream_cur;
     io.read(&n_stream_cur, sizeof(n_stream_cur));
     if (n_stream_cur != n_stream) {
@@ -2548,6 +3092,8 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    kv->prefix_note_applied(sinfos[i_cur]);
+
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;

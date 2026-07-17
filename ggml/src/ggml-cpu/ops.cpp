@@ -10744,6 +10744,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_sidx  = dst->src[6]; // GGML_OP_GATED_DELTA_NET_IDX only, nullptr otherwise
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10756,6 +10757,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous(src_g));
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
+    GGML_ASSERT(src_sidx == nullptr || (src_sidx->type == GGML_TYPE_I32 && src_sidx->ne[0] >= n_seqs));
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
     GGML_ASSERT(src_beta->ne[0] == 1);
@@ -10797,6 +10799,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float * state_in_base = (const float *)src_state->data;
 
+    // indexed form (GGML_OP_GATED_DELTA_NET_IDX): batch seq i reads its initial state
+    // from store row sidx[i] instead of row i; the state output stays dense by batch seq.
+    const int32_t * sidx = src_sidx != nullptr ? (const int32_t *) src_sidx->data : nullptr;
+    const int64_t   n_state_rows = src_state->ne[3];
+
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
     const int64_t rq3 = nev3 / neq3;
@@ -10821,8 +10828,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
-        // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        // state layout [S_v, S_v, H, n_rows]: seq iv3 starts at row sidx[iv3] (indexed) or row iv3.
+        const int64_t iseq = sidx != nullptr ? sidx[iv3] : iv3;
+        GGML_ASSERT(iseq >= 0 && iseq < n_state_rows);
+        const float * s_in = state_in_base + iseq * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)

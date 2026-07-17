@@ -103,6 +103,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+
+    // prefix caching is not supported for iSWA caches (SWA blocks expire) - keep it off
+    kv_base->prefix_set_enabled(false);
+    kv_swa ->prefix_set_enabled(false);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

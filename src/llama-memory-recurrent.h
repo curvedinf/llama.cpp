@@ -78,6 +78,18 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    //
+    // prefix cache support
+    //
+
+    // snapshot the current recurrent state of seq_id across all layers into host memory
+    // return an empty vector if the sequence has no state
+    std::vector<uint8_t> snapshot_prefix_state(llama_seq_id seq_id) const;
+
+    // restore a snapshot as the initial state of a fresh sequence (must have no state)
+    // pos is the position of the last token of the snapshot's prefix
+    bool restore_prefix_state(llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size);
+
     // computed before each graph build
     uint32_t n = 0;
 

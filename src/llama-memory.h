@@ -124,6 +124,25 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // block-hash prefix cache (llama-prefix-cache.h)
+    //
+
+    // find the longest fully-cached block-aligned prefix of the given tokens
+    // the default implementation disables the prefix cache
+    virtual llama_prefix_match prefix_match(const llama_token * tokens, int32_t n_tokens);
+
+    // reuse a matched prefix for seq_id, skipping prefill compute for it
+    // consumes the handle (also on failure). requires seq_id to be empty
+    // the caller must ensure that no graph compute is in flight (e.g. via llama_synchronize)
+    virtual bool prefix_copy(llama_seq_id seq_id, uint64_t handle);
+
+    // release a handle returned by prefix_match without copying
+    virtual void prefix_release(uint64_t handle);
+
+    // notification that an ubatch was computed - used to register newly-filled blocks
+    virtual void prefix_notify(const llama_ubatch & ubatch);
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

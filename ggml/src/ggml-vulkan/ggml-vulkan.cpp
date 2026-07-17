@@ -970,6 +970,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    vk_pipeline pipeline_gated_delta_net_idx[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1009,6 +1010,7 @@ struct vk_device_struct {
     bool disable_host_visible_vidmem;
     bool allow_sysmem_fallback;
     bool disable_graph_optimize;
+    bool disable_dispatch_cache;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
 
@@ -2123,6 +2125,67 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+// a memory range of a device buffer that needs to be synchronized
+struct vk_buffer_range {
+    vk_buffer buffer;
+    size_t offset;
+    size_t size;
+};
+
+// Recorded command for the graph dispatch cache. When the same graph (same structure
+// and tensor addresses) is computed repeatedly, the recorded commands are re-emitted
+// instead of re-running the graph analysis (fusion detection, dependency tracking, ...).
+struct vk_graph_cache_op {
+    enum class kind_t : uint8_t { DISPATCH, BARRIER, BARRIER_RANGES, FILL_BUFFER, HOST_MEMSET };
+
+    kind_t kind;
+
+    // DISPATCH
+    vk_pipeline pipeline;
+    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> descriptors;
+    std::array<vk_buffer, MAX_PARAMETER_COUNT> keep_alive; // internal (prealloc) buffers referenced by the descriptors
+    uint32_t n_descriptors = 0;
+    std::vector<uint8_t> push_constants;
+    std::array<uint32_t, 3> workgroups;
+
+    // BARRIER_RANGES
+    std::vector<vk_buffer_range> ranges;
+
+    // FILL_BUFFER, and keep-alive for HOST_MEMSET
+    vk_buffer fill_buffer;
+    size_t fill_offset = 0;
+    size_t fill_size = 0;
+    uint32_t fill_value = 0;
+
+    // HOST_MEMSET
+    void * memset_ptr = nullptr;
+    uint32_t memset_value = 0;
+    size_t memset_size = 0;
+
+    vk_graph_cache_op(kind_t kind) : kind(kind) {}
+};
+
+struct vk_graph_cache_chunk {
+    uint32_t n_ops;
+    bool almost_ready_fence;
+};
+
+struct vk_graph_cache_entry {
+    uint64_t uid = 0;
+    uint64_t sig = 0;
+    uint64_t total_flops = 0;
+    uint32_t n_descriptor_sets = 0;
+    std::vector<vk_graph_cache_op> ops;
+    std::vector<vk_graph_cache_chunk> chunks;
+
+    // transient state used while recording
+    size_t chunk_ops = 0;
+    uint32_t descriptor_set_idx_start = 0;
+};
+
+// maximum number of entries in the dispatch cache, cleared when exceeded
+#define VK_GRAPH_CACHE_MAX_ENTRIES 32
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2169,6 +2232,10 @@ struct ggml_backend_vk_context {
     std::vector<vk::DescriptorSet> descriptor_sets;
     uint32_t descriptor_set_idx {};
     uint32_t pipeline_descriptor_set_requirements {};
+
+    // dispatch cache for repeated computes of the same graph
+    std::unordered_map<uint64_t, std::unique_ptr<vk_graph_cache_entry>> graph_cache;
+    vk_graph_cache_entry * graph_cache_recording = nullptr;
 
     vk_command_pool compute_cmd_pool;
     vk_command_pool transfer_cmd_pool;
@@ -3371,6 +3438,43 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
         {},
         {}
     );
+
+    if (ctx != nullptr && ctx->graph_cache_recording != nullptr) {
+        ctx->graph_cache_recording->ops.emplace_back(vk_graph_cache_op::kind_t::BARRIER);
+    }
+}
+
+// same as ggml_vk_sync_buffers, but the barriers are scoped to the given buffer ranges.
+// does not clear the prealloc sync flags, since the prealloc buffers may not be covered
+static void ggml_vk_sync_buffer_ranges(ggml_backend_vk_context* ctx, vk_context& subctx, const std::vector<vk_buffer_range> &ranges) {
+    VK_LOG_DEBUG("ggml_vk_sync_buffer_ranges(" << ranges.size() << ")");
+
+    const bool transfer_queue = subctx->p->q->transfer_only;
+
+    const vk::AccessFlags access_flags = !transfer_queue ?
+        (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) :
+        (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+
+    std::vector<vk::BufferMemoryBarrier> barriers;
+    barriers.reserve(ranges.size());
+    for (const auto &range : ranges) {
+        barriers.push_back({ access_flags, access_flags, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, range.buffer->buffer, range.offset, range.size });
+    }
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        subctx->p->q->stage_flags,
+        subctx->p->q->stage_flags,
+        {},
+        {},
+        barriers,
+        {}
+    );
+
+    if (ctx != nullptr && ctx->graph_cache_recording != nullptr) {
+        vk_graph_cache_entry * entry = ctx->graph_cache_recording;
+        entry->ops.emplace_back(vk_graph_cache_op::kind_t::BARRIER_RANGES);
+        entry->ops.back().ranges = ranges;
+    }
 }
 
 static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
@@ -5500,6 +5604,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_idx_names[][2] = {
+            {"gated_delta_net_idx_f32_d16",     "gated_delta_net_idx_f32_d16_kda"},
+            {"gated_delta_net_idx_f32_d32",     "gated_delta_net_idx_f32_d32_kda"},
+            {"gated_delta_net_idx_f32_d64",     "gated_delta_net_idx_f32_d64_kda"},
+            {"gated_delta_net_idx_f32_d128",    "gated_delta_net_idx_f32_d128_kda"},
+        };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
@@ -5536,15 +5646,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
             size_t gdn_len;
             const void * gdn_data;
+            size_t gdn_idx_len;
+            const void * gdn_idx_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_idx_len = gated_delta_net_idx_f32_len;
+                gdn_idx_data = (const void *)gated_delta_net_idx_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_idx_len = gated_delta_net_idx_f32_nocluster_len;
+                gdn_idx_data = (const void *)gated_delta_net_idx_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_idx_len = gated_delta_net_idx_f32_shmem_len;
+                gdn_idx_data = (const void *)gated_delta_net_idx_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -5553,6 +5671,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_idx[si][kda],
+                    gdn_idx_names[si][kda], gdn_idx_len, gdn_idx_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -5850,6 +5971,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         const char* GGML_VK_DISABLE_GRAPH_OPTIMIZE = getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE");
         device->disable_graph_optimize = GGML_VK_DISABLE_GRAPH_OPTIMIZE != nullptr;
+
+        const char* GGML_VK_DISABLE_DISPATCH_CACHE = getenv("GGML_VK_DISABLE_DISPATCH_CACHE");
+        device->disable_dispatch_cache = GGML_VK_DISABLE_DISPATCH_CACHE != nullptr;
 
         bool fp16_storage = false;
         bool fp16_compute = false;
@@ -7776,6 +7900,32 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
+    if (ctx->graph_cache_recording != nullptr) {
+        vk_graph_cache_entry * entry = ctx->graph_cache_recording;
+        entry->ops.emplace_back(vk_graph_cache_op::kind_t::DISPATCH);
+        vk_graph_cache_op &op = entry->ops.back();
+        op.pipeline = pipeline;
+        op.workgroups = { wg0, wg1, wg2 };
+        const uint8_t *pc_data = (const uint8_t *)push_constant_data(push_constants);
+        op.push_constants.assign(pc_data, pc_data + push_constant_size(push_constants));
+        uint32_t desc_idx = 0;
+        for (const auto &buffer_info : descriptor_buffer_infos) {
+            op.descriptors[desc_idx] = buffer_info;
+            // keep the internal (prealloc) buffers alive, they are not part of the graph signature
+            if (ctx->prealloc_x && buffer_info.buffer == ctx->prealloc_x->buffer) {
+                op.keep_alive[desc_idx] = ctx->prealloc_x;
+            } else if (ctx->prealloc_y && buffer_info.buffer == ctx->prealloc_y->buffer) {
+                op.keep_alive[desc_idx] = ctx->prealloc_y;
+            } else if (ctx->prealloc_split_k && buffer_info.buffer == ctx->prealloc_split_k->buffer) {
+                op.keep_alive[desc_idx] = ctx->prealloc_split_k;
+            } else if (ctx->prealloc_add_rms_partials && buffer_info.buffer == ctx->prealloc_add_rms_partials->buffer) {
+                op.keep_alive[desc_idx] = ctx->prealloc_add_rms_partials;
+            }
+            desc_idx++;
+        }
+        op.n_descriptors = desc_idx;
+    }
+
     vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
     vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, descriptor_buffer_infos.begin() };
     ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
@@ -8291,17 +8441,37 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
     }
 }
 
-static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
+static void ggml_vk_buffer_memset_async(ggml_backend_vk_context * ctx, vk_context& subctx, vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
     VK_LOG_DEBUG("ggml_vk_buffer_memset_async(" << offset << ", " << c << ", " << size << ")");
+
+    if (ctx->graph_cache_recording != nullptr) {
+        vk_graph_cache_entry * entry = ctx->graph_cache_recording;
+        if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
+            dst->device->uma) {
+            entry->ops.emplace_back(vk_graph_cache_op::kind_t::HOST_MEMSET);
+            vk_graph_cache_op &op = entry->ops.back();
+            op.fill_buffer = dst; // keep the buffer alive
+            op.memset_ptr = (uint8_t*)dst->ptr + offset;
+            op.memset_value = c;
+            op.memset_size = size;
+        } else {
+            entry->ops.emplace_back(vk_graph_cache_op::kind_t::FILL_BUFFER);
+            vk_graph_cache_op &op = entry->ops.back();
+            op.fill_buffer = dst;
+            op.fill_offset = offset;
+            op.fill_size = size;
+            op.fill_value = c;
+        }
+    }
 
     if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible &&
         dst->device->uma) {
-        deferred_memset((uint8_t*)dst->ptr + offset, c, size, &ctx->memsets);
+        deferred_memset((uint8_t*)dst->ptr + offset, c, size, &subctx->memsets);
         return;
     }
 
     // Fall back to GPU fillBuffer for non-UMA or non-host-visible buffers
-    ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+    subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
 }
 
 static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, size_t size) {
@@ -11185,6 +11355,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
         return nullptr;
     case GGML_OP_GATED_DELTA_NET:
+    case GGML_OP_GATED_DELTA_NET_IDX:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
             const uint32_t kda = (dst->src[3]->ne[0] == (int64_t)S_v) ? 1 : 0;
@@ -11195,6 +11366,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 64:  si = 2; break;
                 case 128: si = 3; break;
                 default: return nullptr;
+            }
+            if (dst->op == GGML_OP_GATED_DELTA_NET_IDX) {
+                return ctx->device->pipeline_gated_delta_net_idx[si][kda];
             }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
@@ -11848,7 +12022,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src1_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_COUNT_EQUAL) {
         // count_equal assumes that destination buffer is initialized with zeroes
-        ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
+        ggml_vk_buffer_memset_async(ctx, subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
         ggml_vk_sync_buffers(ctx, subctx);
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
     } else if (op == GGML_OP_OPT_STEP_SGD) {
@@ -12246,6 +12420,65 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+        pc, { H, n_seqs, S_v });
+}
+
+static void ggml_vk_gated_delta_net_idx(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_beta  = dst->src[4];
+    const ggml_tensor * src_sidx  = dst->src[6];
+
+    GGML_ASSERT(dst->buffer != nullptr);
+    GGML_ASSERT(src_sidx != nullptr && src_sidx->type == GGML_TYPE_I32);
+
+    const uint32_t S_v      = (uint32_t)src_v->ne[0];
+    const uint32_t H        = (uint32_t)src_v->ne[1];
+    const uint32_t n_tokens = (uint32_t)src_v->ne[2];
+    const uint32_t n_seqs   = (uint32_t)src_v->ne[3];
+
+    // K (snapshot slot count) is an op param; state is the full store [S_v, S_v, H, n_rows].
+    const uint32_t K = (uint32_t)ggml_get_op_params_i32(dst, 0);
+
+    const uint32_t s_off = S_v * H * n_tokens * n_seqs;
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer src_buf[7] = {};
+    for (int i = 0; i < 7; i++) {
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+
+    const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
+    const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
+    const uint32_t sq3 = (uint32_t)(src_q->nb[3] / sizeof(float));
+    const uint32_t sv1 = (uint32_t)(src_v->nb[1] / sizeof(float));
+    const uint32_t sv2 = (uint32_t)(src_v->nb[2] / sizeof(float));
+    const uint32_t sv3 = (uint32_t)(src_v->nb[3] / sizeof(float));
+    const uint32_t sb1 = (uint32_t)(src_beta->nb[1] / sizeof(float));
+    const uint32_t sb2 = (uint32_t)(src_beta->nb[2] / sizeof(float));
+    const uint32_t sb3 = (uint32_t)(src_beta->nb[3] / sizeof(float));
+
+    const uint32_t neq1 = (uint32_t)src_q->ne[1];
+    const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
+
+    const float scale = 1.0f / sqrtf((float)S_v);
+    const vk_op_gated_delta_net_push_constants pc = {
+        H, n_tokens, n_seqs, s_off,
+        sq1, sq2, sq3,
+        sv1, sv2, sv3,
+        sb1, sb2, sb3,
+        neq1, rq3,
+        scale,
+        K
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, src_buf[6]},
         pc, { H, n_seqs, S_v });
 }
 
@@ -14711,18 +14944,22 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
     {
-        // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
+        // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffer_ranges
         // to synchronize them. This handles most "normal" synchronization when computing the graph, and when
         // there is no auxiliary memory use, it shouldn't be necessary to call ggml_vk_sync_buffers
         // outside of this logic. When a node uses one of the prealloc buffers for something like
         // dequantization or split_k, additional synchronization is needed between those passes.
         bool need_sync = false;
 
+        // Ranges of the tensors involved in hazards with the current node, used to scope the barrier
+        std::vector<vk_buffer_range> sync_ranges;
+
         // Check whether "node" requires synchronization. The node requires synchronization if it
         // overlaps in memory with another unsynchronized node and at least one of them is a write.
         // Destination nodes are checked against both the written/read lists. Source nodes are only
         // checked against the written list. Two nodes overlap in memory if they come from the same
-        // buffer and the tensor or view ranges overlap.
+        // buffer and the tensor or view ranges overlap. For each hazard found, the ranges of both
+        // tensors are collected so that the barrier can be scoped to the affected memory.
         auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
             if (unsynced_nodes.size() == 0) {
                 return false;
@@ -14731,6 +14968,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             auto n_size = ggml_nbytes(node);
             ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
             vk_buffer a_buf = a_buf_ctx->dev_buffer;
+            bool found = false;
             for (auto &other : unsynced_nodes) {
                 ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
                 vk_buffer o_buf = o_buf_ctx->dev_buffer;
@@ -14740,32 +14978,39 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
                     if ((o_base <= n_base && n_base < o_base + o_size) ||
                         (n_base <= o_base && o_base < n_base + n_size)) {
-                        return true;
+                        sync_ranges.push_back({ o_buf, o_base, o_size });
+                        sync_ranges.push_back({ a_buf, n_base, n_size });
+                        found = true;
                     }
                 }
             }
-            return false;
+            return found;
         };
 
+        // bound the hazard-scan cost: the unsynced lists are only pruned (never fully cleared)
+        // by scoped barriers, so they can grow to graph size and make the per-node scan quadratic.
+        // fall back to a full barrier + clear, which is what keeps the lists short
+        if (ctx->unsynced_nodes_written.size() + ctx->unsynced_nodes_read.size() > 128) {
+            ggml_vk_sync_buffers(ctx, compute_ctx);
+            ctx->unsynced_nodes_written.clear();
+            ctx->unsynced_nodes_read.clear();
+        }
+
         // For all fused ops, check if the destination node or any of the source
-        // nodes require synchronization.
-        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1 && !need_sync; ++i) {
+        // nodes require synchronization. All the hazards of the current node have to
+        // be collected, since the barrier is scoped to the affected ranges.
+        for (int32_t i = 0; i < ctx->num_additional_fused_ops + 1; ++i) {
             const ggml_tensor *cur_node = cgraph->nodes[node_idx + i];
             // If the node actually writes to memory, then check if it needs to sync
             if (ctx->fused_ops_write_mask & (1 << i)) {
-                if (overlaps_unsynced(cur_node, ctx->unsynced_nodes_read) || overlaps_unsynced(cur_node, ctx->unsynced_nodes_written)) {
-                    need_sync = true;
-                    break;
-                }
+                need_sync |= overlaps_unsynced(cur_node, ctx->unsynced_nodes_read);
+                need_sync |= overlaps_unsynced(cur_node, ctx->unsynced_nodes_written);
             }
             for (uint32_t j = 0; j < GGML_MAX_SRC; ++j) {
                 if (!cur_node->src[j]) {
                     continue;
                 }
-                if (overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written)) {
-                    need_sync = true;
-                    break;
-                }
+                need_sync |= overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_written);
             }
         }
 
@@ -14773,9 +15018,42 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             if (vk_enable_sync_logger) {
                 std::cerr <<  "sync" << std::endl;
             }
-            ctx->unsynced_nodes_written.clear();
-            ctx->unsynced_nodes_read.clear();
-            ggml_vk_sync_buffers(ctx, compute_ctx);
+
+            // merge the hazard ranges into one span per buffer
+            std::vector<vk_buffer_range> merged;
+            for (const auto &range : sync_ranges) {
+                bool found = false;
+                for (auto &m : merged) {
+                    if (m.buffer == range.buffer) {
+                        const size_t end = std::max(m.offset + m.size, range.offset + range.size);
+                        m.offset = std::min(m.offset, range.offset);
+                        m.size = end - m.offset;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    merged.push_back(range);
+                }
+            }
+
+            // drop the tensors that are fully covered by a barrier span: their accesses
+            // are now ordered with respect to all later accesses to the same range
+            const auto is_synced = [&](const ggml_tensor * t) {
+                const auto t_base = vk_tensor_offset(t) + t->view_offs;
+                const auto t_size = ggml_nbytes(t);
+                vk_buffer t_buf = ((ggml_backend_vk_buffer_context *)t->buffer->context)->dev_buffer;
+                for (const auto &m : merged) {
+                    if (m.buffer == t_buf && m.offset <= t_base && t_base + t_size <= m.offset + m.size) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+            ctx->unsynced_nodes_written.erase(std::remove_if(ctx->unsynced_nodes_written.begin(), ctx->unsynced_nodes_written.end(), is_synced), ctx->unsynced_nodes_written.end());
+            ctx->unsynced_nodes_read.erase(std::remove_if(ctx->unsynced_nodes_read.begin(), ctx->unsynced_nodes_read.end(), is_synced), ctx->unsynced_nodes_read.end());
+
+            ggml_vk_sync_buffer_ranges(ctx, compute_ctx, merged);
 
             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
                 ctx->query_node_idx[ctx->query_idx] = node_idx;
@@ -15146,6 +15424,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
         break;
+    case GGML_OP_GATED_DELTA_NET_IDX:
+        ggml_vk_gated_delta_net_idx(ctx, compute_ctx, node);
+
+        break;
 
     case GGML_OP_SSM_SCAN:
         ggml_vk_ssm_scan(ctx, compute_ctx, node);
@@ -15191,7 +15473,14 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         ctx->compute_ctx.reset();
 
+        const bool almost_ready_fence_pending = ctx->almost_ready_fence_pending;
         ggml_vk_compute_forward(ctx, cgraph, node_begin, node_idx_begin, almost_ready);
+
+        if (ctx->graph_cache_recording != nullptr) {
+            vk_graph_cache_entry * entry = ctx->graph_cache_recording;
+            entry->chunks.push_back({ (uint32_t)(entry->ops.size() - entry->chunk_ops), almost_ready && !almost_ready_fence_pending });
+            entry->chunk_ops = entry->ops.size();
+        }
     }
     return true;
 }
@@ -15807,6 +16096,33 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
+static bool ggml_backend_vk_set_inputs_async(ggml_backend_t backend, const ggml_tensor * const * src, ggml_tensor * const * dst, int n) {
+    VK_LOG_DEBUG("ggml_backend_vk_set_inputs_async(" << n << ")");
+
+    // the fast path requires contiguous tensors and host-visible device memory for the copies
+    for (int i = 0; i < n; i++) {
+        if (!ggml_backend_buffer_is_host(src[i]->buffer) || !ggml_is_contiguous(src[i]) || !ggml_is_contiguous(dst[i]) ||
+            ggml_nbytes(src[i]) != ggml_nbytes(dst[i]) ||
+            dst[i]->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend)) {
+            return false;
+        }
+        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)dst[i]->buffer->context;
+        if ((buf_ctx->dev_buffer->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) !=
+            (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) {
+            return false;
+        }
+    }
+
+    // the caller guarantees that no in-flight work reads or writes the dst tensors,
+    // so the inputs can be copied directly into the mapped device memory
+    for (int i = 0; i < n; i++) {
+        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)dst[i]->buffer->context;
+        memcpy((uint8_t *)buf_ctx->dev_buffer->ptr + vk_tensor_offset(dst[i]) + dst[i]->view_offs, src[i]->data, ggml_nbytes(src[i]));
+    }
+
+    return true;
+}
+
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
@@ -16406,6 +16722,139 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Compute a cheap signature of the graph structure and the assigned tensor addresses.
+// The recorded dispatch stream of a graph can only be reused when the signature matches,
+// since the pipeline selection, push constants and descriptor contents all derive from it.
+static uint64_t ggml_vk_graph_signature(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const auto mix = [&h](uint64_t v) {
+        v ^= v >> 30; v *= 0xbf58476d1ce4e5b9ULL;
+        v ^= v >> 27; v *= 0x94d049bb133111ebULL;
+        v ^= v >> 31;
+        h ^= v;
+        h *= 0x100000001b3ULL;
+    };
+    const auto mix_tensor = [&](const ggml_tensor * t) {
+        if (t == nullptr) {
+            mix(0);
+            return;
+        }
+        mix((uint64_t)t->type);
+        for (int j = 0; j < GGML_MAX_DIMS; j++) {
+            mix((uint64_t)t->ne[j]);
+            mix((uint64_t)t->nb[j]);
+        }
+        if (t->buffer != nullptr && ggml_backend_buffer_is_vk(t->buffer)) {
+            // galloc-assigned address of the tensor
+            vk_buffer buf = ((ggml_backend_vk_buffer_context *)t->buffer->context)->dev_buffer;
+            mix((uint64_t)buf.get());
+            mix(vk_tensor_offset(t) + t->view_offs);
+        } else {
+            mix((uint64_t)t->data);
+        }
+    };
+
+    mix((uint64_t)cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor *node = cgraph->nodes[i];
+        mix((uint64_t)node->op);
+        mix((uint64_t)node->flags);
+        mix_tensor(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            mix_tensor(node->src[j]);
+        }
+        // op_params can affect the push constants
+        static_assert(sizeof(node->op_params) % sizeof(uint64_t) == 0, "unexpected op_params size");
+        for (size_t j = 0; j < sizeof(node->op_params)/sizeof(uint64_t); j++) {
+            mix(((const uint64_t *)node->op_params)[j]);
+        }
+    }
+    return h;
+
+    GGML_UNUSED(ctx);
+}
+
+// Re-emit the command stream of a previously recorded graph
+static void ggml_vk_replay_graph_cache(ggml_backend_vk_context * ctx, const vk_graph_cache_entry * entry) {
+    VK_LOG_DEBUG("ggml_vk_replay_graph_cache(" << entry->ops.size() << " ops, " << entry->chunks.size() << " chunks)");
+
+    ggml_vk_submit_transfer_ctx(ctx);
+
+    // make sure there are enough descriptor sets for the whole graph
+    ctx->pipeline_descriptor_set_requirements = std::max(ctx->pipeline_descriptor_set_requirements, ctx->descriptor_set_idx + entry->n_descriptor_sets);
+    ggml_pipeline_allocate_descriptor_sets(ctx);
+
+    ctx->last_total_flops = entry->total_flops;
+
+    size_t op_idx = 0;
+    for (size_t chunk_idx = 0; chunk_idx < entry->chunks.size(); chunk_idx++) {
+        const vk_graph_cache_chunk &chunk = entry->chunks[chunk_idx];
+        const bool last_chunk = chunk_idx == entry->chunks.size() - 1;
+
+        vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
+        for (uint32_t i = 0; i < chunk.n_ops; i++, op_idx++) {
+            const vk_graph_cache_op &op = entry->ops[op_idx];
+            switch (op.kind) {
+            case vk_graph_cache_op::kind_t::DISPATCH: {
+                GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+                vk::DescriptorSet &descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+                vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, op.n_descriptors, vk::DescriptorType::eStorageBuffer, nullptr, op.descriptors.data() };
+                ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+                compute_ctx->s->buffer->buf.pushConstants(op.pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, (uint32_t)op.push_constants.size(), op.push_constants.data());
+                compute_ctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, op.pipeline->pipeline);
+                compute_ctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, op.pipeline->layout, 0, { descriptor_set }, {});
+                compute_ctx->s->buffer->buf.dispatch(op.workgroups[0], op.workgroups[1], op.workgroups[2]);
+                break;
+            }
+            case vk_graph_cache_op::kind_t::BARRIER:
+                ggml_vk_sync_buffers(ctx, compute_ctx);
+                break;
+            case vk_graph_cache_op::kind_t::BARRIER_RANGES:
+                ggml_vk_sync_buffer_ranges(ctx, compute_ctx, op.ranges);
+                break;
+            case vk_graph_cache_op::kind_t::FILL_BUFFER:
+                compute_ctx->s->buffer->buf.fillBuffer(op.fill_buffer->buffer, op.fill_offset, op.fill_size, op.fill_value);
+                break;
+            case vk_graph_cache_op::kind_t::HOST_MEMSET:
+                deferred_memset(op.memset_ptr, op.memset_value, op.memset_size, &compute_ctx->memsets);
+                break;
+            }
+        }
+
+        // end and submit the chunk, mirroring ggml_vk_compute_forward
+        ggml_vk_ctx_end(compute_ctx);
+        ctx->compute_ctx.reset();
+
+        if (!compute_ctx->seqs.empty()) {
+            for (auto& cpy : compute_ctx->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            for (auto& mset : compute_ctx->memsets) {
+                memset(mset.dst, mset.val, mset.n);
+            }
+
+            if (chunk.almost_ready_fence && !ctx->almost_ready_fence_pending) {
+                ggml_vk_submit(compute_ctx, ctx->almost_ready_fence);
+                ctx->almost_ready_fence_pending = true;
+            } else {
+                ggml_vk_submit(compute_ctx, {});
+            }
+            ctx->submit_pending = true;
+        }
+
+        if (last_chunk) {
+            for (auto& cpy : compute_ctx->out_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            compute_ctx->in_memcpys.clear();
+            compute_ctx->out_memcpys.clear();
+            compute_ctx->memsets.clear();
+        }
+    }
+    GGML_ASSERT(op_idx == entry->ops.size());
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -16471,11 +16920,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
 
+#ifdef GGML_VULKAN_CHECK_RESULTS
+    const bool cache_enabled = false;
+#else
+    const bool cache_enabled = !ctx->device->disable_dispatch_cache && !vk_perf_logger_enabled;
+#endif
+
+    std::unique_ptr<vk_graph_cache_entry> cache_entry;
+    if (cache_enabled) {
+        const uint64_t sig = ggml_vk_graph_signature(ctx, cgraph);
+        auto it = ctx->graph_cache.find(sig);
+        if (it != ctx->graph_cache.end()) {
+            ggml_vk_replay_graph_cache(ctx, it->second.get());
+            if (!ctx->device->support_async) {
+                ggml_vk_synchronize(ctx);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+        // record the command stream of this graph so that it can be replayed on the next computes
+        cache_entry = std::make_unique<vk_graph_cache_entry>();
+        cache_entry->uid = cgraph->uid;
+        cache_entry->sig = sig;
+        cache_entry->descriptor_set_idx_start = ctx->descriptor_set_idx;
+        ctx->graph_cache_recording = cache_entry.get();
+    }
+
     if (ctx->prealloc_size_add_rms_partials) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         // initialize partial sums to zero.
-        ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        ggml_vk_buffer_memset_async(ctx, compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
@@ -16766,6 +17240,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     ctx->last_total_flops = total_flops;
+
+    if (cache_enabled) {
+        ctx->graph_cache_recording = nullptr;
+        cache_entry->total_flops = total_flops;
+        cache_entry->n_descriptor_sets = ctx->descriptor_set_idx - cache_entry->descriptor_set_idx_start;
+        // any commands recorded after the last submit form an implicit final chunk
+        if (cache_entry->chunk_ops < cache_entry->ops.size()) {
+            cache_entry->chunks.push_back({ (uint32_t)(cache_entry->ops.size() - cache_entry->chunk_ops), false });
+        }
+        if (!cache_entry->ops.empty()) {
+            if (ctx->graph_cache.size() >= VK_GRAPH_CACHE_MAX_ENTRIES) {
+                ctx->graph_cache.clear();
+            }
+            ctx->graph_cache[cache_entry->sig] = std::move(cache_entry);
+        }
+    }
 
     if (vk_perf_logger_enabled) {
         // End the command buffer and submit/wait
@@ -17151,6 +17641,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .set_inputs_async        = */ ggml_backend_vk_set_inputs_async,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {
@@ -17829,6 +18320,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
+                }
+                return op->type == GGML_TYPE_F32;
+            }
+        case GGML_OP_GATED_DELTA_NET_IDX:
+            {
+                const uint32_t S_v = op->src[2]->ne[0];
+                if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+                    return false;
+                }
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_I32) {
+                    return false;
                 }
                 return op->type == GGML_TYPE_F32;
             }
@@ -18781,6 +19288,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
             tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
             src_clone[2], src_clone[3], src_clone[4], src_clone[5],
+            ggml_get_op_params_i32(tensor, 0));
+        } else if (tensor->op == GGML_OP_GATED_DELTA_NET_IDX) {
+            tensor_clone = ggml_gated_delta_net_idx(ggml_ctx, src_clone[0], src_clone[1],
+            src_clone[2], src_clone[3], src_clone[4], src_clone[5], src_clone[6],
             ggml_get_op_params_i32(tensor, 0));
         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
             src_clone[0]->flags = tensor->src[0]->flags;

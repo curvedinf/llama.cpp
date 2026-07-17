@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-prefix-cache.h"
 
 #include <unordered_map>
 #include <vector>
@@ -150,6 +151,41 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     //
+    // prefix cache (llama_memory_i)
+    //
+
+    llama_prefix_match prefix_match(const llama_token * tokens, int32_t n_tokens) override;
+
+    bool prefix_copy(llama_seq_id seq_id, uint64_t handle) override;
+
+    void prefix_release(uint64_t handle) override;
+
+    void prefix_notify(const llama_ubatch & ubatch) override;
+
+    //
+    // prefix cache - extended API used by hybrid memory
+    //
+
+    // an aligned sequence end reported by prefix_notify_ex
+    struct seq_end {
+        llama_seq_id seq_id;
+        llama_pos    pos_end; // one past the last token of the aligned prefix
+        uint64_t     hash;    // hash of the last block of the prefix
+
+        llama_token tokens[llama_prefix_cache::block_size]; // tokens of the last block
+    };
+
+    uint32_t prefix_match_ex(const llama_token * tokens, int32_t n_tokens, bool need_state, uint64_t & out_handle);
+
+    void prefix_notify_ex(const llama_ubatch & ubatch, std::vector<seq_end> & out);
+
+    void prefix_set_state(uint64_t hash, const llama_token * tokens, std::vector<uint8_t> state);
+
+    const std::vector<uint8_t> * prefix_handle_state(uint64_t handle) const;
+
+    void prefix_set_enabled(bool enabled);
+
+    //
     // llama_kv_cache specific API
     //
 
@@ -195,6 +231,9 @@ public:
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+
+    // remember the applied slot info for prefix_notify_ex (called by llama_kv_cache_context::apply)
+    void prefix_note_applied(const slot_info & sinfo);
 
     //
     // input API
@@ -265,7 +304,7 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
-    // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+    // the current index from where we start searching for SWA-masked cells to reuse (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
 
@@ -281,6 +320,37 @@ private:
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
+
+    //
+    // prefix cache state
+    //
+
+    bool prefix_enabled = true;
+
+    llama_prefix_cache prefix;
+
+    // per-sequence token chain trackers for block hash computation
+    std::vector<llama_prefix_chain> chains;
+
+    // the slot info of the last ubatch applied by a batch context, consumed by prefix_notify_ex
+    slot_info inflight_sinfo;
+    bool      inflight_valid = false;
+
+    // evict the oldest unpinned cache-owned block of the stream, freeing its cells
+    // return true if a block was evicted
+    bool prefix_evict_one(uint32_t stream);
+
+    // unregister the given locations and unpin their blocks
+    void prefix_unregister(const std::vector<llama_prefix_cache::loc_t> & locs);
+
+    // verify that block b holds exactly the positions [p0, p0 + block_size) (any sequence)
+    bool prefix_block_matches(const llama_kv_cells & cells, uint32_t b, llama_pos p0) const;
+
+    bool prefix_copy_impl(llama_seq_id seq_id, const std::vector<uint64_t> & hashes);
+
+    // copy n cells of K/V data between two streams, starting at the given cells
+    void copy_cells(uint32_t ssrc, uint32_t csrc, uint32_t sdst, uint32_t cdst, uint32_t n);
+
 
     std::vector<kv_layer> layers;
 

@@ -782,6 +782,35 @@ extern "C" {
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
     //
+    // Block-hash prefix cache
+    //
+
+    struct llama_prefix_match {
+        uint32_t n_tokens; // number of matched prefix tokens (multiple of the block size)
+        uint64_t handle;   // handle pinning the matched blocks, 0 if no match
+    };
+
+    // Find the longest fully-cached block-aligned prefix of the given token array.
+    // The returned handle keeps the matched blocks alive until released or copied.
+    LLAMA_API struct llama_prefix_match llama_memory_prefix_match(
+            const struct llama_context * ctx,
+                     const llama_token * tokens,
+                               int32_t   n_tokens);
+
+    // Reuse a matched prefix for seq_id, skipping prefill compute for it.
+    // Consumes the handle (also on failure). Requires seq_id to be empty.
+    // Returns true on success.
+    LLAMA_API bool llama_memory_prefix_copy(
+            const struct llama_context * ctx,
+                            llama_seq_id   seq_id,
+                               uint64_t   handle);
+
+    // Release a handle returned by llama_memory_prefix_match without copying
+    LLAMA_API void llama_memory_prefix_release(
+            const struct llama_context * ctx,
+                               uint64_t   handle);
+
+    //
     // State / sessions
     //
 

@@ -4,6 +4,9 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <algorithm>
+#include <cstring>
+
 //
 // llama_memory_hybrid
 //
@@ -65,6 +68,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+    prefix_eval_pending();
+
     do {
         balloc.split_reset();
 
@@ -127,6 +132,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
+    prefix_eval_pending();
+
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
@@ -136,11 +143,24 @@ bool llama_memory_hybrid::get_can_shift() const {
 }
 
 void llama_memory_hybrid::clear(bool data) {
+    pendings.clear();
+
     mem_attn->clear(data);
     mem_recr->clear(data);
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // drop the pending snapshots that fall inside the removed range
+    if (seq_id >= 0) {
+        pendings.erase(
+            std::remove_if(pendings.begin(), pendings.end(), [&](const pending_state & p) {
+                return p.seq_id == seq_id && (p0 < 0 || p.pos_end > p0) && (p1 < 0 || p.pos_end - 1 < p1);
+            }),
+            pendings.end());
+    } else {
+        pendings.clear();
+    }
+
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
@@ -160,11 +180,28 @@ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (shift != 0 && seq_id >= 0) {
+        // the shifted positions no longer match the pending snapshot endpoints
+        pendings.erase(
+            std::remove_if(pendings.begin(), pendings.end(), [&](const pending_state & p) {
+                return p.seq_id == seq_id;
+            }),
+            pendings.end());
+    }
+
     mem_attn->seq_add(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (d != 1 && seq_id >= 0) {
+        pendings.erase(
+            std::remove_if(pendings.begin(), pendings.end(), [&](const pending_state & p) {
+                return p.seq_id == seq_id;
+            }),
+            pendings.end());
+    }
+
     mem_attn->seq_div(seq_id, p0, p1, d);
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
@@ -209,6 +246,100 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+llama_prefix_match llama_memory_hybrid::prefix_match(const llama_token * tokens, int32_t n_tokens) {
+    prefix_eval_pending();
+
+    uint64_t handle = 0;
+
+    // a hybrid prefix is reusable only with a recurrent state snapshot at its end
+    llama_prefix_match res { mem_attn->prefix_match_ex(tokens, n_tokens, /*need_state=*/ true, handle), handle };
+
+    return res;
+}
+
+bool llama_memory_hybrid::prefix_copy(llama_seq_id seq_id, uint64_t handle) {
+    prefix_eval_pending();
+
+    // note: remains valid while the handle is pinned (entries with pins are never evicted)
+    const auto * state = mem_attn->prefix_handle_state(handle);
+
+    bool ok = false;
+
+    if (state && mem_recr->seq_pos_max(seq_id) == -1) {
+        if (mem_attn->prefix_copy(seq_id, handle)) {
+            const llama_pos pos = mem_attn->seq_pos_max(seq_id);
+
+            ok = mem_recr->restore_prefix_state(seq_id, pos, state->data(), state->size());
+            if (!ok) {
+                mem_attn->seq_rm(seq_id, 0, -1);
+            }
+        }
+    } else {
+        mem_attn->prefix_release(handle);
+    }
+
+    return ok;
+}
+
+void llama_memory_hybrid::prefix_release(uint64_t handle) {
+    mem_attn->prefix_release(handle);
+}
+
+void llama_memory_hybrid::prefix_notify(const llama_ubatch & ubatch) {
+    std::vector<llama_kv_cache::seq_end> ends;
+
+    mem_attn->prefix_notify_ex(ubatch, ends);
+
+    for (const auto & end : ends) {
+        pending_state p;
+
+        p.seq_id  = end.seq_id;
+        p.pos_end = end.pos_end;
+        p.hash    = end.hash;
+
+        memcpy(p.tokens, end.tokens, sizeof(p.tokens));
+
+        pendings.push_back(p);
+    }
+}
+
+void llama_memory_hybrid::prefix_eval_pending() {
+    if (pendings.empty()) {
+        return;
+    }
+
+    std::vector<pending_state> rest;
+
+    for (const auto & p : pendings) {
+        const int32_t tail = p.seq_id >= 0 && (size_t) p.seq_id < mem_recr->cells.size() ? mem_recr->cells[p.seq_id].tail : -1;
+        if (tail < 0) {
+            // the sequence is gone
+            continue;
+        }
+
+        const auto & cell = mem_recr->cells[tail];
+
+        if (cell.pos == p.pos_end - 1) {
+            // the recurrent state is exactly at the prefix end - snapshot it
+            auto state = mem_recr->snapshot_prefix_state(p.seq_id);
+            if (!state.empty()) {
+                mem_attn->prefix_set_state(p.hash, p.tokens, std::move(state));
+            }
+
+            continue;
+        }
+
+        if (cell.pos < p.pos_end - 1) {
+            // the sequence rolled back before the prefix end - it may come back
+            rest.push_back(p);
+        }
+
+        // otherwise the state advanced past the prefix end - the snapshot is lost
+    }
+
+    pendings = std::move(rest);
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
@@ -234,7 +365,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())),
+    mem(mem) {
 }
 
 bool llama_memory_hybrid_context::next() {
@@ -252,6 +384,11 @@ bool llama_memory_hybrid_context::next() {
 
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    // snapshot pending prefix states before this ubatch overwrites the recurrent state
+    if (mem) {
+        mem->prefix_eval_pending();
+    }
 
     bool res = true;
 

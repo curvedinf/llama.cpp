@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+    #define GGML_BACKEND_API_VERSION 3
 
     //
     // Backend buffer type
@@ -137,6 +137,12 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) batched copy of graph inputs from host memory to this backend
+        // the caller guarantees that no in-flight work reads or writes the dst tensors,
+        // and the src host memory must be fully consumed before the call returns
+        // returns false if the tensors are not supported and the caller should fall back to sync copies
+        bool (*set_inputs_async)(ggml_backend_t backend, const struct ggml_tensor * const * src, struct ggml_tensor * const * dst, int n);
     };
 
     struct ggml_backend {

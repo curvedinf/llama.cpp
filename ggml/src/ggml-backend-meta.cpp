@@ -981,7 +981,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SOLVE_TRI: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_GATED_DELTA_NET: {
+            case GGML_OP_GATED_DELTA_NET:
+            case GGML_OP_GATED_DELTA_NET_IDX: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
             case GGML_OP_DSV4_HC_COMB:

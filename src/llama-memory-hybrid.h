@@ -77,17 +77,44 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
     //
+    // prefix cache (llama_memory_i)
+    //
+
+    llama_prefix_match prefix_match(const llama_token * tokens, int32_t n_tokens) override;
+
+    bool prefix_copy(llama_seq_id seq_id, uint64_t handle) override;
+
+    void prefix_release(uint64_t handle) override;
+
+    void prefix_notify(const llama_ubatch & ubatch) override;
+
+    //
     // llama_memory_hybrid specific API
     //
 
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // snapshot the recurrent state of any sequence sitting at a pending aligned prefix
+    //   end and attach it to the corresponding prefix cache entry
+    void prefix_eval_pending();
+
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // aligned prefix ends reported by prefix_notify, waiting for a recurrent state snapshot
+    struct pending_state {
+        llama_seq_id seq_id;
+        llama_pos    pos_end;
+        uint64_t     hash;
+
+        llama_token tokens[llama_prefix_cache::block_size];
+    };
+
+    std::vector<pending_state> pendings;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {
@@ -137,4 +164,8 @@ private:
     const llama_memory_context_ptr ctx_recr;
 
     const llama_memory_status status;
+
+    // set for batch processing contexts, used to snapshot pending prefix states before
+    //   each ubatch overwrites the recurrent state
+    llama_memory_hybrid * mem = nullptr;
 };

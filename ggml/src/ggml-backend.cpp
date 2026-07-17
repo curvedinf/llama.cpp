@@ -1550,6 +1550,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        bool inputs_done = false;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1558,13 +1559,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (!inputs_done) {
+                    inputs_done = true;
+
+                    // handle all the inputs of this split in a single batch
+                    const ggml_tensor * inputs_src[GGML_SCHED_MAX_SPLIT_INPUTS];
+                    ggml_tensor * inputs_dst[GGML_SCHED_MAX_SPLIT_INPUTS];
+                    int n_inputs = 0;
+                    for (int i = 0; i < split->n_inputs; i++) {
+                        if (split->inputs[i]->flags & GGML_TENSOR_FLAG_INPUT) {
+                            inputs_src[n_inputs] = split->inputs[i];
+                            inputs_dst[n_inputs] = tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy);
+                            n_inputs++;
+                        }
+                    }
+
+                    // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    if (split_backend->iface.set_inputs_async == NULL ||
+                        !split_backend->iface.set_inputs_async(split_backend, inputs_src, inputs_dst, n_inputs)) {
+                        for (int i = 0; i < n_inputs; i++) {
+                            ggml_backend_tensor_copy(inputs_src[i], inputs_dst[i]);
+                        }
+                    }
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1748,7 +1770,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+
+    // enable copy double-buffering also when a backend can copy graph inputs without a full
+    // synchronization (e.g. async H2D copies), so that input copies do not drain the backend
+    bool async_inputs = false;
+    for (int b = 0; b < n_backends; b++) {
+        if (backends[b]->iface.set_inputs_async != NULL) {
+            async_inputs = true;
+            break;
+        }
+    }
+    sched->n_copies = (parallel || async_inputs) ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

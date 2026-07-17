@@ -396,6 +396,130 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+std::vector<uint8_t> llama_memory_recurrent::snapshot_prefix_state(llama_seq_id seq_id) const {
+    std::vector<uint8_t> res;
+
+    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+        return res;
+    }
+
+    const int32_t tail = cells[seq_id].tail;
+    if (tail < 0) {
+        return res;
+    }
+
+    const auto & cell = cells[tail];
+    if (cell.pos < 0) {
+        return res;
+    }
+
+    // the logical current state may live in a rollback snapshot plane (see state_write)
+    const uint32_t row = rs_idx[seq_id]*size + (cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail);
+
+    const uint32_t n_layer = hparams.n_layer();
+
+    size_t total = 0;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il]) {
+            total += ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+        }
+        if (s_l[il]) {
+            total += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+        }
+    }
+
+    res.resize(total);
+
+    uint8_t * dst = res.data();
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il]) {
+            const size_t rb = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+            ggml_backend_tensor_get(r_l[il], dst, row*rb, rb);
+            dst += rb;
+        }
+        if (s_l[il]) {
+            const size_t rb = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+            ggml_backend_tensor_get(s_l[il], dst, row*rb, rb);
+            dst += rb;
+        }
+    }
+
+    return res;
+}
+
+bool llama_memory_recurrent::restore_prefix_state(llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size) {
+    if (seq_id < 0 || (size_t) seq_id >= size) {
+        return false;
+    }
+
+    // the sequence must not have any state yet
+    if (cells[seq_id].tail >= 0) {
+        return false;
+    }
+
+    const uint32_t n_layer = hparams.n_layer();
+
+    size_t total = 0;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il]) {
+            total += ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+        }
+        if (s_l[il]) {
+            total += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+        }
+    }
+
+    if (total != data_size) {
+        return false;
+    }
+
+    // find a free cell for the sequence
+    uint32_t e = size;
+
+    for (uint32_t i = 0; i < size; ++i) {
+        const uint32_t c = (head + i)%size;
+        if (cells[c].is_empty()) {
+            e = c;
+            break;
+        }
+    }
+
+    if (e == size) {
+        return false;
+    }
+
+    const uint8_t * src = data;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (r_l[il]) {
+            const size_t rb = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+            ggml_backend_tensor_set(r_l[il], src, e*rb, rb);
+            src += rb;
+        }
+        if (s_l[il]) {
+            const size_t rb = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+            ggml_backend_tensor_set(s_l[il], src, e*rb, rb);
+            src += rb;
+        }
+    }
+
+    auto & cell = cells[e];
+
+    cell.pos = pos;
+    cell.src = e; // keep the restored state (mirrors state_read_meta)
+    cell.seq_id.insert(seq_id);
+
+    cells[seq_id].tail = e;
+
+    used++;
+
+    return true;
+}
+
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

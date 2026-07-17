@@ -247,20 +247,27 @@ public:
     // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
+    // same as above, but compute on the specified scheduler
+    ggml_status graph_compute(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
+
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // number of graphs built due to graph cache misses (llama_perf_context_data::n_reused counts the hits)
+    int32_t get_n_graph_miss() const { return n_graph_miss; }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                 ggml_backend_sched_t      sched) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -366,6 +373,32 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // cache of graphs used by process_ubatch, each with a dedicated scheduler
+    // the dedicated schedulers keep the galloc/split state of their graph, so switching
+    //   between cached graphs does not require re-splitting or re-reserving the graph
+    struct graph_cache_slot {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+
+        uint64_t t_last = 0; // last use, used for LRU eviction
+    };
+
+    std::vector<graph_cache_slot> graph_cache;
+
+    // get a slot for building a new graph: an unused one, or the least recently used
+    // when graph reuse is disabled, always returns the first slot
+    graph_cache_slot * graph_cache_acquire();
+
+    uint64_t graph_cache_clock = 0;
+
+    // scheduler that owns the graph of the latest process_ubatch result
+    ggml_backend_sched_t sched_active = nullptr;
+
+    // env: LLAMA_GRAPH_CACHE_SIZE
+    int32_t n_graph_cache_max = 8;
+
+    int32_t n_graph_miss = 0; // number of graphs built on cache misses
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -247,6 +247,8 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
 }
 
 llama_prefix_match llama_memory_hybrid::prefix_match(const llama_token * tokens, int32_t n_tokens) {
+    snap_enabled = true;
+
     prefix_eval_pending();
 
     uint64_t handle = 0;
@@ -258,6 +260,8 @@ llama_prefix_match llama_memory_hybrid::prefix_match(const llama_token * tokens,
 }
 
 bool llama_memory_hybrid::prefix_copy(llama_seq_id seq_id, uint64_t handle) {
+    snap_enabled = true;
+
     prefix_eval_pending();
 
     // note: remains valid while the handle is pinned (entries with pins are never evicted)
@@ -338,12 +342,15 @@ void llama_memory_hybrid::prefix_eval_pending() {
         const auto & cell = mem_recr->cells[tail];
 
         if (cell.pos == p.pos_end - 1) {
-            // the recurrent state is exactly at the prefix end - snapshot it
-            ggml_backend_buffer_ptr state;
-            size_t state_size = 0;
+            // the recurrent state is exactly at the prefix end - snapshot it,
+            //   but only once prefix matching is actually used (lazy activation)
+            if (snap_enabled) {
+                ggml_backend_buffer_ptr state;
+                size_t state_size = 0;
 
-            if (mem_recr->snapshot_prefix_state(snap_backend, p.seq_id, state, state_size)) {
-                mem_attn->prefix_set_state(p.hash, p.tokens, std::move(state), state_size);
+                if (mem_recr->snapshot_prefix_state(snap_backend, p.seq_id, state, state_size)) {
+                    mem_attn->prefix_set_state(p.hash, p.tokens, std::move(state), state_size);
+                }
             }
 
             continue;

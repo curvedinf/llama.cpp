@@ -26,6 +26,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | this | async recurrent prefix state snapshots | 15790.55 | 1237.40 | TG +27.7%, PP -3.2% vs 1ed3129 | committed |
 | 2026-07-17 | aa5a59f | (debug) fix GGML_VK_PERF_LOGGER assert with pending async copies | - | - | tooling only | committed |
 | 2026-07-17 | this | strided 2D snapshot copies (38 -> 2 per snapshot) | 15976.04 | 1262.97 | TG +2.1%, PP +1.2% vs prev | committed |
+| 2026-07-17 | this | lazy snapshots (only once prefix matching is used) | 16692.57 | 1365.65 | TG +8.1%, PP +4.5% vs prev | committed |
 
 Reference points for remaining prefix-machinery cost (same build, env toggles):
 - `LLAMA_PREFIX_CACHE_DISABLE=1`: PP 16765.07, TG 1367.39

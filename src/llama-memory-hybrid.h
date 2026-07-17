@@ -112,6 +112,10 @@ private:
     // backend used for async recurrent-state snapshot readback (nullptr until prefix_set_backend)
     ggml_backend_t snap_backend = nullptr;
 
+    // state snapshots are taken lazily: only once prefix matching has actually been used.
+    // workloads that never reuse prefixes (e.g. pure decode) skip the readback entirely
+    bool snap_enabled = false;
+
     // aligned prefix ends reported by prefix_notify, waiting for a recurrent state snapshot
     struct pending_state {
         llama_seq_id seq_id;

@@ -54,8 +54,10 @@ LOG="$OUT/${LABEL}-${MODE}-$(date +%Y%m%d-%H%M%S).log"
     echo "# model:  $MODEL"
 } > "$LOG"
 
+# note: -ub 1024 measured optimal for C=16 x 4k on RX 7900 XTX (see OPTIMIZATION_LOG.md);
+#   -ub 512 is -6% PP, -ub 2048 is -12% PP
 "$BUILD/bin/llama-batched-bench" \
-    -m "$MODEL" -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 512 \
+    -m "$MODEL" -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -b 2048 -ub 1024 \
     -c "$NCTX" -npp "$NPP" -ntg "$NTG" -npl "$NPL" >> "$LOG" 2>&1 &
 BENCH_PID=$!
 

@@ -29,23 +29,28 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | this | lazy snapshots (only once prefix matching is used) | 16692.57 | 1365.65 | TG +8.1%, PP +4.5% vs prev | committed |
 | 2026-07-17 | - | EXPERIMENT: dmmv 16 columns for n=16 decode matmuls | 16783.54 | 1238.24 | TG -9.3% vs prev | reverted (slower than mul_mat path) |
 | 2026-07-17 | this | batch descriptor updates per chunk in dispatch replay | 16683.53 | 1369.33 | TG +0.1% vs prev | committed |
-| 2026-07-17 | 37e04f1 | FINAL (verification runs) | 16740.53 / 16677.15 | 1365.94 / 1363.09 | - | verified, tests pass |
+| 2026-07-17 | this | harness: -ub 512 -> -ub 1024 (sweep below) | 17721.15 | 1368.00 | PP +6.3% vs prev | committed (bench-c16.sh) |
 
-Reference points for remaining prefix-machinery cost (same build, env toggles):
-- `LLAMA_PREFIX_CACHE_DISABLE=1`: PP 16765.07, TG 1367.39
-- snapshots off, chains/blocks on (experiment): PP 16736.91, TG 1364.79
-=> all of the remaining prefix cost is the state snapshot readback (~19 MB x
-   ~528 pinned-buffer D2H snapshots per run); chain feeding is free.
+ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
-## Final result (C=16 x 4k)
+| config | S_PP t/s | S_TG t/s |
+|--------|----------|----------|
+| ub=256 | 14005.66 | 1340.46 |
+| ub=512 | 16692.57 | 1365.65 |
+| ub=1024 | 17739.12 | 1370.00 |
+| ub=2048 | 15650.67 | 1371.40 |
+| b=4096 ub=1024 | 17662.76 | 1366.06 |
+| b=4096 ub=2048 | 15475.68 | 1368.57 |
+
+## Final result (C=16 x 4k, -ub 1024)
 
 | build | S_PP t/s | S_TG t/s | S t/s |
 |-------|----------|----------|-------|
-| upstream 0dc74e3 | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
-| HEAD baseline 1ed3129 | 16318 | 968 | 11025 |
-| **optimized (37e04f1)** | **16677 - 16740** | **1363 - 1369** | **12441 - 12482** |
+| upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
+| HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
+| **optimized (ub 1024)** | **17721** | **1368** | **13009** |
 
-vs HEAD baseline: PP +2.4%, TG +40.8%. vs upstream: PP -3.5%, TG +3.8%.
+vs HEAD baseline: PP +8.6%, TG +41.2%, S +18.0%. vs upstream: PP +2.5%, TG +4.0%, S +2.9%.
 
 ## Findings
 

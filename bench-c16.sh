@@ -2,6 +2,7 @@
 # C=16 x 128k benchmark harness for the concurrency-optimization branch.
 # Usage: ./bench-c16.sh [build_dir] [label] [quick|full]
 #   quick: 16 x 8k prompt  (fast sanity, ~1 min)
+#   s4k:   16 x 4k prompt  (the C=16 4k seq len target workload)
 #   full:  16 x 128k prompt (the target workload; long prefill)
 #
 # Safety: refuses to start on a contended GPU, and a watchdog kills the bench
@@ -27,7 +28,7 @@ VRAM_FREE_MB=$(amd-smi metric --mem-usage 2>/dev/null | grep -oP 'FREE_VRAM:\s*\
 VRAM_FREE=$(( ${VRAM_FREE_MB:-0} / 1024 ))
 # full mode needs ~16 GiB (KV + weights + state + compute); require 18 GiB free headroom
 NEED_FREE=18
-[ "$MODE" = quick ] && NEED_FREE=8
+if [ "$MODE" = quick ] || [ "$MODE" = s4k ]; then NEED_FREE=8; fi
 if [ "${FORCE:-0}" != 1 ] && { [ "${KFD_PIDS:-0}" -gt 0 ] || [ "${GPU_USE:-0}" -gt 20 ] || [ "${VRAM_FREE:-0}" -lt "$NEED_FREE" ]; }; then
     echo "error: GPU not clear (${KFD_PIDS} compute processes, ${GPU_USE}% used, ${VRAM_FREE} GB VRAM free; need ${NEED_FREE} GB) - results would be invalid/dangerous."
     echo "       wait for it to free up, or run with FORCE=1 to proceed anyway."
@@ -36,6 +37,8 @@ fi
 
 if [ "$MODE" = full ]; then
     NPP=130816
+elif [ "$MODE" = s4k ]; then
+    NPP=4096
 else
     NPP=8192
 fi

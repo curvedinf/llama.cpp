@@ -143,6 +143,9 @@ struct llama_memory_i {
 
     // notification that an ubatch was computed - used to register newly-filled blocks
     virtual void prefix_notify(const llama_ubatch & ubatch);
+
+    // provide the backends that own the memory buffers (for async state snapshot readback)
+    virtual void prefix_set_backend(const std::vector<ggml_backend_t> & backends);
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

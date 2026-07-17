@@ -269,7 +269,7 @@ bool llama_memory_hybrid::prefix_copy(llama_seq_id seq_id, uint64_t handle) {
         if (mem_attn->prefix_copy(seq_id, handle)) {
             const llama_pos pos = mem_attn->seq_pos_max(seq_id);
 
-            ok = mem_recr->restore_prefix_state(seq_id, pos, state->data(), state->size());
+            ok = mem_recr->restore_prefix_state(snap_backend, seq_id, pos, state->data(), state->size());
             if (!ok) {
                 mem_attn->seq_rm(seq_id, 0, -1);
             }
@@ -283,6 +283,19 @@ bool llama_memory_hybrid::prefix_copy(llama_seq_id seq_id, uint64_t handle) {
 
 void llama_memory_hybrid::prefix_release(uint64_t handle) {
     mem_attn->prefix_release(handle);
+}
+
+void llama_memory_hybrid::prefix_set_backend(const std::vector<ggml_backend_t> & backends) {
+    const auto * dev = mem_recr->state_device();
+
+    snap_backend = nullptr;
+
+    for (auto * backend : backends) {
+        if (ggml_backend_get_device(backend) == dev) {
+            snap_backend = backend;
+            break;
+        }
+    }
 }
 
 void llama_memory_hybrid::prefix_notify(const llama_ubatch & ubatch) {
@@ -308,6 +321,11 @@ void llama_memory_hybrid::prefix_eval_pending() {
         return;
     }
 
+    if (snap_backend == nullptr) {
+        // cannot snapshot without a backend - keep the pendings for later
+        return;
+    }
+
     std::vector<pending_state> rest;
 
     for (const auto & p : pendings) {
@@ -321,9 +339,11 @@ void llama_memory_hybrid::prefix_eval_pending() {
 
         if (cell.pos == p.pos_end - 1) {
             // the recurrent state is exactly at the prefix end - snapshot it
-            auto state = mem_recr->snapshot_prefix_state(p.seq_id);
-            if (!state.empty()) {
-                mem_attn->prefix_set_state(p.hash, p.tokens, std::move(state));
+            ggml_backend_buffer_ptr state;
+            size_t state_size = 0;
+
+            if (mem_recr->snapshot_prefix_state(snap_backend, p.seq_id, state, state_size)) {
+                mem_attn->prefix_set_state(p.hash, p.tokens, std::move(state), state_size);
             }
 
             continue;

@@ -2,6 +2,8 @@
 
 #include "llama.h"
 
+#include "ggml-cpp.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +42,15 @@ public:
         }
     };
 
+    // read-only view of a state snapshot attached to an entry
+    struct state_view {
+        const uint8_t * ptr = nullptr;
+        size_t          n   = 0;
+
+        const uint8_t * data() const { return ptr; }
+        size_t          size() const { return n; }
+    };
+
     struct entry {
         uint64_t hash = 0;
 
@@ -51,6 +62,15 @@ public:
 
         bool has_state = false;
         std::vector<uint8_t> state; // state snapshot at the end of this block's prefix
+
+        // alternative state storage: a backend host buffer (e.g. Vulkan pinned memory) that
+        //   an async device-to-host copy may still be filling. the copy is ordered before any
+        //   later backend work on the same device, so restoring with ggml_backend_tensor_set
+        //   after synchronizing the backend is safe. never read the bytes from the CPU without
+        //   synchronizing the backend first.
+        ggml_backend_buffer_ptr state_buf;
+
+        state_view sv; // view of state / state_buf, valid while the entry is alive
 
         std::list<uint64_t>::iterator lru_it;
     };
@@ -151,7 +171,24 @@ public:
         }
 
         it->second.state     = std::move(state);
+        it->second.state_buf = nullptr;
         it->second.has_state = true;
+        it->second.sv        = { it->second.state.data(), it->second.state.size() };
+
+        touch(it->second);
+    }
+
+    // attach a state snapshot held by a backend host buffer (see entry::state_buf)
+    void set_state(uint64_t hash, const llama_token * tokens, ggml_backend_buffer_ptr && buf, size_t size) {
+        auto it = map.find(hash);
+        if (it == map.end() || !tokens_equal(it->second.tokens, tokens)) {
+            return;
+        }
+
+        it->second.state.clear();
+        it->second.state_buf = std::move(buf);
+        it->second.has_state = true;
+        it->second.sv        = { (const uint8_t *) ggml_backend_buffer_get_base(it->second.state_buf.get()), size };
 
         touch(it->second);
     }
@@ -292,7 +329,7 @@ public:
     }
 
     // the state snapshot at the end of a matched prefix (nullptr if none or invalid handle)
-    const std::vector<uint8_t> * handle_state(uint64_t handle) const {
+    const state_view * handle_state(uint64_t handle) const {
         const auto * hashes = handle_hashes(handle);
         if (!hashes || hashes->empty()) {
             return nullptr;
@@ -303,7 +340,7 @@ public:
             return nullptr;
         }
 
-        return &e->state;
+        return &e->sv;
     }
 
     // unpin and forget a handle

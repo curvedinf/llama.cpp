@@ -79,3 +79,7 @@ void llama_memory_i::prefix_release(uint64_t handle) {
 void llama_memory_i::prefix_notify(const llama_ubatch & ubatch) {
     GGML_UNUSED(ubatch);
 }
+
+void llama_memory_i::prefix_set_backend(const std::vector<ggml_backend_t> & backends) {
+    GGML_UNUSED(backends);
+}

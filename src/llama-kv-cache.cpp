@@ -1088,7 +1088,11 @@ void llama_kv_cache::prefix_set_state(uint64_t hash, const llama_token * tokens,
     prefix.set_state(hash, tokens, std::move(state));
 }
 
-const std::vector<uint8_t> * llama_kv_cache::prefix_handle_state(uint64_t handle) const {
+void llama_kv_cache::prefix_set_state(uint64_t hash, const llama_token * tokens, ggml_backend_buffer_ptr buf, size_t size) {
+    prefix.set_state(hash, tokens, std::move(buf), size);
+}
+
+const llama_prefix_cache::state_view * llama_kv_cache::prefix_handle_state(uint64_t handle) const {
     return prefix.handle_state(handle);
 }
 

@@ -82,13 +82,21 @@ public:
     // prefix cache support
     //
 
-    // snapshot the current recurrent state of seq_id across all layers into host memory
-    // return an empty vector if the sequence has no state
-    std::vector<uint8_t> snapshot_prefix_state(llama_seq_id seq_id) const;
+    // device of the recurrent state tensors (nullptr if there are none)
+    ggml_backend_dev_t state_device() const;
+
+    // snapshot the current recurrent state of seq_id across all layers into a freshly
+    // allocated host buffer of the state device (pinned memory on GPU backends).
+    // the snapshot is read back with async copies - the bytes are only guaranteed to be
+    // complete once `backend` has been synchronized; restoring with ggml_backend_tensor_set
+    // after a backend synchronize is always safe.
+    // return false if the sequence has no state or the allocation failed
+    bool snapshot_prefix_state(ggml_backend_t backend, llama_seq_id seq_id, ggml_backend_buffer_ptr & out_buf, size_t & out_size) const;
 
     // restore a snapshot as the initial state of a fresh sequence (must have no state)
     // pos is the position of the last token of the snapshot's prefix
-    bool restore_prefix_state(llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size);
+    // backend, when non-null, is synchronized first so that async snapshot reads have completed
+    bool restore_prefix_state(ggml_backend_t backend, llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size);
 
     // computed before each graph build
     uint32_t n = 0;

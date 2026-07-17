@@ -423,6 +423,10 @@ llama_context::llama_context(
             backend_buf_exp_size.push_back(0);
         }
 
+        if (memory) {
+            memory->prefix_set_backend(backend_ptrs);
+        }
+
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched

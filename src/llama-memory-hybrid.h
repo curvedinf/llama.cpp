@@ -99,11 +99,18 @@ public:
     //   end and attach it to the corresponding prefix cache entry
     void prefix_eval_pending();
 
+    // resolve the backend that owns the recurrent state tensors (needed for the async
+    //   state snapshot readback). called by llama_context once the backends exist.
+    void prefix_set_backend(const std::vector<ggml_backend_t> & backends) override;
+
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    // backend used for async recurrent-state snapshot readback (nullptr until prefix_set_backend)
+    ggml_backend_t snap_backend = nullptr;
 
     // aligned prefix ends reported by prefix_notify, waiting for a recurrent state snapshot
     struct pending_state {

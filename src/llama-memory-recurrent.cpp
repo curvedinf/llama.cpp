@@ -396,21 +396,36 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
-std::vector<uint8_t> llama_memory_recurrent::snapshot_prefix_state(llama_seq_id seq_id) const {
-    std::vector<uint8_t> res;
+ggml_backend_dev_t llama_memory_recurrent::state_device() const {
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (s_l[il]) {
+            return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(s_l[il]->buffer));
+        }
+        if (r_l[il]) {
+            return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(r_l[il]->buffer));
+        }
+    }
+
+    return nullptr;
+}
+
+bool llama_memory_recurrent::snapshot_prefix_state(ggml_backend_t backend, llama_seq_id seq_id, ggml_backend_buffer_ptr & out_buf, size_t & out_size) const {
+    if (backend == nullptr) {
+        return false;
+    }
 
     if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
-        return res;
+        return false;
     }
 
     const int32_t tail = cells[seq_id].tail;
     if (tail < 0) {
-        return res;
+        return false;
     }
 
     const auto & cell = cells[tail];
     if (cell.pos < 0) {
-        return res;
+        return false;
     }
 
     // the logical current state may live in a rollback snapshot plane (see state_write)
@@ -429,27 +444,37 @@ std::vector<uint8_t> llama_memory_recurrent::snapshot_prefix_state(llama_seq_id 
         }
     }
 
-    res.resize(total);
+    auto * dev = state_device();
+    if (dev == nullptr) {
+        return false;
+    }
 
-    uint8_t * dst = res.data();
+    out_buf.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(dev), total));
+    if (!out_buf) {
+        return false;
+    }
+
+    out_size = total;
+
+    uint8_t * dst = (uint8_t *) ggml_backend_buffer_get_base(out_buf.get());
 
     for (uint32_t il = 0; il < n_layer; ++il) {
         if (r_l[il]) {
             const size_t rb = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-            ggml_backend_tensor_get(r_l[il], dst, row*rb, rb);
+            ggml_backend_tensor_get_async(backend, r_l[il], dst, row*rb, rb);
             dst += rb;
         }
         if (s_l[il]) {
             const size_t rb = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-            ggml_backend_tensor_get(s_l[il], dst, row*rb, rb);
+            ggml_backend_tensor_get_async(backend, s_l[il], dst, row*rb, rb);
             dst += rb;
         }
     }
 
-    return res;
+    return true;
 }
 
-bool llama_memory_recurrent::restore_prefix_state(llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size) {
+bool llama_memory_recurrent::restore_prefix_state(ggml_backend_t backend, llama_seq_id seq_id, llama_pos pos, const uint8_t * data, size_t data_size) {
     if (seq_id < 0 || (size_t) seq_id >= size) {
         return false;
     }
@@ -489,6 +514,11 @@ bool llama_memory_recurrent::restore_prefix_state(llama_seq_id seq_id, llama_pos
 
     if (e == size) {
         return false;
+    }
+
+    // make sure any async snapshot copies into `data` have completed
+    if (backend != nullptr) {
+        ggml_backend_synchronize(backend);
     }
 
     const uint8_t * src = data;

@@ -181,7 +181,9 @@ public:
 
     void prefix_set_state(uint64_t hash, const llama_token * tokens, std::vector<uint8_t> state);
 
-    const std::vector<uint8_t> * prefix_handle_state(uint64_t handle) const;
+    void prefix_set_state(uint64_t hash, const llama_token * tokens, ggml_backend_buffer_ptr buf, size_t size);
+
+    const llama_prefix_cache::state_view * prefix_handle_state(uint64_t handle) const;
 
     void prefix_set_enabled(bool enabled);
 

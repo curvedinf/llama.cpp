@@ -41,6 +41,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-18 | this | merge q+k L2 norms into one op per delta layer | 17859.77 | 1594.66 | within noise (-0.2% TG) | committed |
 | 2026-07-18 | this | fuse residual ADD + RMS_NORM + MUL (input-norm chain) | 17956.21 | 1599.11 | within noise | committed |
 | 2026-07-18 | - | EXPERIMENT: fold beta sigmoid into the GDN op (4 variants) | 17863.15 | 1553.90 | TG -2.8% vs prev | reverted (see note below) |
+| 2026-07-18 | this | split-K for skinny-n matmuls (drop n>=tile guard in ggml_vk_guess_split_k) | 17856.80 | 1857.54 | TG +16.2%, PP -0.6% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -71,10 +72,13 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024, in-place GDN + conv)** | **17859 - 18014** | **1595 - 1599** | **13643 - 13783** |
+| **optimized (ub 1024, in-place GDN + conv + skinny-n split-K)** | **17856 - 18006** | **1857 - 1859** | **14121 - 14160** |
 
-vs HEAD baseline: PP +10.0%, TG +64.9%, S +24.2%. vs upstream: PP +3.8%, TG +21.4%, S +8.4%.
+vs HEAD baseline: PP +9.4%, TG +91.8%, S +28.4%. vs upstream: PP +3.2%, TG +41.2%, S +12.0%.
 At 16x8k (quick): PP 16187 vs upstream 16595 (-2.5%), TG 1435 vs upstream 1329 (+8.0%).
+
+Update (2026-07-18): skinny-n split-K raised TG from ~1599 to ~1858. The 16x8k
+cross-check above predates that change.
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full
@@ -210,6 +214,21 @@ Also fixed mid-way: the fused dispatch case was missing from the UNARY switch,
 so the first bench (PP 20203/TG 1701) silently skipped all GDN ops - invalid.
 Lesson reconfirmed: any fusion win must be validated by generation identity,
 not just perf numbers. Reverted entirely.
+
+## Skinny-n split-K (2026-07-18)
+
+Per-step op profile at C=16 4k (GGML_VK_PERF_LOGGER): MUL_MAT kernels are ~70%
+of the ~10 ms step, running at 1-6.5 TFLOPS. The worst shape is ffn_down
+(m=1024, n=16, k=3584, ~20% of step): 32 workgroups of 1 wave on 96 CUs, no
+latency hiding. The existing split-K machinery was gated behind
+n >= wg_denoms[1] (32), blocking exactly the skinny-n case; the n dimension is
+already bounds-checked in the shader. Dropping that guard gives split_k=3
+(96 workgroups) for m=1024/k=3584 and m=1024/k=2048.
+
+Result: TG 1599.11 -> 1857.54 (+16.2%), PP 17956 -> 17856 (-0.6%).
+Numerics: accumulation order changes (f16 per-split partials + f32 reduce);
+validated with test-backend-ops -o MUL_MAT (3/3) and coherent greedy
+generation matching upstream. Not bit-identical by design.
 
 ## Constraints
 

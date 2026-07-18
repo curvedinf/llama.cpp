@@ -292,6 +292,166 @@ static bool run_case_inplace(ggml_backend_t backend, const test_cfg & cfg) {
     return ok;
 }
 
+// indexed in-place conv (ggml_ssm_conv_idx): output must match the reference
+// (gathered state + concat + ggml_ssm_conv) and the store rows s_idxs[i] must hold
+// the shifted new state; other rows untouched.
+struct test_conv_cfg {
+    int64_t nc;     // d_conv
+    int64_t nr;     // d_inner (channels)
+    int64_t n_t;    // new tokens per seq
+    int64_t n_s;    // sequences
+    int64_t n_rows; // store rows
+};
+
+static bool run_case_conv_inplace(ggml_backend_t backend, const test_conv_cfg & cfg) {
+    char name[128];
+    snprintf(name, sizeof(name), "conv nc=%d nr=%d T=%d B=%d rows=%d (in-place)",
+        (int) cfg.nc, (int) cfg.nr, (int) cfg.n_t, (int) cfg.n_s, (int) cfg.n_rows);
+
+    struct ggml_init_params iparams = { 32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(iparams);
+
+    ggml_tensor * store  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (cfg.nc - 1)*cfg.nr, cfg.n_rows);
+    ggml_tensor * idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, cfg.n_s);
+    ggml_tensor * tokens = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, cfg.n_t, cfg.nr, cfg.n_s);
+    ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.nc, cfg.nr);
+
+    // reference path: gather, concat, conv
+    ggml_tensor * gathered  = ggml_get_rows(ctx, store, idx);
+    ggml_tensor * states_3d = ggml_reshape_3d(ctx, gathered, cfg.nc - 1, cfg.nr, cfg.n_s);
+    ggml_tensor * conv_in   = ggml_concat(ctx, states_3d, tokens, 0);
+    ggml_tensor * ref       = ggml_ssm_conv(ctx, conv_in, weight);
+
+    // indexed in-place path
+    ggml_tensor * out_i = ggml_ssm_conv_idx(ctx, tokens, weight, store, idx);
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, ref);
+    ggml_build_forward_expand(gf, out_i);
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "%s: alloc failed\n", name);
+        return false;
+    }
+
+    std::mt19937 rng(1234);
+
+    const int64_t row_elems = (cfg.nc - 1)*cfg.nr;
+
+    std::vector<float> buf(ggml_nelements(store));
+    fill(buf.data(), ggml_nelements(store), -1.0f, 1.0f, rng);
+    ggml_backend_tensor_set(store, buf.data(), 0, buf.size()*sizeof(float));
+
+    const std::vector<float> store_snapshot = buf;
+
+    std::vector<int32_t> idx_data(cfg.n_s);
+    for (int64_t i = 0; i < cfg.n_s; i++) {
+        // the in-place form requires distinct rows
+        idx_data[i] = (int32_t) ((2*i + 1) % cfg.n_rows);
+    }
+    ggml_backend_tensor_set(idx, idx_data.data(), 0, idx_data.size()*sizeof(int32_t));
+
+    buf.resize(ggml_nelements(tokens));
+    fill(buf.data(), ggml_nelements(tokens), -1.0f, 1.0f, rng);
+    ggml_backend_tensor_set(tokens, buf.data(), 0, buf.size()*sizeof(float));
+
+    buf.resize(ggml_nelements(weight));
+    fill(buf.data(), ggml_nelements(weight), -1.0f, 1.0f, rng);
+    ggml_backend_tensor_set(weight, buf.data(), 0, buf.size()*sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: compute failed\n", name);
+        return false;
+    }
+
+    bool ok = true;
+
+    const int64_t n_out = ggml_nelements(ref);
+    std::vector<float> res_g(n_out), res_i(n_out);
+    ggml_backend_tensor_get(ref,   res_g.data(), 0, n_out*sizeof(float));
+    ggml_backend_tensor_get(out_i, res_i.data(), 0, n_out*sizeof(float));
+
+    int64_t n_nan = 0;
+    for (int64_t i = 0; i < n_out; i++) {
+        n_nan += std::isnan(res_g[i]) || std::isnan(res_i[i]);
+    }
+    if (n_nan > 0) {
+        fprintf(stderr, "%s: %d NaNs\n", name, (int) n_nan);
+        ok = false;
+    }
+
+    // NOTE: the two paths may round differently (dot order), compare with tolerance
+    {
+        int64_t first = -1;
+        for (int64_t i = 0; i < n_out; i++) {
+            if (std::abs(res_g[i] - res_i[i]) > 1e-5f*std::max(1.0f, std::abs(res_g[i]))) { first = i; break; }
+        }
+        if (first >= 0) {
+            fprintf(stderr, "%s: output mismatch at %d (%g != %g)\n", name, (int) first, res_g[first], res_i[first]);
+            ok = false;
+        }
+    }
+
+    // expected store rows: last nc-1 window columns per sequence, computed from the
+    // original inputs (note: conv_in's buffer is recycled by the allocator after the
+    // graph runs - it must not be read back here)
+    std::vector<float> buf_tokens(ggml_nelements(tokens));
+    ggml_backend_tensor_get(tokens, buf_tokens.data(), 0, buf_tokens.size()*sizeof(float));
+
+    buf.resize(ggml_nelements(store));
+    ggml_backend_tensor_get(store, buf.data(), 0, buf.size()*sizeof(float));
+
+    std::vector<bool> touched(cfg.n_rows, false);
+    for (int64_t s = 0; s < cfg.n_s; s++) {
+        touched[idx_data[s]] = true;
+    }
+
+    for (int64_t r = 0; r < cfg.n_rows; r++) {
+        if (!touched[r]) {
+            if (std::memcmp(buf.data() + r*row_elems, store_snapshot.data() + r*row_elems, row_elems*sizeof(float)) != 0) {
+                fprintf(stderr, "%s: untouched store row %d changed\n", name, (int) r);
+                ok = false;
+            }
+            continue;
+        }
+
+        int64_t s = 0;
+        for (; s < cfg.n_s; s++) {
+            if (idx_data[s] == r) {
+                break;
+            }
+        }
+
+        // new state column c of channel ch = window column (n_t + c):
+        //   old state column (n_t + c) if < nc - 1, else token (n_t + c - (nc - 1))
+        for (int64_t c = 0; c < cfg.nc - 1; c++) {
+            for (int64_t ch = 0; ch < cfg.nr; ch++) {
+                const int64_t w = cfg.n_t + c;
+
+                float expect;
+                if (w < cfg.nc - 1) {
+                    expect = store_snapshot[r*row_elems + ch*(cfg.nc - 1) + w];
+                } else {
+                    expect = buf_tokens[s*cfg.nr*cfg.n_t + ch*cfg.n_t + (w - (cfg.nc - 1))];
+                }
+
+                const float actual = buf[r*row_elems + ch*(cfg.nc - 1) + c];
+                if (std::abs(expect - actual) > 1e-6f) {
+                    fprintf(stderr, "%s: store row %d col %d ch %d: %g != %g\n", name, (int) r, (int) c, (int) ch, actual, expect);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "%s: %s\n", name, ok ? "OK" : "FAIL");
+
+    ggml_gallocr_free(allocr);
+    ggml_free(ctx);
+    return ok;
+}
+
 int main(int, char **) {
     ggml_backend_load_all();
 
@@ -339,6 +499,18 @@ int main(int, char **) {
         };
         for (const auto & cfg : ip_cases) {
             ok &= run_case_inplace(backend, cfg);
+        }
+
+        const std::vector<test_conv_cfg> conv_cases = {
+            // nc, nr, n_t, n_s, n_rows
+            { 4, 16,  1, 3,  7},
+            { 4, 16,  1, 8, 18},
+            { 4, 16,  2, 2,  5}, // n_t < nc - 1: state tail + tokens
+            { 4, 16,  5, 2,  6}, // n_t >= nc - 1: state fully from tokens
+            { 3,  8,  1, 4,  9},
+        };
+        for (const auto & cfg : conv_cases) {
+            ok &= run_case_conv_inplace(backend, cfg);
         }
 
         ggml_backend_free(backend);

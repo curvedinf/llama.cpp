@@ -2452,6 +2452,17 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // indexed in-place variant: sx holds only the new tokens [n_t, d_inner, n_s];
+    // the conv state [(d_conv - 1)*d_inner, n_rows] is read from and written back to
+    // row s_idxs[i] of the store for batch sequence i (each workgroup owns its row).
+    // the caller must guarantee that the s_idxs rows are distinct.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_idx(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * store,
+            struct ggml_tensor  * s_idxs);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

@@ -9607,9 +9607,86 @@ static void ggml_compute_forward_ssm_conv_f32(
     }
 }
 
+static void ggml_compute_forward_ssm_conv_idx_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // new tokens [n_t, d_inner, n_s]
+    const ggml_tensor * src1 = dst->src[1]; // conv1d.weight [d_conv, d_inner]
+    const ggml_tensor * src2 = dst->src[2]; // state store [(d_conv - 1)*d_inner, n_rows]
+    const ggml_tensor * src3 = dst->src[3]; // sidx [n_s]
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = src1->ne[0]; // d_conv
+    const int nr  = src0->ne[1]; // d_inner
+    const int n_t =  dst->ne[1]; // tokens per sequence
+    const int n_s =  dst->ne[2]; // number of sequences in the batch
+
+    GGML_ASSERT(src3->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && src0->nb[1] == src0->ne[0]*sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float) && dst->nb[1] == dst->ne[0]*sizeof(float));
+
+    // store row layout: state column c of channel r at c + r*(nc-1) floats
+    // token t of channel r at t + r*n_t floats
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+    const int ir  = ir1 - ir0;
+
+    const float * wdata = (const float *) src1->data;
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        const int32_t row = ((const int32_t *) src3->data)[i3];
+
+        float * s_row = (float *) ((char *) src2->data + row*src2->nb[1]);
+
+        for (int i2 = 0; i2 < n_t; ++i2) {
+            for (int i1 = 0; i1 < ir; ++i1) {
+                const int r = ir0 + i1;
+
+                float sumf = 0.0f;
+
+                for (int j = 0; j < nc; ++j) {
+                    const int w = i2 - (nc - 1) + j;
+                    const float x = w < 0 ? s_row[(nc - 1 + w) + r*(nc - 1)]
+                                          : ((const float *) src0->data)[i3*nr*n_t + r*n_t + w];
+                    sumf += x*wdata[j + r*nc];
+                }
+
+                ((float *) dst->data)[i3*nr*n_t + i2*nr + r] = sumf;
+            }
+        }
+
+        // write the new state (last d_conv - 1 window columns) back to the store row
+        for (int c = 0; c < nc - 1; ++c) {
+            const int w = n_t + c; // window column
+
+            for (int i1 = 0; i1 < ir; ++i1) {
+                const int r = ir0 + i1;
+
+                s_row[c + r*(nc - 1)] = w < nc - 1 ? s_row[w + r*(nc - 1)]
+                                                   : ((const float *) src0->data)[i3*nr*n_t + r*n_t + (w - (nc - 1))];
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_ssm_conv(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (dst->src[2] != nullptr) {
+        // indexed in-place form (ggml_ssm_conv_idx)
+        ggml_compute_forward_ssm_conv_idx_f32(params, dst);
+        return;
+    }
+
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {

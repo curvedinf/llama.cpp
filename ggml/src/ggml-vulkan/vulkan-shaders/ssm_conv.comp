@@ -15,6 +15,12 @@ layout(binding = 0) readonly buffer Src0 { float src0[]; };
 layout(binding = 1) readonly buffer Src1 { float src1[]; };
 layout(binding = 2) readonly buffer Bias { float bias[]; };
 layout(binding = 3) buffer Dst { float dst[]; };
+#if USE_SIDX
+// indexed in-place form: data_state is the conv state store [(nc-1)*nr, n_rows],
+// data_sidx maps batch seq -> store row; the new state is written back in place.
+layout(binding = 4)           buffer StateBuf { float data_state[]; };
+layout(binding = 5) readonly  buffer SidxBuf  { int  data_sidx[];  };
+#endif
 
 layout(push_constant) uniform PushConstants {
     uint nb01; uint nb02;
@@ -32,6 +38,39 @@ void main() {
         return;
     }
 
+#if USE_SIDX
+    // window column j of token i2: w = i2 - (nc-1) + j; w < 0 reads the store row
+    const uint state_base = uint(data_sidx[i3]) * (nc - 1u) * nr + i1 * (nc - 1u);
+    const uint tok_base   = i3 * (nb02 / 4) + i1 * (nb01 / 4);
+
+    float sum = 0.0;
+
+    [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+        const int w = int(i2) - int(nc - 1u) + int(i0);
+        const float x = w < 0 ? data_state[state_base + (nc - 1u) + uint(w)]
+                              : src0[tok_base + uint(w)];
+        sum += x * src1[i1 * (nb11 / 4) + i0];
+    }
+
+    if (APPLY_BIAS) {
+        sum += bias[i1];
+    }
+    if (APPLY_SILU) {
+        sum = sum / (1.0f + exp(-sum));
+    }
+
+    const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
+    dst[dst_idx] = sum;
+
+    // last token: shift the new state (last nc-1 window columns) into the store row
+    if (i2 == n_t - 1u) {
+        [[unroll]] for (uint c = 0; c < nc - 1u; c++) {
+            const uint w = n_t + c;
+            data_state[state_base + c] = w < nc - 1u ? data_state[state_base + w]
+                                                     : src0[tok_base + (w - (nc - 1u))];
+        }
+    }
+#else
     const uint src0_base = i3 * (nb02 / 4) + i2 + i1 * (nb01 / 4);
     const uint src1_base = i1 * (nb11 / 4);
 
@@ -57,4 +96,5 @@ void main() {
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
     dst[dst_idx] = sum;
+#endif
 }

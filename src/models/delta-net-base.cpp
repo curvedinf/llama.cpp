@@ -450,6 +450,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
         int                  il) {
@@ -459,6 +460,14 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const auto mem_size = mctx_cur->get_size();
 
     const int64_t n_seqs = ubatch.n_seqs;
+
+    if (inp->direct && qkv_mixed->ne[1] == 1) {
+        // steady-state decode: read/write the conv state rows in place via s_copy_main,
+        //   skipping the gather, concat and write-back copy
+        ggml_tensor * qkv_t = ggml_reshape_3d(ctx0, qkv_mixed, 1, conv_channels, n_seqs);
+
+        return ggml_ssm_conv_idx(ctx0, qkv_t, conv_kernel, conv_states_all, inp->s_copy_main);
+    }
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
@@ -521,7 +530,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         }
     }
 
-    return conv_input;
+    return ggml_ssm_conv(ctx0, conv_input, conv_kernel);
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(

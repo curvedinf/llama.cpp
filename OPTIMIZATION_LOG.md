@@ -33,6 +33,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | this | harness: -ub 512 -> -ub 1024 (sweep below) | 17721.15 | 1368.00 | PP +6.3% vs prev | committed (bench-c16.sh) |
 | 2026-07-17 | 058402b | FINAL verification (clean tree, guarded harness) | 17711.19 | 1373.94 | - | verified, tests pass |
 | 2026-07-18 | this | GDN in-place state write-back (skip snapshot + 18x16MB cpy/step) | 17748.20 | 1479.37 | TG +8.1%, PP +0.2% vs prev | committed |
+| 2026-07-18 | this | conv state in-place (skip gather+concat+cpy, ~54 nodes/step) | 17733.44 | 1544.47 | TG +4.4%, PP -0.1% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -63,9 +64,9 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024, in-place GDN)** | **17748** | **1479** | **13312** |
+| **optimized (ub 1024, in-place GDN + conv)** | **17733** | **1544** | **13459** |
 
-vs HEAD baseline: PP +8.8%, TG +52.7%, S +20.7%. vs upstream: PP +2.6%, TG +12.4%, S +5.3%.
+vs HEAD baseline: PP +8.7%, TG +59.5%, S +22.1%. vs upstream: PP +2.5%, TG +17.4%, S +6.5%.
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full
@@ -111,6 +112,14 @@ watchdog or on CPU; it is not part of the bench flow.
 - dmmv (dequant-mul-mat-vec) extended to 16 columns was SLOWER than the mul_mat
   path at n=16 (-9.3% TG) - serialized per-op timings (GGML_VK_PERF_LOGGER)
   mislead; wall-clock is the arbiter. Reverted.
+- Conv state in-place (ggml_ssm_conv_idx): the conv1d state was gathered with
+  get_rows, concatenated with the new tokens, and its tail copied back to the
+  store every step (54 nodes, ~45 MB of copies at C=16). The indexed variant
+  reads/writes the state rows in place under the same src0 == own index
+  invariant as the GDN path (shared get_direct flag, automatic fallback to
+  the gather path). Validated bit-exact on CPU and Vulkan
+  (test-gdn-indexed-state conv cases incl. n_t < nc-1 and n_t >= nc-1).
+  Result: TG 1479.37 -> 1544.47 t/s (+4.4%).
 - PP residual gap to upstream (-3.5%): decomposes into ~1.4% op-sum difference
   (matmuls +2.8% on some shapes, GATED_DELTA_NET_IDX vs GDN +7 ms over 128
   ubatches) and ~1-2% graph-optimizer effectiveness difference (opt on/off:
@@ -124,7 +133,16 @@ watchdog or on CPU; it is not part of the bench flow.
 
 ## Future directions (not done)
 
+- MTP speculative decoding: the checkpoint has a nextn MTP head - use it to
+  draft tokens and raise effective TG throughput. Evaluating what this branch
+  already supports (MTP draft context) and measuring at C=16 4k.
 - Fewer/larger kernels per step (fusion of the delta-net elementwise chains);
   ~420 of the ~640 nodes per step are small elementwise/copy ops.
-- MTP speculative decoding is out of scope for this harness but is the natural
-  big lever for this model family.
+
+## Constraints
+
+- VRAM budget is hard-capped at 20 GB for any benchmark or test run (the GPU
+  also drives the desktop). All GPU runs must go through bench-c16.sh (it has
+  the contention guard and the MEM_CAP_MB watchdog); use MEM_CAP_MB=16384 to
+  keep desktop headroom. Never run test-backend-ops or other large-allocation
+  binaries unguarded.

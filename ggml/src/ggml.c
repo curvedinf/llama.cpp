@@ -5580,6 +5580,38 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_idx(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sx,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * store,
+        struct ggml_tensor  * s_idxs) {
+    GGML_ASSERT(ggml_is_3d(sx));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_is_matrix(store));
+    GGML_ASSERT(s_idxs->type == GGML_TYPE_I32);
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = sx->ne[0]; // tokens per sequence (new tokens only)
+    const int64_t n_s     = sx->ne[2];
+
+    GGML_ASSERT(sx->ne[1] == d_inner);
+    GGML_ASSERT(store->ne[0] == (d_conv - 1)*d_inner);
+    GGML_ASSERT(s_idxs->ne[0] == n_s);
+    GGML_ASSERT(n_t >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = sx;
+    result->src[1] = c;
+    result->src[2] = store;
+    result->src[3] = s_idxs;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(

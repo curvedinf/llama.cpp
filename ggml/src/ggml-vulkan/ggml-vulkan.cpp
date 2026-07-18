@@ -977,6 +977,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    vk_pipeline pipeline_ssm_conv_ip_f32;
+    vk_pipeline pipeline_ssm_conv_ip_silu_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -5708,6 +5710,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_f32,        "ssm_conv_ip_f32",        ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -11406,6 +11410,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SSM_CONV:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            if (dst->src[2] != nullptr) {
+                // indexed in-place form (ggml_ssm_conv_idx)
+                switch (ctx->num_additional_fused_ops) {
+                    case 0:  return ctx->device->pipeline_ssm_conv_ip_f32;
+                    case 1:  return ctx->device->pipeline_ssm_conv_ip_silu_f32;
+                    default: return nullptr;
+                }
+            }
             switch (ctx->num_additional_fused_ops) {
                 case 0:  return ctx->device->pipeline_ssm_conv_f32;
                 case 1:  return ctx->device->pipeline_ssm_conv_silu_f32;
@@ -12575,6 +12587,47 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         ggml_tensor * add = cgraph->nodes[node_idx + 1];
         bias = (add->src[0] == conv) ? add->src[1] : add->src[0];
         dst = cgraph->nodes[node_idx + 2]; // silu
+    }
+
+    if (conv->src[2] != nullptr) {
+        // indexed in-place form (ggml_ssm_conv_idx): tokens, weights, store, sidx
+        const ggml_tensor * store = conv->src[2];
+        const ggml_tensor * sidx  = conv->src[3];
+
+        // note: select the pipeline here - ggml_vk_op_get_pipeline cannot be used since
+        //   the fused dst (silu) does not carry the conv node's srcs
+        vk_pipeline pipeline;
+        switch (ctx->num_additional_fused_ops) {
+            case 0:  pipeline = ctx->device->pipeline_ssm_conv_ip_f32;       break;
+            case 1:  pipeline = ctx->device->pipeline_ssm_conv_ip_silu_f32;  break;
+            default: GGML_ABORT("unsupported fused ssm_conv_idx");
+        }
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst);
+        vk_subbuffer src0_buf  = ggml_vk_tensor_subbuffer(ctx, src0);
+        vk_subbuffer src1_buf  = ggml_vk_tensor_subbuffer(ctx, src1);
+        vk_subbuffer store_buf = ggml_vk_tensor_subbuffer(ctx, store);
+        vk_subbuffer sidx_buf  = ggml_vk_tensor_subbuffer(ctx, sidx);
+        vk_subbuffer bias_buf  = bias ? ggml_vk_tensor_subbuffer(ctx, bias) : src1_buf;
+
+        const vk_op_ssm_conv_push_constants pc = {
+            (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
+            (uint32_t)src1->nb[1],
+            (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+            (uint32_t)src1->ne[0],
+            (uint32_t)src0->ne[0],
+            (uint32_t)src0->ne[1],
+            (uint32_t)dst->ne[1],
+            (uint32_t)dst->ne[2],
+        };
+
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src0_buf, src1_buf, bias_buf, dst_buf, store_buf, sidx_buf},
+            pc, { (uint32_t) src0->ne[1], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2] });
+
+        return;
     }
 
     // The shader always declares 4 bindings; bind src0 as a dummy when bias isn't fused.

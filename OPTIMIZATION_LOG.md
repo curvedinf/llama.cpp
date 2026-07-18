@@ -286,3 +286,67 @@ s4k regression check (build baseline-recheck vs build with the change, both
 chunk=0): S_PP 17902 / S_TG 1902 -> 17900 / 1883. Within noise. The change
 does not run under batched-bench (server-only).
 
+### Phase 2: Async / decoupled scheduler
+
+Status: analyzed, deferred. The sample dependency blocks the win at this scale.
+
+The proposed overlap was: run iteration N+1's prep (balloc->init,
+memory_update, memory->init_batch, output_reserve, graph cache lookup) on a
+background thread while iteration N's GPU compute runs.
+
+The blocker: iteration N+1's prep needs iteration N's sampled tokens, which
+are only available after iteration N's GPU compute completes. So CPU prep
+cannot overlap with the GPU compute it depends on. The only ways around this:
+
+(a) Speculative next-iter dispatch (predict batch structure + draft tokens
+    before sampling finishes) - that is MTP, already in tree
+    (`OPTIMIZATION_LOG.md:156-181`).
+(b) Multi-threaded Vulkan command-buffer recording (each thread its own
+    command pool; record the replay for iter N+1 while iter N computes).
+    The dispatch cache already amortizes the recording cost; the remaining
+    0.45 ms submit/replay is mostly driver-side `vkUpdateDescriptorSets` +
+    `vkQueueSubmit` overhead, which would need either bindless resources
+    (descriptor indexing) or pre-recorded secondary command buffers.
+
+Both are invasive subsystem changes. AGENTS.md says "no new subsystems
+without prior discussion", so Phase 2 stays deferred. The realistic Phase 2
+win on this bench is <=5%; the rest of the gap requires Phase 4.
+
+### Phase 3: Preemption via recompute (AGENTS.md roadmap #4)
+
+Status: implemented (env-gated, opt-in), not live-verified.
+
+Knob: `LLAMA_PREEMPT=1` env (server only), additionally requires
+`--kv-unified`. Default off. CPU swap is intentionally not implemented
+(dropped from this roadmap per AGENTS.md); recompute via the prefill path is
+cheaper on a hot GPU and avoids pinned-memory contention with the snapshot
+readback path.
+
+Implementation in `tools/server/server-context.cpp`:
+- New `try_preempt_active_slot()` method called from the decode retry path
+  when `try_clear_idle_slots()` cannot relieve KV pressure. Previously the
+  retry fell through to `n_batch /= 2`, which often just delays the failure
+  because halving the logical batch does not free any KV cells.
+- Victim policy: among `SLOT_STATE_GENERATING` slots, pick the one with the
+  fewest decoded tokens (least work to lose). Skip speculative, parent/child,
+  and non-completion slots (cross-slot invariants). Skip the slot whose token
+  is in the in-flight batch (`i_batch >= 0`).
+- Re-admission: snapshot the merged token stream (original prompt + generated,
+  which `slot.prompt.tokens` already contains), free the victim's KV via
+  `prompt_clear()`, replace the task's input tokens with the merged stream
+  (we exclusively own the task via unique_ptr; the const is nominal), and
+  transition the slot back to `SLOT_STATE_PROCESSING_PROMPT`. The normal
+  prefill loop then re-prefills it from scratch, optionally assisted by the
+  Phase 1 chunk cap.
+
+Verification: NOT live-verified. The s4k regression check (above) confirms
+the code path is dormant when KV is not under pressure. A live verification
+requires an oversubscribed workload (e.g. C=32 x 4k under a tight KV cap)
+and must be driven through `./run-guarded.sh` with the VRAM watchdog running
+- a direct server run bypasses the guard and is what crashed the host during
+initial testing.
+
+s4k regression check (build baseline-recheck vs build with the change,
+LLAMA_PREEMPT=0): S_PP 17902 / S_TG 1902 -> 17777 / 1897. Within noise.
+
+

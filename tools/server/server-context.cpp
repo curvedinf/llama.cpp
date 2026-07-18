@@ -1664,6 +1664,95 @@ private:
         return res;
     }
 
+    // Phase 3 (AGENTS.md roadmap #4): preemption via recompute.
+    // On KV pressure, when no idle slot can be purged, drop the victim's KV and
+    // re-queue its full token stream (prompt + already-generated) for re-admission
+    // via the normal prefill path. CPU swap is intentionally not implemented
+    // (dropped from this roadmap); recompute is cheaper on a hot GPU and avoids
+    // pinned-memory contention with the snapshot readback path.
+    //
+    // Victim policy: among GENERATING slots, pick the one with the fewest decoded
+    // tokens (least work to lose). Skip speculative, parent/child, and non-
+    // completion slots - those have cross-slot invariants that preemption would
+    // break. Env-gated because the policy is intentionally simple.
+    bool try_preempt_active_slot() {
+        static const bool enable = []{
+            const char * e = getenv("LLAMA_PREEMPT");
+            return e && atoi(e) > 0;
+        }();
+        if (!enable) {
+            return false;
+        }
+
+        // only meaningful with a shared KV pool: with per-slot KV, evicting slot B
+        // does not free cells for slot A, so preemption cannot relieve the pressure.
+        if (!params_base.kv_unified) {
+            return false;
+        }
+
+        server_slot * victim = nullptr;
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_GENERATING) {
+                continue;
+            }
+            if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) {
+                continue;
+            }
+            if (slot.spec) {
+                continue;
+            }
+            if (slot.task->is_parent() || slot.task->is_child()) {
+                continue;
+            }
+            // never preempt the slot whose tokens are currently in the in-flight batch
+            // (decode retries happen with batch_view already built around active i_batch)
+            if (slot.i_batch >= 0) {
+                continue;
+            }
+            if (victim == nullptr || slot.n_decoded < victim->n_decoded) {
+                victim = &slot;
+            }
+        }
+
+        if (victim == nullptr) {
+            return false;
+        }
+
+        // snapshot the merged token stream (original prompt + generated tokens).
+        // prompt.tokens already contains both because the decode loop pushes the
+        // sampled token back into prompt.tokens after each step.
+        llama_tokens merged;
+        merged.reserve(victim->prompt.tokens.size());
+        for (size_t i = 0; i < victim->prompt.tokens.size(); ++i) {
+            merged.push_back(victim->prompt.tokens[i]);
+        }
+
+        SRV_WRN("preempting slot %d to free KV (n_decoded = %d, prompt = %d tokens) - will re-prefill\n",
+                victim->id, victim->n_decoded, (int) merged.size());
+
+        // free the KV cells
+        victim->prompt_clear();
+
+        // replace the task's input tokens with the merged stream; we own the task
+        // exclusively via unique_ptr, so the const is nominal here.
+        auto & mutable_tokens = const_cast<server_tokens &>(victim->task->tokens);
+        mutable_tokens.clear();
+        mutable_tokens.insert(merged);
+
+        // reset the slot's prompt-tracking so the prefill path runs from scratch.
+        // keep n_decoded so the original generation budget is preserved (the model
+        // state is restored by re-prefill, so the next decode will produce a fresh
+        // sample rather than a duplicate of the last pre-preemption token).
+        victim->prompt.clear();
+        victim->n_prompt_tokens_cache     = 0;
+        victim->n_prompt_tokens_processed = 0;
+        victim->t_start_process_prompt    = ggml_time_us();
+        victim->t_start_generation        = 0;
+        victim->state                     = SLOT_STATE_PROCESSING_PROMPT;
+
+        return true;
+    }
+
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
         std::vector<common_adapter_lora_info> output = params_base.lora_adapters; // copy
         for (size_t i = 0; i < output.size(); ++i) {
@@ -3682,9 +3771,14 @@ private:
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
+            // retry with half the batch size to try to find a free slot in the KV cache.
+            // Phase 3: before halving (which often just delays the failure), try to
+            // free KV by preempting an active slot. The victim is re-admitted via the
+            // prefill path on a subsequent iteration. Opt-in via LLAMA_PREEMPT.
             if (!try_clear_idle_slots()) {
-                n_batch /= 2;
+                if (!try_preempt_active_slot()) {
+                    n_batch /= 2;
+                }
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);

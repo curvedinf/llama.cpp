@@ -147,13 +147,17 @@ repetitive prompt, draft model = same checkpoint (nextn head), guarded 16 GB:
 | mode | S_PP t/s | S_TG t/s | note |
 |------|----------|----------|------|
 | baseline (no spec) | 11569.9 | 334.5 | llama-cli has per-step sampling syncs; not comparable to batched-bench |
+| --backend-sampling | 11184.9 | 365.0 | TG +9.1% |
 | --spec-type draft-mtp | 6755.2 | 362.6 | TG +8.4%, PP -41.6% |
+| draft-mtp + backend-sampling | 6570.4 | 398.3 | TG +19.1%, PP -43.2% |
 
 - MTP drafting works at C=16 via llama-cli --parallel N --spec-type draft-mtp
   (same checkpoint as -md). Acceptance on this trivially predictable prompt is
   ~100% (best case), yet the net generation gain is only +8.4%: at C=16 the
   batch is already 16-wide, so draft+verify multiplies work per accepted
   token. Prompt eval is ~42% slower (h_nextn extraction + draft eval).
+  Combined with backend sampling (removes the per-step logits readback) the
+  gain is +19.1% - the best llama-cli configuration measured.
 - llama-speculative --parallel N (tree branches) crashes at
   common/sampling.cpp:154 (GGML_ASSERT(logits != nullptr)) for N > 1.
   Verified PRE-EXISTING in 1ed3129 (reproduced with a fresh worktree build of

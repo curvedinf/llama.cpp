@@ -2040,6 +2040,16 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // LLAMA_GDN_STATE_F16: store the GDN (delta-net) recurrent state as f16 instead of f32.
+    // Only applied to hybrid archs (the GDN op has f16-state shader variants; pure-recurrent
+    // archs use different ops without f16-state variants and would silently fall back to a
+    // non-existent pipeline). type_r (conv state) stays f32 to avoid concat dtype issues.
+    static const bool gdn_state_f16 = []{
+        const char * e = getenv("LLAMA_GDN_STATE_F16");
+        return e && e[0] == '1';
+    }();
+    const ggml_type recr_type_s = (gdn_state_f16 && llm_arch_is_hybrid(arch)) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2097,8 +2107,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
                             nullptr);
-                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {
-                    // The main difference between hybrid architectures is the
+                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {                    // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
@@ -2133,7 +2142,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ recr_type_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2152,7 +2161,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ recr_type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

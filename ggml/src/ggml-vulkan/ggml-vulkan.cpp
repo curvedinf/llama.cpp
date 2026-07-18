@@ -856,6 +856,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
+    vk_pipeline pipeline_scale_f16;
     vk_pipeline pipeline_log[2];
     vk_pipeline pipeline_tri[2];
     vk_pipeline pipeline_diag[2];
@@ -972,6 +973,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_gated_delta_net_idx[4][2];
     vk_pipeline pipeline_gated_delta_net_ip[4][2];
+    // fp16 state-storage variants (compute stays f32); dispatched when state tensor is F16
+    vk_pipeline pipeline_gated_delta_net_f16state[4][2];
+    vk_pipeline pipeline_gated_delta_net_idx_f16state[4][2];
+    vk_pipeline pipeline_gated_delta_net_ip_f16state[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -5420,6 +5425,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_upscale_bilinear_antialias_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_scale_f32, "scale_f32", scale_f32_len, scale_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_scale_f16, "scale_f16_f32", scale_f16_f32_len, scale_f16_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_log[0], "log_f32", log_f32_len, log_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_log[1], "log_f16", log_f16_len, log_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -5650,6 +5656,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             {"gated_delta_net_ip_f32_d64",     "gated_delta_net_ip_f32_d64_kda"},
             {"gated_delta_net_ip_f32_d128",    "gated_delta_net_ip_f32_d128_kda"},
         };
+        const char * gdn_f16_names[][2] = {
+            {"gated_delta_net_f16state_d16",     "gated_delta_net_f16state_d16_kda"},
+            {"gated_delta_net_f16state_d32",     "gated_delta_net_f16state_d32_kda"},
+            {"gated_delta_net_f16state_d64",     "gated_delta_net_f16state_d64_kda"},
+            {"gated_delta_net_f16state_d128",    "gated_delta_net_f16state_d128_kda"},
+        };
+        const char * gdn_f16_idx_names[][2] = {
+            {"gated_delta_net_idx_f16state_d16",     "gated_delta_net_idx_f16state_d16_kda"},
+            {"gated_delta_net_idx_f16state_d32",     "gated_delta_net_idx_f16state_d32_kda"},
+            {"gated_delta_net_idx_f16state_d64",     "gated_delta_net_idx_f16state_d64_kda"},
+            {"gated_delta_net_idx_f16state_d128",    "gated_delta_net_idx_f16state_d128_kda"},
+        };
+        const char * gdn_f16_ip_names[][2] = {
+            {"gated_delta_net_ip_f16state_d16",     "gated_delta_net_ip_f16state_d16_kda"},
+            {"gated_delta_net_ip_f16state_d32",     "gated_delta_net_ip_f16state_d32_kda"},
+            {"gated_delta_net_ip_f16state_d64",     "gated_delta_net_ip_f16state_d64_kda"},
+            {"gated_delta_net_ip_f16state_d128",    "gated_delta_net_ip_f16state_d128_kda"},
+        };
         for (uint32_t si = 0; si < 4; si++) {
             const uint32_t S_V = gdn_sizes[si];
             GGML_ASSERT(is_pow2(S_V));
@@ -5690,6 +5714,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const void * gdn_idx_data;
             size_t gdn_ip_len;
             const void * gdn_ip_data;
+            // fp16-state SPIRV blobs (compute dtype stays f32; only the state buffer is f16)
+            size_t gdn_f16_len;
+            const void * gdn_f16_data;
+            size_t gdn_f16_idx_len;
+            const void * gdn_f16_idx_data;
+            size_t gdn_f16_ip_len;
+            const void * gdn_f16_ip_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
@@ -5697,6 +5728,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 gdn_idx_data = (const void *)gated_delta_net_idx_f32_data;
                 gdn_ip_len = gated_delta_net_ip_f32_len;
                 gdn_ip_data = (const void *)gated_delta_net_ip_f32_data;
+                gdn_f16_len = gated_delta_net_f16state_f32_len;
+                gdn_f16_data = (const void *)gated_delta_net_f16state_f32_data;
+                gdn_f16_idx_len = gated_delta_net_idx_f16state_f32_len;
+                gdn_f16_idx_data = (const void *)gated_delta_net_idx_f16state_f32_data;
+                gdn_f16_ip_len = gated_delta_net_ip_f16state_f32_len;
+                gdn_f16_ip_data = (const void *)gated_delta_net_ip_f16state_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
@@ -5704,6 +5741,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 gdn_idx_data = (const void *)gated_delta_net_idx_f32_nocluster_data;
                 gdn_ip_len = gated_delta_net_ip_f32_nocluster_len;
                 gdn_ip_data = (const void *)gated_delta_net_ip_f32_nocluster_data;
+                gdn_f16_len = gated_delta_net_f16state_f32_nocluster_len;
+                gdn_f16_data = (const void *)gated_delta_net_f16state_f32_nocluster_data;
+                gdn_f16_idx_len = gated_delta_net_idx_f16state_f32_nocluster_len;
+                gdn_f16_idx_data = (const void *)gated_delta_net_idx_f16state_f32_nocluster_data;
+                gdn_f16_ip_len = gated_delta_net_ip_f16state_f32_nocluster_len;
+                gdn_f16_ip_data = (const void *)gated_delta_net_ip_f16state_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
@@ -5711,6 +5754,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 gdn_idx_data = (const void *)gated_delta_net_idx_f32_shmem_data;
                 gdn_ip_len = gated_delta_net_ip_f32_shmem_len;
                 gdn_ip_data = (const void *)gated_delta_net_ip_f32_shmem_data;
+                gdn_f16_len = gated_delta_net_f16state_f32_shmem_len;
+                gdn_f16_data = (const void *)gated_delta_net_f16state_f32_shmem_data;
+                gdn_f16_idx_len = gated_delta_net_idx_f16state_f32_shmem_len;
+                gdn_f16_idx_data = (const void *)gated_delta_net_idx_f16state_f32_shmem_data;
+                gdn_f16_ip_len = gated_delta_net_ip_f16state_f32_shmem_len;
+                gdn_f16_ip_data = (const void *)gated_delta_net_ip_f16state_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -5725,6 +5774,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_ip[si][kda],
                     gdn_ip_names[si][kda], gdn_ip_len, gdn_ip_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+
+                // fp16-state variants: same shader layout, same specialization constants, different SPIRV blob.
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_f16state[si][kda],
+                    gdn_f16_names[si][kda], gdn_f16_len, gdn_f16_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_idx_f16state[si][kda],
+                    gdn_f16_idx_names[si][kda], gdn_f16_idx_len, gdn_f16_idx_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_ip_f16state[si][kda],
+                    gdn_f16_ip_names[si][kda], gdn_f16_ip_len, gdn_f16_ip_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
         }
@@ -11039,6 +11099,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_scale_f32;
         }
+        if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16) {
+            return ctx->device->pipeline_scale_f16;
+        }
         return nullptr;
     case GGML_OP_SQR:
         if (src0->type == dst->type &&
@@ -11427,13 +11490,18 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 3; break;
                 default: return nullptr;
             }
+            // state tensor is src[5]; when stored as F16, dispatch the f16-state pipeline variant
+            const bool state_f16 = dst->src[5] && dst->src[5]->type == GGML_TYPE_F16;
             if (dst->op == GGML_OP_GATED_DELTA_NET_IDX) {
                 if (ggml_get_op_params_i32(dst, 1) != 0) {
-                    return ctx->device->pipeline_gated_delta_net_ip[si][kda];
+                    return state_f16 ? ctx->device->pipeline_gated_delta_net_ip_f16state   [si][kda]
+                                     : ctx->device->pipeline_gated_delta_net_ip             [si][kda];
                 }
-                return ctx->device->pipeline_gated_delta_net_idx[si][kda];
+                return state_f16 ? ctx->device->pipeline_gated_delta_net_idx_f16state[si][kda]
+                                 : ctx->device->pipeline_gated_delta_net_idx        [si][kda];
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            return state_f16 ? ctx->device->pipeline_gated_delta_net_f16state[si][kda]
+                             : ctx->device->pipeline_gated_delta_net          [si][kda];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -18651,7 +18719,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_FILL:
             return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
         case GGML_OP_SCALE:
-            return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+            return ggml_is_contiguous(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_PAD:
         case GGML_OP_ROLL:
             return op->src[0]->type == GGML_TYPE_F32;
@@ -18721,7 +18789,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 for (int i = 0; i < 6; i++) {
-                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                    if (op->src[i] == nullptr) {
+                        return false;
+                    }
+                    // src[5] is the state tensor; the f16-state shader variants allow F16 storage
+                    const ggml_type st = op->src[i]->type;
+                    if (i == 5) {
+                        if (st != GGML_TYPE_F32 && st != GGML_TYPE_F16) {
+                            return false;
+                        }
+                    } else if (st != GGML_TYPE_F32) {
                         return false;
                     }
                 }
@@ -18734,7 +18811,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 for (int i = 0; i < 6; i++) {
-                    if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                    if (op->src[i] == nullptr) {
+                        return false;
+                    }
+                    const ggml_type st = op->src[i]->type;
+                    if (i == 5) {
+                        if (st != GGML_TYPE_F32 && st != GGML_TYPE_F16) {
+                            return false;
+                        }
+                    } else if (st != GGML_TYPE_F32) {
                         return false;
                     }
                 }

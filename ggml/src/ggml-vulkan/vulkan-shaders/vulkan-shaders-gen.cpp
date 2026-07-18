@@ -884,6 +884,7 @@ void process_shaders() {
     string_to_spv("repeat_i16", "repeat.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
 
     string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("scale_f16_f32", "scale.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
@@ -1066,6 +1067,20 @@ void process_shaders() {
     string_to_spv("gated_delta_net_ip_f32", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}}));
     string_to_spv("gated_delta_net_ip_f32_nocluster", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}}));
     string_to_spv("gated_delta_net_ip_f32_shmem", "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}}));
+
+    // fp16 state-storage variants: compute stays f32, state I/O is f16.
+    // 9 variants mirroring the f32-state set above, opt-in via the state tensor's dtype.
+    string_to_spv("gated_delta_net_f16state_f32",             "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_f16state_f32_nocluster",   "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_f16state_f32_shmem",       "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+
+    string_to_spv("gated_delta_net_idx_f16state_f32",         "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_SIDX", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_idx_f16state_f32_nocluster","gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_idx_f16state_f32_shmem",   "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+
+    string_to_spv("gated_delta_net_ip_f16state_f32",          "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "1"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_ip_f16state_f32_nocluster","gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
+    string_to_spv("gated_delta_net_ip_f16state_f32_shmem",    "gated_delta_net.comp", merge_maps(base_dict, {{"FLOAT_TYPE", "float"}, {"USE_SUBGROUP_ADD", "0"}, {"USE_SUBGROUP_CLUSTERED", "0"}, {"USE_SIDX", "1"}, {"STATE_IP", "1"}, {"STATE_TYPE", "float16_t"}, {"STATE_TYPE_IS_F16", "1"}}));
 
     string_to_spv("opt_step_adamw_f32", "opt_step_adamw.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));
     string_to_spv("opt_step_sgd_f32", "opt_step_sgd.comp", merge_maps(base_dict, {{"A_TYPE", "float"}}));

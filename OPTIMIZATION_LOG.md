@@ -351,41 +351,67 @@ LLAMA_PREEMPT=0): S_PP 17902 / S_TG 1902 -> 17777 / 1897. Within noise.
 
 ### Phase 4: fp16 recurrent state (AGENTS.md roadmap #3)
 
-Status: scoped, not implemented this session. Estimated +3% TG, but the
-change is invasive and touches numerically sensitive code.
+Status: implemented (env-gated, opt-in), validated bit-identical-generating, kept.
 
-The bandwidth analysis (above) shows GDN state IO is ~0.61 GB / step at
-~950 GB/s effective. Cutting the state dtype from f32 to f16 halves the IO,
-saving ~0.3 ms / step (~3% of the 10 ms decode step).
+Knob: `LLAMA_GDN_STATE_F16=1` (env, hybrid archs only). Stores the GDN state
+tensor (`s_l`) as f16 instead of f32; compute stays f32. The conv state tensor
+(`r_l`) is left at f32 to avoid concat dtype issues in the prefill path.
 
-Scope of the change (this is why it did not go in this session):
+Scope deviation from the original plan (OPTIMIZATION_LOG.md:352-388): the plan
+named `recurrent_type_r` as the knob, but the GDN state lives in `s_l` (parameter
+`type_s` of the recurrent memory ctor). `r_l` is the conv state. The env name
+`LLAMA_GDN_STATE_F16` reflects what is actually being toggled.
 
-- `vulkan-shaders/gated_delta_net.comp`: the state buffer currently uses
-  `FLOAT_TYPE` (the same define as Q/K/V/G/Beta), so storage and compute
-  precision are coupled. fp16 storage with fp32 compute (the desired combo)
-  needs a separate `STATE_TYPE` define plus explicit `float()` conversion at
-  the four state load sites and two state write sites (snapshot, in-place,
-  K==1 final-write). The compute registers (`s_shard`, `kv_shard`,
-  `attn_partial`) stay f32.
-- `vulkan-shaders-gen.cpp`:~1058: add 9 new variants
-  (`gated_delta_net_*_f16state.comp` for each of base / _idx / _ip, each with
-  the three subgroup reduction strategies) plus matching `ssm_conv_f16state`
-  variants for the conv state IO.
-- `ggml-vulkan.cpp`: GDN op dispatch must pick the f16-state variant when the
-  state tensor's type is F16. Today dispatch keys on the Q/K/V type only.
-- `src/llama-model.cpp:2135`: `recurrent_type_r GGML_TYPE_F32` becomes
-  configurable (env `LLAMA_RECURRENT_STATE_F16=1`).
+Changes:
+- `vulkan-shaders/gated_delta_net.comp`: STATE_TYPE define (defaults to
+  FLOAT_TYPE for the legacy variants). Only the in-place state write needs an
+  explicit `STATE_TYPE(s_shard[r])` cast; the state load is already wrapped in
+  FLOAT_TYPE(...) which doubles as a float(float16_t) promotion.
+- `vulkan-shaders/vulkan-shaders-gen.cpp`: 9 new variants (3 layouts x 3
+  subgroup strategies), naming `gated_delta_net_{,idx_,ip_}f16state_f32{,_nocluster,_shmem}`.
+- `vulkan-shaders/scale.comp` + generator: scale_f16_f32 variant (the recurrent
+  memory zeroes the state via `ggml_scale_inplace(state_zero, 0)` and the
+  existing scale pipeline was f32-only).
+- `ggml-vulkan.cpp`:
+  - 3 new pipeline arrays (`pipeline_gated_delta_net{,_idx,_ip}_f16state[4][2]`)
+    created alongside the f32 ones, same spec constants, different SPIRV blob.
+  - Dispatch in `ggml_vk_get_pipeline` picks the f16state variant when
+    `dst->src[5]->type == GGML_TYPE_F16`.
+  - `ggml_backend_vk_device_supports_op` relaxed for GATED_DELTA_NET(_IDX) to
+    allow src[5] (state) F16, and for SCALE to allow F16 src/dst.
+- `ggml.c`: relax state-type assert in `ggml_gated_delta_net{,_idx}` to allow F16.
+- `src/llama-model.cpp`: read env at `create_memory` top; only applied when
+  `llm_arch_is_hybrid(arch)` (pure-recurrent archs use other ops without
+  f16-state variants).
 
-Risk: the GDN beta-sigmoid fusion experiment (`OPTIMIZATION_LOG.md:199-218`)
-is the cautionary tale - a change that looked correct and benched fast silently
-skipped ops. fp16 state changes accumulation order at the store/load boundary
-which can move greedy-generation output. Validation has to be generation-
-identical on the standard prompt set, not just numerical `test-backend-ops`.
+Numerics: validated with `test-gdn-indexed-state` (all cases pass on CPU and
+Vulkan backends), and by greedy generation on the standard prompt
+(`--seed 42 --temp 0.0`, 64 tokens): token stream is **identical** between
+LLAMA_GDN_STATE_F16=0 and =1. Storage boundary is f32 compute -> f16 store ->
+f32 load, so accumulation order changes only at the round-trip; on this model
+the rounding does not move greedy argmax over 64 tokens.
 
-This is multi-hour shader surgery with non-trivial validation. Deferred until
-it can be done in a single focused session with small-run validation first
-(`llama-cli -n 8` under `./run-guarded.sh`) before any bench, per the AGENTS.md
-GPU safety rules.
+Bench (s4k, two iterations each, MEM_CAP_MB=20000, watchdog running):
+
+| iter | build                 | S_PP t/s | S_TG t/s |
+|------|-----------------------|----------|----------|
+| 1    | baseline (f32 state)  | 17754.64 | 1895.35  |
+| 1    | f16 state             | 17747.12 | 1989.71  |
+| 2    | baseline (f32 state)  | 17647.36 | 1895.55  |
+| 2    | f16 state             | 17668.02 | 1981.33  |
+
+Average: S_PP within noise, S_TG 1895 -> 1985 (**+4.7%**). Better than the +3%
+predicted in the bandwidth analysis (OPTIMIZATION_LOG.md:355-359); the f32 state
+IO at ~950 GB/s effective was ~6% of the step, and f16 halves that to ~3%, plus
+a small win from reduced register pressure on the f16 load path.
+
+VRAM: peak observed 7.3 GB under the bench (vs 7.6 GB baseline) - the state
+buffer shrank from 9 MB/layer x 19 layers = 171 MB to 86 MB, ~85 MB saved at
+C=16; immaterial at this scale but it grows linearly with n_seq_max.
+
+Net: G4 committed. The env is opt-in and default-off; no regression when
+LLAMA_GDN_STATE_F16 is unset (the f32 path is byte-identical to before).
+
 
 ## vLLM gap-closure summary (2026-07-18)
 
@@ -402,8 +428,9 @@ Of the gap-analysis plan:
   (`LLAMA_PREEMPT=1`), requires `--kv-unified`. CPU swap dropped per AGENTS.md.
   Implemented but not live-verified - the live-server test crashed the host
   (bypassed `run-guarded.sh`). s4k regression check is within noise.
-- Phase 4 (fp16 recurrent state): **scoped, deferred**. ~3% TG upside,
-  invasive shader surgery with numerical risk; deferred to a focused session.
+- Phase 4 (fp16 recurrent state): **committed**, env-gated
+  (`LLAMA_GDN_STATE_F16=1`, hybrid archs only). Validated generation-identical
+  on the standard prompt; **+4.7% TG** on s4k (above the +3% estimate).
   FP8 KV, paged attention, MoE, TP - all dropped per AGENTS.md roadmap scope.
 
 Net deltas from this work (s4k, the primary metric, unchanged within noise -

@@ -38,6 +38,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-18 | this | fused ADD+SOFTPLUS+MUL op for the GDN gate prep chain | 17609.41 | 1572.62 | TG +0.7%, PP +0.4% vs prev | committed |
 | 2026-07-18 | this | fused SILU+MUL op for the gated-norm z chain | 17848.44 | 1595.04 | TG +1.4%, PP +1.4% vs prev | committed |
 | 2026-07-18 | this | extend fusion to the sigmoid gate (full-attn layers) | 17957.45 | 1597.40 | TG +0.1%, PP +0.6% vs prev | committed |
+| 2026-07-18 | this | merge q+k L2 norms into one op per delta layer | 17859.77 | 1594.66 | within noise (-0.2% TG) | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 

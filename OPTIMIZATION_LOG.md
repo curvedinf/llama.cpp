@@ -40,6 +40,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-18 | this | extend fusion to the sigmoid gate (full-attn layers) | 17957.45 | 1597.40 | TG +0.1%, PP +0.6% vs prev | committed |
 | 2026-07-18 | this | merge q+k L2 norms into one op per delta layer | 17859.77 | 1594.66 | within noise (-0.2% TG) | committed |
 | 2026-07-18 | this | fuse residual ADD + RMS_NORM + MUL (input-norm chain) | 17956.21 | 1599.11 | within noise | committed |
+| 2026-07-18 | - | EXPERIMENT: fold beta sigmoid into the GDN op (4 variants) | 17863.15 | 1553.90 | TG -2.8% vs prev | reverted (see note below) |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -188,6 +189,27 @@ repetitive prompt, draft model = same checkpoint (nextn head), guarded 16 GB:
   ~950 GB/s effective - bandwidth-bound, only fp16 state would cut it (numerics).
   The step (10 ms) is still dispatch/latency-bound; skinny n=16 matmul kernels
   (measured 169-340 GB/s effective) are the remaining big but deep target.
+
+## GDN beta-sigmoid fusion (2026-07-18, negative result)
+
+Attempted to elide the 18 per-layer beta sigmoid dispatches by folding the
+sigmoid into the GATED_DELTA_NET_IDX kernel (push-constant flag, in-kernel
+sigmoid on the raw beta load). The fusion itself is correct (generation
+bit-identical) and the in-kernel sigmoid is free, but making the sigmoid
+adjacent to the GDN op constrains the wave scheduler and costs more than the
+elision saves:
+
+| variant | S_PP t/s | S_TG t/s | note |
+|---------|----------|----------|------|
+| early graph expands + adjacent pair, full fusion | 17871.42 | 1555.46 | -2.7% TG vs 1599.11 |
+| same, GGML_VK_DISABLE_FUSION=1 | 16888.74 | 1488.73 | graph reorder alone: ~-4.7% TG |
+| no expands, span empty nodes, partial coverage | 17854.63 | 1599.68 | 1/18 fused per TG graph: par with baseline |
+| no expands, span empty nodes, full coverage | 17863.15 | 1553.90 | 18/18 fused: -2.8% TG |
+
+Also fixed mid-way: the fused dispatch case was missing from the UNARY switch,
+so the first bench (PP 20203/TG 1701) silently skipped all GDN ops - invalid.
+Lesson reconfirmed: any fusion win must be validated by generation identity,
+not just perf numbers. Reverted entirely.
 
 ## Constraints
 

@@ -43,6 +43,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-18 | - | EXPERIMENT: fold beta sigmoid into the GDN op (4 variants) | 17863.15 | 1553.90 | TG -2.8% vs prev | reverted (see note below) |
 | 2026-07-18 | this | split-K for skinny-n matmuls (drop n>=tile guard in ggml_vk_guess_split_k) | 17856.80 | 1857.54 | TG +16.2%, PP -0.6% vs prev | committed |
 | 2026-07-18 | this | split-K k threshold 2048 -> 1024 | 17856.40 | 1873.04 | TG +0.8% vs prev | committed |
+| 2026-07-18 | this | K-quant small matmul warptile BK 32 -> 64 (halves k-loop barrier rounds) | 17911.89 | 1930.75 | TG +3.1%, PP +0.3% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 

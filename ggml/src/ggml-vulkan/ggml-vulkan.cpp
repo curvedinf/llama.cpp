@@ -4143,19 +4143,30 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile_mmq = { 512, 128, 128, 32, subgroup_size_8, 32, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
         }
 
+        // K-quant small warptile with doubled BK: halves the barrier rounds in the k-loop.
+        // Only K-quants can span a 64-wide k tile (their dequant emits 2 elements per call);
+        // legacy quants dequant one 32-wide block per call and would leave half the tile unwritten.
+        l_warptile_mmq_k = l_warptile_mmq;
+        m_warptile_mmq_k = m_warptile_mmq;
+        s_warptile_mmq_k = s_warptile_mmq;
+        s_warptile_mmq_k[3] = 64;
+
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
         l_align = 128;
         m_align =  64;
-        s_align =  32;
+        s_align =  64;
 
         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
             ggml_type t = (ggml_type)i;
+            const bool is_k_quant = (t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
+                                     t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
+                                     t == GGML_TYPE_Q6_K);
             // Disable medium and large matrix multiplication if not enough shared memory is available
             // Check mmq warptiles as the largest configuration
             // Throw an error if not enough for any matrix multiplication is available
-            if (!ggml_vk_matmul_shmem_support(device, s_warptile_mmq, false, t)) {
+            if (!ggml_vk_matmul_shmem_support(device, is_k_quant ? s_warptile_mmq_k : s_warptile_mmq, false, t)) {
                 std::cerr << "ggml_vulkan: Error: Shared memory size too small for matrix multiplication." << std::endl;
                 throw std::runtime_error("Shared memory size too small for matrix multiplication.");
             } else if (!ggml_vk_matmul_shmem_support(device, m_warptile_mmq, false, t)) {
@@ -4179,9 +4190,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
             // The q8_1 mmq path has its own (larger) shmem layout, check it separately.
             // K-quants use the _int_k warptiles, others use _int.
-            const bool is_k_quant = (t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
-                                     t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
-                                     t == GGML_TYPE_Q6_K);
             const auto & s_int   = is_k_quant ? s_warptile_mmq_int_k   : s_warptile_mmq_int;
             const auto & m_int   = is_k_quant ? m_warptile_mmq_int_k   : m_warptile_mmq_int;
             const auto & l_int   = is_k_quant ? l_warptile_mmq_int_k   : l_warptile_mmq_int;
@@ -4584,11 +4592,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_1], matmul_q5_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_Q8_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q8_0], matmul_q8_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
 
-        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
-        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q2_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q2_K], matmul_q2_k_f32, mmq_wg_denoms, warptile_mmq_k, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q3_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q3_K], matmul_q3_k_f32, mmq_wg_denoms, warptile_mmq_k, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q4_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_K], matmul_q4_k_f32, mmq_wg_denoms, warptile_mmq_k, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q5_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_K], matmul_q5_k_f32, mmq_wg_denoms, warptile_mmq_k, vk_mat_mat_push_constants, 3, );
+        CREATE_MM2(GGML_TYPE_Q6_K, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q6_K], matmul_q6_k_f32, mmq_wg_denoms, warptile_mmq_k, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_S,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_S],   matmul_iq1_s_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ1_M,   pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ1_M],   matmul_iq1_m_f32,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );
         CREATE_MM2(GGML_TYPE_IQ2_XXS, pipeline_dequant_mul_mat_mat[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, );

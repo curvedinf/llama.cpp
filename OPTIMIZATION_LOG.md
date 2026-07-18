@@ -32,6 +32,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | this | batch descriptor updates per chunk in dispatch replay | 16683.53 | 1369.33 | TG +0.1% vs prev | committed |
 | 2026-07-17 | this | harness: -ub 512 -> -ub 1024 (sweep below) | 17721.15 | 1368.00 | PP +6.3% vs prev | committed (bench-c16.sh) |
 | 2026-07-17 | 058402b | FINAL verification (clean tree, guarded harness) | 17711.19 | 1373.94 | - | verified, tests pass |
+| 2026-07-18 | this | GDN in-place state write-back (skip snapshot + 18x16MB cpy/step) | 17748.20 | 1479.37 | TG +8.1%, PP +0.2% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -62,9 +63,9 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024)** | **17711 - 17721** | **1368 - 1374** | **13009 - 13020** |
+| **optimized (ub 1024, in-place GDN)** | **17748** | **1479** | **13312** |
 
-vs HEAD baseline: PP +8.6%, TG +41.8%, S +18.1%. vs upstream: PP +2.4%, TG +4.2%, S +2.9%.
+vs HEAD baseline: PP +8.8%, TG +52.7%, S +20.7%. vs upstream: PP +2.6%, TG +12.4%, S +5.3%.
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full
@@ -96,6 +97,17 @@ watchdog or on CPU; it is not part of the bench flow.
 - Decode is dispatch-rate limited: ~640 graph nodes per step at C=16, GPU per
   step ~10 ms, CPU per step ~0.65 ms (submit/replay ~0.45 ms of it). Barriers
   per run: 2959 (HEAD, merged-range barriers) vs 5645 (upstream).
+- GDN in-place state write-back: the indexed op (K==1) writes the new state
+  back to the store rows it read from instead of a snapshot area + ggml_cpy
+  (18 x 16 MB of D2D copy traffic and 18 nodes removed per step). Safe only
+  when every batch seq reads and writes the same row; llama_memory_recurrent
+  finds this from the cell bookkeeping (src0 == own index for all running
+  seqs, i.e. steady state, no empty states, no shared rows) and the graph
+  falls back to the copy path otherwise (graph cache keys on the flag, so
+  both variants coexist). No store resize was needed - the ring aliases only
+  across steps, never within one ubatch. Validated bit-exact vs the gathered
+  reference on CPU and Vulkan (test-gdn-indexed-state, in-place cases).
+  Result: TG 1368.00 -> 1479.37 t/s (+8.1%).
 - dmmv (dequant-mul-mat-vec) extended to 16 columns was SLOWER than the mul_mat
   path at n=16 (-9.3% TG) - serialized per-op timings (GGML_VK_PERF_LOGGER)
   mislead; wall-clock is the arbiter. Reverted.
@@ -112,11 +124,6 @@ watchdog or on CPU; it is not part of the bench flow.
 
 ## Future directions (not done)
 
-- Direct GDN state write-back into the store ring rows (skip the gdn_out
-  snapshot + 18 x 16 MB ggml_cpy per step, ~0.6-1 ms/step): needs the recurrent
-  store sized >= 2 x n_seq_max rows (currently n_seq_max = 16, so every row
-  aliases a read row every step and in-kernel writes would race between
-  workgroups). Requires a memory sizing policy change.
 - Fewer/larger kernels per step (fusion of the delta-net elementwise chains);
   ~420 of the ~640 nodes per step are small elementwise/copy ops.
 - MTP speculative decoding is out of scope for this harness but is the natural

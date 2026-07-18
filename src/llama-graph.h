@@ -276,6 +276,9 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // llama_memory_recurrent_context::get_direct() at build time
+    bool direct = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

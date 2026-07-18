@@ -576,7 +576,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = keep ? (int64_t) cparams.n_rs_seq + 1 : 1;
 
-    ggml_tensor * gdn_out = ggml_gated_delta_net_idx(ctx0, q, k, v, g, b, state_store, inp->s_copy_main, K);
+    // steady-state decode: the op can write the new state back to the rows it read from,
+    //   skipping the snapshot area and the write-back copy below
+    const bool inplace = !keep && n_seq_tokens == 1 && inp->direct;
+
+    ggml_tensor * gdn_out = ggml_gated_delta_net_idx(ctx0, q, k, v, g, b, state_store, inp->s_copy_main, K, inplace);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -596,6 +600,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
+
+    if (inplace) {
+        return output;
+    }
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 

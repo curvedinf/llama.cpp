@@ -1485,6 +1485,22 @@ int32_t llama_memory_recurrent_context::get_rs_z() const {
     return is_full ? 0 : mem->rs_z;
 }
 
+bool llama_memory_recurrent_context::get_direct() const {
+    // in-place state write-back is only valid when every sequence in the batch reads
+    // and writes the same state row (steady state, no empty states, no shared rows)
+    if (is_full || mem->n_rs_seq != 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < mem->n; ++i) {
+        if (mem->cells[mem->head + i].src0 != (int32_t)(mem->head + i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }

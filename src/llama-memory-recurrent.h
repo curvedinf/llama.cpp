@@ -188,6 +188,11 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // true when every running sequence's state row is stable (src0 == own index), so the
+    //   fused op can write the new state back to the row it read from (in place) instead
+    //   of staging it in the op output and copying it back with ggml_cpy
+    bool get_direct() const;
+
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
 

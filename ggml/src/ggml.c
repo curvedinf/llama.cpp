@@ -6321,7 +6321,8 @@ struct ggml_tensor * ggml_gated_delta_net_idx(
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
         struct ggml_tensor  * s_idxs,
-        int64_t               K) {
+        int64_t               K,
+        bool                  state_ip) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6355,11 +6356,13 @@ struct ggml_tensor * ggml_gated_delta_net_idx(
     GGML_ASSERT(state->ne[3] >= n_seqs);
     GGML_ASSERT(s_idxs->ne[0] == n_seqs);
     GGML_ASSERT(K >= 1);
+    GGML_ASSERT(!state_ip || K == 1);
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, (int32_t) state_ip);
 
     result->op     = GGML_OP_GATED_DELTA_NET_IDX;
     result->src[0] = q;

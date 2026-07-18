@@ -2588,6 +2588,10 @@ extern "C" {
     // state store [S_v, S_v, H_v, n_rows] (n_rows >= n_seqs) and the initial state of
     // batch sequence i is read from row s_idxs[i], skipping the get_rows gather.
     // the output layout is identical to ggml_gated_delta_net (dense, indexed by batch seq).
+    // state_ip (K == 1 only): write the final state back to the input state rows
+    // s_idxs[i] instead of the output snapshot area, which is then left unwritten.
+    // the caller must guarantee that the s_idxs rows are distinct (each workgroup
+    // writes back exactly the row it read).
     GGML_API struct ggml_tensor * ggml_gated_delta_net_idx(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2597,7 +2601,8 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             struct ggml_tensor  * s_idxs,
-            int64_t               K);
+            int64_t               K,
+            bool                  state_ip);
 
     // DSA lightning indexer
     //

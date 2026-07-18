@@ -172,6 +172,22 @@ repetitive prompt, draft model = same checkpoint (nextn head), guarded 16 GB:
   (tree) drafting is not wired for MTP; llama-cli --parallel N (independent
   slots) is the working path for C > 1.
 
+## FA / bandwidth analysis (2026-07-18)
+
+- FA at decode at 4k: COOPMAT1 path, GQA grouped (N=4 rows), workgroups
+  (split_k=6) x (2 kv heads) x (16 seqs) = 192, split_kv=768. Split-k is active.
+- Marginal per-position cost from the length sweep (npp 512..8192): ~0.27 us
+  per KV position per step (FA reads + new K/V writes): FA at 4k ~1.1 ms/step
+  (~11%), at 8k ~2.3 ms/step (~21%).
+- -fa 0 (decomposed attention): PP 4531.79, TG 548.18 - FA is already ~3x
+  better than the alternative; FA is not the remaining bottleneck, the cost is
+  KV-traffic-inherent.
+- Per-step bandwidth accounting at C=16 4k: weights ~0.66 GB, GDN state IO
+  ~0.61 GB (19 layers x 32 MB), KV ~28 MB. GDN_IDX at 641 us/step is already
+  ~950 GB/s effective - bandwidth-bound, only fp16 state would cut it (numerics).
+  The step (10 ms) is still dispatch/latency-bound; skinny n=16 matmul kernels
+  (measured 169-340 GB/s effective) are the remaining big but deep target.
+
 ## Constraints
 
 - VRAM budget is hard-capped at 20 GB for any benchmark or test run (the GPU

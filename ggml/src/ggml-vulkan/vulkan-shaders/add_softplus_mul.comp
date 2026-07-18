@@ -1,0 +1,36 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// fused: dst[i] = softplus(x[i] + dt[h]) * a[h], h = i % H
+// x is contiguous [H, T, S]; dt and a are per-channel constants [H, 1, 1]
+
+layout(binding = 0) readonly  buffer XBuf  { float data_x[];  };
+layout(binding = 1) readonly  buffer DtBuf { float data_dt[]; };
+layout(binding = 2) readonly  buffer ABuf  { float data_a[];  };
+layout(binding = 3)           buffer Dst   { float data_d[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;
+    uint H;
+} pc;
+
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= pc.ne) {
+        return;
+    }
+
+    const uint h = idx % pc.H;
+
+    data_d[idx] = op_softplus(data_x[idx] + data_dt[h]) * data_a[h];
+}

@@ -979,6 +979,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
     vk_pipeline pipeline_ssm_conv_ip_f32;
     vk_pipeline pipeline_ssm_conv_ip_silu_f32;
+    vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1700,6 +1701,11 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nc, ncs, nr, n_t, n_s;
 };
 
+struct vk_op_add_softplus_mul_push_constants {
+    uint32_t ne;
+    uint32_t H;
+};
+
 struct vk_op_conv2d_push_constants {
     uint32_t Cout;
     uint32_t Cin;
@@ -2252,6 +2258,7 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    bool fused_add_softplus_mul {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5712,6 +5719,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_f32,        "ssm_conv_ip_f32",        ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 1}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32,   "add_softplus_mul_f32",   add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {256}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -12122,8 +12131,96 @@ static void ggml_vk_acc(ggml_backend_vk_context * ctx, vk_context& subctx, const
     });
 }
 
-static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor *first_node = cgraph->nodes[node_idx];
+// fused: dst = softplus(x + dt) * a, for the delta-net gate prep chain
+// (ADD with a per-channel broadcast, then SOFTPLUS, then MUL with a per-channel broadcast)
+static bool ggml_vk_can_fuse_add_softplus_mul(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL })) {
+        return false;
+    }
+
+    const ggml_tensor * add      = cgraph->nodes[node_idx];
+    const ggml_tensor * softplus = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+
+    if (ggml_get_unary_op(softplus) != GGML_UNARY_OP_SOFTPLUS || softplus->src[0] != add) {
+        return false;
+    }
+
+    // the mul's non-softplus src must be a per-channel broadcast [H, 1, 1]
+    const ggml_tensor * a = nullptr;
+    if (mul->src[0] == softplus) {
+        a = mul->src[1];
+    } else if (mul->src[1] == softplus) {
+        a = mul->src[0];
+    } else {
+        return false;
+    }
+
+    const auto is_hvec = [](const ggml_tensor * t) {
+        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+    };
+
+    // the add must have exactly one per-channel broadcast addend
+    const ggml_tensor * x  = nullptr;
+    const ggml_tensor * dt = nullptr;
+    if (is_hvec(add->src[1]) && !is_hvec(add->src[0])) {
+        x  = add->src[0];
+        dt = add->src[1];
+    } else if (is_hvec(add->src[0]) && !is_hvec(add->src[1])) {
+        x  = add->src[1];
+        dt = add->src[0];
+    } else {
+        return false;
+    }
+
+    if (!is_hvec(a)) {
+        return false;
+    }
+
+    const int64_t H = dt->ne[0];
+
+    if (x->ne[0] != H || a->ne[0] != H || !ggml_is_contiguous(x)) {
+        return false;
+    }
+
+    if (x->type != GGML_TYPE_F32 || dt->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_vk_add_softplus_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+
+    const auto is_hvec = [](const ggml_tensor * t) {
+        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+    };
+
+    const ggml_tensor * x  = is_hvec(add->src[1]) ? add->src[0] : add->src[1];
+    const ggml_tensor * dt = is_hvec(add->src[1]) ? add->src[1] : add->src[0];
+    const ggml_tensor * a  = mul->src[0]->op == GGML_OP_UNARY ? mul->src[1] : mul->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_add_softplus_mul_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer x_buf  = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer dt_buf = ggml_vk_tensor_subbuffer(ctx, dt);
+    vk_subbuffer a_buf  = ggml_vk_tensor_subbuffer(ctx, a);
+    vk_subbuffer d_buf  = ggml_vk_tensor_subbuffer(ctx, mul);
+
+    const uint32_t ne = (uint32_t) ggml_nelements(mul);
+
+    const vk_op_add_softplus_mul_push_constants pc = { ne, (uint32_t) dt->ne[0] };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, dt_buf, a_buf, d_buf }, pc, { ne, 1, 1 });
+}
+
+static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {    const ggml_tensor *first_node = cgraph->nodes[node_idx];
     const ggml_tensor *dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
     // Make a list of all the tensors used by the op.
@@ -15188,7 +15285,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_add_softplus_mul) {
+            ggml_vk_add_softplus_mul(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_add(ctx, compute_ctx, src0, src1, node);
@@ -17079,6 +17178,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_add_softplus_mul = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17152,6 +17252,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "SSM_CONV_SILU";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_add_softplus_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "ADD_SOFTPLUS_MUL";
+                ctx->fused_add_softplus_mul = true;
+                std::fill_n(op_srcs_fused_elementwise, 3, true);
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
@@ -17477,6 +17582,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern(snake_pattern)) {
             continue;
         }
+        // delta-net gate prep chain (ADD + SOFTPLUS + MUL with per-channel broadcasts)
+        if (keep_pattern({ GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL })) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -17512,6 +17621,8 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_UNARY) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
                     ok = false;

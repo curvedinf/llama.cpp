@@ -1,0 +1,63 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// fused: dst = rms_norm(x + y) * w per column
+// x and y are [ncols, nrows*channels*samps] (residual add, same shape);
+// w is a per-row constant [ncols]; dst is contiguous.
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 512;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly buffer YBuf { float data_y[]; };
+layout(binding = 2) readonly buffer WBuf { float data_w[]; };
+layout(binding = 3)           buffer Dst { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ncols;
+    uint nrows;
+    uint nchannels;
+    float eps;
+    uint nb_x1, nb_x2, nb_x3;
+    uint nb_y1, nb_y2, nb_y3;
+} p;
+
+shared float sumsh[BLOCK_SIZE];
+
+void main() {
+    const uint row     = gl_WorkGroupID.x;
+    const uint channel = gl_WorkGroupID.y;
+    const uint samp    = gl_WorkGroupID.z;
+    const uint tid     = gl_LocalInvocationID.x;
+
+    const uint off_x = samp*p.nb_x3 + channel*p.nb_x2 + row*p.nb_x1;
+    const uint off_y = samp*p.nb_y3 + channel*p.nb_y2 + row*p.nb_y1;
+
+    float sum = 0.0f;
+
+    [[unroll]] for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        const float xi = data_x[off_x + col] + data_y[off_y + col];
+        sum += xi * xi;
+    }
+
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float scale = inversesqrt(sum / float(p.ncols) + p.eps);
+
+    const uint d_offset = ((samp*p.nchannels + channel)*p.nrows + row)*p.ncols;
+
+    [[unroll]] for (uint col = tid; col < p.ncols; col += BLOCK_SIZE) {
+        data_d[d_offset + col] = (data_x[off_x + col] + data_y[off_y + col]) * scale * data_w[col];
+    }
+}

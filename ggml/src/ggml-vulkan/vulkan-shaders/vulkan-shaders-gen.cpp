@@ -1147,6 +1147,8 @@ void process_shaders() {
 
     string_to_spv("add_softplus_mul_f32", "add_softplus_mul.comp", {});
 
+    string_to_spv("add_rms_norm_mul_f32", "add_rms_norm_mul.comp", {});
+
     string_to_spv("mul_silu_f32", "mul_silu.comp", {});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});

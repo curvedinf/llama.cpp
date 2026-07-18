@@ -980,6 +980,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_ip_f32;
     vk_pipeline pipeline_ssm_conv_ip_silu_f32;
     vk_pipeline pipeline_add_softplus_mul_f32;
+    vk_pipeline pipeline_add_rms_norm_mul_f32;
     vk_pipeline pipeline_mul_silu_f32;
     vk_pipeline pipeline_mul_sigmoid_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1708,6 +1709,13 @@ struct vk_op_add_softplus_mul_push_constants {
     uint32_t H;
 };
 
+struct vk_op_add_rms_norm_mul_push_constants {
+    uint32_t ncols, nrows, nchannels;
+    float eps;
+    uint32_t nb_x1, nb_x2, nb_x3;
+    uint32_t nb_y1, nb_y2, nb_y3;
+};
+
 struct vk_op_mul_silu_push_constants {
     uint32_t ne;
 };
@@ -2266,6 +2274,7 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     bool fused_add_softplus_mul {};
     bool fused_mul_silu {};
+    bool fused_add_rms_norm_mul {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5728,6 +5737,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32,   "add_softplus_mul_f32",   add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_add_rms_norm_mul_f32,   "add_rms_norm_mul_f32",   add_rms_norm_mul_f32_len, add_rms_norm_mul_f32_data, "main", 4, sizeof(vk_op_add_rms_norm_mul_push_constants), {1, 1, 1}, {512}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_silu_f32,           "mul_silu_f32",           mul_silu_f32_len, mul_silu_f32_data, "main", 3, sizeof(vk_op_mul_silu_push_constants), {256, 1, 1}, {256, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_mul_sigmoid_f32,        "mul_sigmoid_f32",        mul_silu_f32_len, mul_silu_f32_data, "main", 3, sizeof(vk_op_mul_silu_push_constants), {256, 1, 1}, {256, 1}, 1);
 
@@ -12294,6 +12304,86 @@ static void ggml_vk_mul_silu(ggml_backend_vk_context * ctx, vk_context& subctx, 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, z_buf, d_buf }, pc, { ne, 1, 1 });
 }
 
+// fused: dst = rms_norm(x + y) * w, for the residual-add + input-norm chain
+// (ADD of two same-shape tensors, then RMS_NORM, then MUL by a per-row constant)
+static bool ggml_vk_can_fuse_add_rms_norm_mul(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(ctx);
+
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false;
+    }
+
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+
+    if (rms->src[0] != add) {
+        return false;
+    }
+
+    // the residual add must add two same-shape tensors
+    if (!ggml_are_same_shape(add->src[0], add->src[1])) {
+        return false;
+    }
+
+    // the mul's non-rms src must be a per-row constant [ncols, 1, 1]
+    const ggml_tensor * w = nullptr;
+    if (mul->src[0] == rms) {
+        w = mul->src[1];
+    } else if (mul->src[1] == rms) {
+        w = mul->src[0];
+    } else {
+        return false;
+    }
+
+    if (w->ne[1] != 1 || w->ne[2] != 1 || w->ne[3] != 1 || w->ne[0] != add->ne[0]) {
+        return false;
+    }
+
+    if (add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // dst layout assumed by the shader (contiguous rows)
+    if (!ggml_is_contiguous_rows(add->src[0]) || !ggml_is_contiguous_rows(add->src[1])) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_vk_add_rms_norm_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * add = cgraph->nodes[node_idx];
+    const ggml_tensor * rms = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * x = add->src[0];
+    const ggml_tensor * y = add->src[1];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_add_rms_norm_mul_f32;
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x);
+    vk_subbuffer y_buf = ggml_vk_tensor_subbuffer(ctx, y);
+    vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mul);
+
+    const float eps = ((const float *) rms->op_params)[0];
+
+    const vk_op_add_rms_norm_mul_push_constants pc = {
+        (uint32_t) add->ne[0], (uint32_t) add->ne[1], (uint32_t) add->ne[2],
+        eps,
+        (uint32_t) x->nb[1] / (uint32_t) sizeof(float), (uint32_t) x->nb[2] / (uint32_t) sizeof(float), (uint32_t) x->nb[3] / (uint32_t) sizeof(float),
+        (uint32_t) y->nb[1] / (uint32_t) sizeof(float), (uint32_t) y->nb[2] / (uint32_t) sizeof(float), (uint32_t) y->nb[3] / (uint32_t) sizeof(float),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, y_buf, w_buf, d_buf }, pc,
+                              { (uint32_t) add->ne[1], (uint32_t) add->ne[2], (uint32_t) add->ne[3] });
+}
+
 static void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {    const ggml_tensor *first_node = cgraph->nodes[node_idx];
     const ggml_tensor *dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
@@ -15359,7 +15449,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_ADD:
-        if (ctx->fused_add_softplus_mul) {
+        if (ctx->fused_add_rms_norm_mul) {
+            ggml_vk_add_rms_norm_mul(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->fused_add_softplus_mul) {
             ggml_vk_add_softplus_mul(ctx, compute_ctx, cgraph, node_idx);
         } else if (ctx->num_additional_fused_ops) {
             ggml_vk_multi_add(ctx, compute_ctx, cgraph, node_idx);
@@ -17258,6 +17350,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_scale = false;
         ctx->fused_add_softplus_mul = false;
         ctx->fused_mul_silu = false;
+        ctx->fused_add_rms_norm_mul = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17336,6 +17429,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "ADD_SOFTPLUS_MUL";
                 ctx->fused_add_softplus_mul = true;
                 std::fill_n(op_srcs_fused_elementwise, 3, true);
+            } else if (ggml_vk_can_fuse_add_rms_norm_mul(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "ADD_RMS_NORM_MUL";
+                ctx->fused_add_rms_norm_mul = true;
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse_mul_silu(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_SILU";
@@ -17674,6 +17774,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
         if (keep_pattern({ GGML_OP_UNARY, GGML_OP_MUL })) {
             continue;
         }
+        // residual add + input norm chain (ADD + RMS_NORM + MUL)
+        if (keep_pattern({ GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+            continue;
+        }
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
@@ -17699,6 +17803,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                 match_pattern(topk_moe_late_softmax, j) ||
                 match_pattern({ GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, j) ||
                 match_pattern({ GGML_OP_UNARY, GGML_OP_MUL }, j) ||
+                match_pattern({ GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, j) ||
                 match_pattern(snake_pattern, j)) {
                 continue;
             }
@@ -17713,6 +17818,7 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_UNARY) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL) &&
+                    !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_ADD && graph->nodes[j]->op == GGML_OP_RMS_NORM) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_SSM_CONV && graph->nodes[j]->op == GGML_OP_UNARY)) {
                     ok = false;

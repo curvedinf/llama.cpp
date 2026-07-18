@@ -198,3 +198,29 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+---
+
+## Local optimization workflow (concurrency-optimization branch)
+
+### GPU safety rules (mandatory, learned from 3 machine crashes)
+
+- **20 GB VRAM hard cap** for any process. The GPU also drives the desktop.
+- Before ANY GPU work, start the watchdog and keep it running:
+  `./vram-watchdog.sh 20480 &`
+  It SIGKILLs any compute process over 20 GB (and the largest one if total
+  compute VRAM exceeds 22 GB). Kills are logged to
+  `bench-results/vram-watchdog.log`.
+- All GPU runs must go through `./bench-c16.sh` or `./run-guarded.sh 16384 --`.
+  Never run test-backend-ops or other large-allocation binaries unguarded;
+  only targeted subsets (`-o MUL_MAT` etc.) under run-guarded.sh.
+- Shader experiments that increase per-workgroup resources (LDS/registers,
+  e.g. larger BK tiles) can HANG the GPU - a VRAM watchdog cannot stop that.
+  Validate such changes with the smallest possible run first
+  (llama-cli -n 8 under run-guarded.sh) before any benchmark.
+
+### Bench workflow
+
+- Target workload: C=16 x 4k: `./bench-c16.sh <build_dir> <label> s4k`.
+- Log every experiment (tok/s, kept or reverted) in OPTIMIZATION_LOG.md.
+- Commit each successful optimization; revert and log the failures.

@@ -69,9 +69,10 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024, in-place GDN + conv)** | **17957** | **1597** | **13704** |
+| **optimized (ub 1024, in-place GDN + conv)** | **17859 - 18014** | **1595 - 1599** | **13643 - 13783** |
 
 vs HEAD baseline: PP +10.0%, TG +64.9%, S +24.2%. vs upstream: PP +3.8%, TG +21.4%, S +8.4%.
+At 16x8k (quick): PP 16187 vs upstream 16595 (-2.5%), TG 1435 vs upstream 1329 (+8.0%).
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full

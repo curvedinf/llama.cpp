@@ -1,0 +1,29 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+// fused: dst[i] = x[i] * silu(z[i]) = x[i] * z[i] / (1 + exp(-z[i]))
+
+layout(binding = 0) readonly  buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly  buffer ZBuf { float data_z[]; };
+layout(binding = 2)           buffer Dst  { float data_d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;
+} pc;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+
+    if (idx >= pc.ne) {
+        return;
+    }
+
+    const float z = data_z[idx];
+
+    data_d[idx] = data_x[idx] * z / (1.0f + exp(-z));
+}

@@ -5710,8 +5710,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_bias_silu_f32, "ssm_conv_bias_silu_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 1, 1}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_f32,        "ssm_conv_ip_f32",        ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_f32,        "ssm_conv_ip_f32",        ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 

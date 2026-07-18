@@ -42,14 +42,23 @@ void main() {
     // window column j of token i2: w = i2 - (nc-1) + j; w < 0 reads the store row
     const uint state_base = uint(data_sidx[i3]) * (nc - 1u) * nr + i1 * (nc - 1u);
     const uint tok_base   = i3 * (nb02 / 4) + i1 * (nb01 / 4);
+    const uint w_base     = i1 * (nb11 / 4);
 
     float sum = 0.0;
 
-    [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
-        const int w = int(i2) - int(nc - 1u) + int(i0);
-        const float x = w < 0 ? data_state[state_base + (nc - 1u) + uint(w)]
-                              : src0[tok_base + uint(w)];
-        sum += x * src1[i1 * (nb11 / 4) + i0];
+    if (nc == 4u && n_t == 1u) {
+        // the only token: taps 0..2 are consecutive store columns, tap 3 is the token
+        const vec4 s = vec4(data_state[state_base], data_state[state_base + 1u],
+                            data_state[state_base + 2u], src0[tok_base]);
+        const vec4 w = vec4(src1[w_base], src1[w_base + 1u], src1[w_base + 2u], src1[w_base + 3u]);
+        sum = dot(s, w);
+    } else {
+        [[unroll]] for (uint i0 = 0; i0 < nc; i0++) {
+            const int w = int(i2) - int(nc - 1u) + int(i0);
+            const float x = w < 0 ? data_state[state_base + (nc - 1u) + uint(w)]
+                                  : src0[tok_base + uint(w)];
+            sum += x * src1[w_base + i0];
+        }
     }
 
     if (APPLY_BIAS) {

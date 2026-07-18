@@ -34,6 +34,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-17 | 058402b | FINAL verification (clean tree, guarded harness) | 17711.19 | 1373.94 | - | verified, tests pass |
 | 2026-07-18 | this | GDN in-place state write-back (skip snapshot + 18x16MB cpy/step) | 17748.20 | 1479.37 | TG +8.1%, PP +0.2% vs prev | committed |
 | 2026-07-18 | this | conv state in-place (skip gather+concat+cpy, ~54 nodes/step) | 17733.44 | 1544.47 | TG +4.4%, PP -0.1% vs prev | committed |
+| 2026-07-18 | this | conv ip shader: full-occupancy workgroups + vec4 fast path | 17541.14 | 1561.84 | TG +1.1%, PP -1.1% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -64,9 +65,9 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024, in-place GDN + conv)** | **17733** | **1544** | **13459** |
+| **optimized (ub 1024, in-place GDN + conv)** | **17733** | **1562** | **13459** |
 
-vs HEAD baseline: PP +8.7%, TG +59.5%, S +22.1%. vs upstream: PP +2.5%, TG +17.4%, S +6.5%.
+vs HEAD baseline: PP +8.7%, TG +61.2%, S +22.1%. vs upstream: PP +2.5%, TG +18.7%, S +6.5%.
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full

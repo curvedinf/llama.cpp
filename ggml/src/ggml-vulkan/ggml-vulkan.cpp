@@ -981,6 +981,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_ip_silu_f32;
     vk_pipeline pipeline_add_softplus_mul_f32;
     vk_pipeline pipeline_mul_silu_f32;
+    vk_pipeline pipeline_mul_sigmoid_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -5727,7 +5728,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_ip_silu_f32,   "ssm_conv_ip_silu_f32",   ssm_conv_ip_f32_len, ssm_conv_ip_f32_data, "main", 6, sizeof(vk_op_ssm_conv_push_constants), {32, 1, 1}, {32, 1, 0, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_add_softplus_mul_f32,   "add_softplus_mul_f32",   add_softplus_mul_f32_len, add_softplus_mul_f32_data, "main", 4, sizeof(vk_op_add_softplus_mul_push_constants), {256, 1, 1}, {256}, 1);
-    ggml_vk_create_pipeline(device, device->pipeline_mul_silu_f32,           "mul_silu_f32",           mul_silu_f32_len, mul_silu_f32_data, "main", 3, sizeof(vk_op_mul_silu_push_constants), {256, 1, 1}, {256}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_silu_f32,           "mul_silu_f32",           mul_silu_f32_len, mul_silu_f32_data, "main", 3, sizeof(vk_op_mul_silu_push_constants), {256, 1, 1}, {256, 0}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_sigmoid_f32,        "mul_sigmoid_f32",        mul_silu_f32_len, mul_silu_f32_data, "main", 3, sizeof(vk_op_mul_silu_push_constants), {256, 1, 1}, {256, 1}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -12227,7 +12229,7 @@ static void ggml_vk_add_softplus_mul(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, dt_buf, a_buf, d_buf }, pc, { ne, 1, 1 });
 }
 
-// fused: dst = x * silu(z), for the gated-norm z chain (SILU followed by MUL)
+// fused: dst = x * act(z), for the gated-norm z chain (SILU or SIGMOID followed by MUL)
 static bool ggml_vk_can_fuse_mul_silu(const ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(ctx);
 
@@ -12235,17 +12237,18 @@ static bool ggml_vk_can_fuse_mul_silu(const ggml_backend_vk_context * ctx, const
         return false;
     }
 
-    const ggml_tensor * silu = cgraph->nodes[node_idx];
-    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * act = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
 
-    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU) {
+    const ggml_unary_op uop = ggml_get_unary_op(act);
+    if (uop != GGML_UNARY_OP_SILU && uop != GGML_UNARY_OP_SIGMOID) {
         return false;
     }
 
     const ggml_tensor * x = nullptr;
-    if (mul->src[0] == silu) {
+    if (mul->src[0] == act) {
         x = mul->src[1];
-    } else if (mul->src[1] == silu) {
+    } else if (mul->src[1] == act) {
         x = mul->src[0];
     } else {
         return false;
@@ -12255,12 +12258,12 @@ static bool ggml_vk_can_fuse_mul_silu(const ggml_backend_vk_context * ctx, const
         return false;
     }
 
-    // silu input, x and dst must all have the same shape and be contiguous
-    if (!ggml_are_same_shape(silu->src[0], x) || !ggml_are_same_shape(silu->src[0], mul)) {
+    // act input, x and dst must all have the same shape and be contiguous
+    if (!ggml_are_same_shape(act->src[0], x) || !ggml_are_same_shape(act->src[0], mul)) {
         return false;
     }
 
-    if (!ggml_is_contiguous(silu->src[0]) || !ggml_is_contiguous(x)) {
+    if (!ggml_is_contiguous(act->src[0]) || !ggml_is_contiguous(x)) {
         return false;
     }
 
@@ -12268,13 +12271,15 @@ static bool ggml_vk_can_fuse_mul_silu(const ggml_backend_vk_context * ctx, const
 }
 
 static void ggml_vk_mul_silu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * silu = cgraph->nodes[node_idx];
-    const ggml_tensor * mul  = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * act = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
 
-    const ggml_tensor * z = silu->src[0];
-    const ggml_tensor * x = mul->src[0] == silu ? mul->src[1] : mul->src[0];
+    const ggml_tensor * z = act->src[0];
+    const ggml_tensor * x = mul->src[0] == act ? mul->src[1] : mul->src[0];
 
-    vk_pipeline pipeline = ctx->device->pipeline_mul_silu_f32;
+    vk_pipeline pipeline = ggml_get_unary_op(act) == GGML_UNARY_OP_SIGMOID
+        ? ctx->device->pipeline_mul_sigmoid_f32
+        : ctx->device->pipeline_mul_silu_f32;
 
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 

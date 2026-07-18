@@ -37,6 +37,7 @@ Target workload: 16 concurrent sequences x 4096-token prompts, 128 generated tok
 | 2026-07-18 | this | conv ip shader: full-occupancy workgroups + vec4 fast path | 17541.14 | 1561.84 | TG +1.1%, PP -1.1% vs prev | committed |
 | 2026-07-18 | this | fused ADD+SOFTPLUS+MUL op for the GDN gate prep chain | 17609.41 | 1572.62 | TG +0.7%, PP +0.4% vs prev | committed |
 | 2026-07-18 | this | fused SILU+MUL op for the gated-norm z chain | 17848.44 | 1595.04 | TG +1.4%, PP +1.4% vs prev | committed |
+| 2026-07-18 | this | extend fusion to the sigmoid gate (full-attn layers) | 17957.45 | 1597.40 | TG +0.1%, PP +0.6% vs prev | committed |
 
 ubatch sweep (b=2048 unless noted, C=16 x 4k):
 
@@ -67,9 +68,9 @@ regimes were not optimized here.
 |-------|----------|----------|-------|
 | upstream 0dc74e3 (-ub 512) | 17295 - 17525 | 1316 - 1356 | 12643 - 12873 |
 | HEAD baseline 1ed3129 (-ub 512) | 16318 | 968 | 11025 |
-| **optimized (ub 1024, in-place GDN + conv)** | **17848** | **1595** | **13637** |
+| **optimized (ub 1024, in-place GDN + conv)** | **17957** | **1597** | **13704** |
 
-vs HEAD baseline: PP +9.4%, TG +64.6%, S +23.7%. vs upstream: PP +3.2%, TG +21.2%, S +7.9%.
+vs HEAD baseline: PP +10.0%, TG +64.9%, S +24.2%. vs upstream: PP +3.8%, TG +21.4%, S +8.4%.
 
 Validation: test-prefix-cache, test-prefix-cache-e2e, test-kv-cells, test-graph-cache,
 test-gdn-indexed-state, test-backend-ops -o MUL_MAT all pass. Note: a full

@@ -3,10 +3,11 @@
 #extension GL_EXT_control_flow_attributes : require
 
 layout(constant_id = 0) const uint BLOCK_SIZE = 256;
+layout(constant_id = 1) const uint ACTIVATION = 0; // 0 = silu, 1 = sigmoid
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-// fused: dst[i] = x[i] * silu(z[i]) = x[i] * z[i] / (1 + exp(-z[i]))
+// fused: dst[i] = x[i] * act(z[i])
 
 layout(binding = 0) readonly  buffer XBuf { float data_x[]; };
 layout(binding = 1) readonly  buffer ZBuf { float data_z[]; };
@@ -25,5 +26,12 @@ void main() {
 
     const float z = data_z[idx];
 
-    data_d[idx] = data_x[idx] * z / (1.0f + exp(-z));
+    float act;
+    if (ACTIVATION == 1) {
+        act = 1.0f / (1.0f + exp(-z));
+    } else {
+        act = z / (1.0f + exp(-z));
+    }
+
+    data_d[idx] = data_x[idx] * act;
 }

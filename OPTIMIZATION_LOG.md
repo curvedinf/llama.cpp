@@ -139,6 +139,29 @@ watchdog or on CPU; it is not part of the bench flow.
 - Fewer/larger kernels per step (fusion of the delta-net elementwise chains);
   ~420 of the ~640 nodes per step are small elementwise/copy ops.
 
+## MTP speculative decoding (draft-mtp) at C=16 x 4k
+
+Measured with llama-cli, --parallel 16, -c 67584, -n 128, same 4069-token
+repetitive prompt, draft model = same checkpoint (nextn head), guarded 16 GB:
+
+| mode | S_PP t/s | S_TG t/s | note |
+|------|----------|----------|------|
+| baseline (no spec) | 11569.9 | 334.5 | llama-cli has per-step sampling syncs; not comparable to batched-bench |
+| --spec-type draft-mtp | 6755.2 | 362.6 | TG +8.4%, PP -41.6% |
+
+- MTP drafting works at C=16 via llama-cli --parallel N --spec-type draft-mtp
+  (same checkpoint as -md). Acceptance on this trivially predictable prompt is
+  ~100% (best case), yet the net generation gain is only +8.4%: at C=16 the
+  batch is already 16-wide, so draft+verify multiplies work per accepted
+  token. Prompt eval is ~42% slower (h_nextn extraction + draft eval).
+- llama-speculative --parallel N (tree branches) crashes at
+  common/sampling.cpp:154 (GGML_ASSERT(logits != nullptr)) for N > 1.
+  Verified PRE-EXISTING in 1ed3129 (reproduced with a fresh worktree build of
+  that commit) - not caused by the optimization commits. Root cause: the
+  draft-mtp driver allocates its batch with n_seq_max = 1, so multi-branch
+  (tree) drafting is not wired for MTP; llama-cli --parallel N (independent
+  slots) is the working path for C > 1.
+
 ## Constraints
 
 - VRAM budget is hard-capped at 20 GB for any benchmark or test run (the GPU

@@ -2835,6 +2835,18 @@ private:
     }
 
     void pre_decode() {
+        // chunked prefill (Sarathi-Serve): cap how many prompt tokens a single slot
+        //   may add per iteration so that running decode tokens and other slots'
+        //   prefill chunks coexist in the same logical batch. 0 = disabled (one
+        //   slot may consume the whole batch), which is the legacy behaviour.
+        //   Tuned via env because it is workload-dependent; the server param
+        //   surface is kept minimal until the win is validated.
+        static const int prefill_chunk = []{
+            const char * env = getenv("LLAMA_PREFILL_CHUNK");
+            int v = env ? atoi(env) : 0;
+            return v < 0 ? 0 : v;
+        }();
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3479,6 +3491,15 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        // chunked prefill cap: tokens added for THIS slot so far
+                        //   (n_tokens_prev = batch.size() at slot entry). When the
+                        //   cap is hit we yield the rest to the next iteration so
+                        //   that already-running decode tokens and other slots'
+                        //   prompt chunks can share the batch.
+                        if (prefill_chunk > 0 && batch.size() - n_tokens_prev >= prefill_chunk) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {

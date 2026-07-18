@@ -239,3 +239,50 @@ generation matching upstream. Not bit-identical by design.
   the contention guard and the MEM_CAP_MB watchdog); use MEM_CAP_MB=16384 to
   keep desktop headroom. Never run test-backend-ops or other large-allocation
   binaries unguarded.
+
+## vLLM gap-closure roadmap (2026-07-18)
+
+Following the gap analysis, the AGENTS.md roadmap is being implemented in
+order. Each phase: implement, bench, log, keep if no regression.
+
+### Phase 1: Chunked prefill co-location (Sarathi-Serve)
+
+Status: implemented (opt-in), no regression on s4k, no win on the small-model
+decode-bound bench. Kept for the larger-model / bursty-traffic regime where
+vLLM's chunked-prefill wins actually show up.
+
+Knob: `LLAMA_PREFILL_CHUNK` (env, server only). 0 = legacy behaviour (one
+slot may consume the whole `n_batch` budget with its prompt); N = cap the
+per-slot prompt-add loop to N tokens per `pre_decode()` iteration, so that
+running decode tokens and other slots' prefill chunks coexist in the same
+logical batch. The engine's existing ubatch splitter (and the
+`[TAG_RECURRENT_ROLLBACK_SPLITS]` tail grouping in
+`src/llama-memory-hybrid.cpp`) handle the rest; no engine change was needed.
+
+Change is in `tools/server/server-context.cpp:pre_decode()` (env read at the
+top of the function, cap checked inside the prompt-add `while` loop). It only
+affects the server; `llama-batched-bench` does not exercise it (it prefills
+all sequences collectively then decodes all collectively).
+
+Validation: a new `tools/mixed-bench/llama-mixed-bench` simulates a server
+mixed phase (N_DECODE warm decoders + N_ARRIVE fresh prompts). Numbers on the
+target hardware (8 + 8 x 4096, 128 decoded each):
+
+| chunk | iters | T_s   | D_t/s  | P_t/s  | all_t/s | note |
+|-------|-------|-------|--------|--------|---------|------|
+| 0     | 152   | 3.230 | 634.1  | 10145  | 10779   | baseline (cap off) |
+| 512   | 192   | 3.283 | 623.8  |  9981  | 10605   | -1.6% (within noise) |
+| 256   | 256   | 3.797 | 539.4  |  8631  |  9170   | -14.9% (dispatch overhead dominates) |
+
+Finding: at C=16 x 4k on a 0.8B model on RX 7900 XTX, dispatch/latency is the
+ceiling (~0.65 ms CPU / 10 ms GPU per step per the bandwidth analysis below).
+Splitting prefill into smaller chunks multiplies the number of iterations and
+the per-iter dispatch overhead, without unblocking any bottleneck. vLLM's win
+here is on larger models where prefill is heavy enough to stall decoders for
+tens of ms; that is not the regime of this bench. Phase 1 stays in tree,
+default off, for that larger-model regime.
+
+s4k regression check (build baseline-recheck vs build with the change, both
+chunk=0): S_PP 17902 / S_TG 1902 -> 17900 / 1883. Within noise. The change
+does not run under batched-bench (server-only).
+

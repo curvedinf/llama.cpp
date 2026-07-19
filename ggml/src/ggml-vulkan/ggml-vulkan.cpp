@@ -12259,13 +12259,17 @@ static bool ggml_vk_can_fuse_add_softplus_mul(const ggml_backend_vk_context * ct
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     };
 
-    // the add must have exactly one per-channel broadcast addend
+    // the add must have exactly one per-channel broadcast addend.
+    // in single-token decode both addends can be hvec-shaped ([H,1,1,1] for alpha
+    // and [H] for ssm_dt); the math is symmetric so just require at least one hvec
+    // and pick it as the broadcast. Prefer src[1] when both qualify (matches the
+    // historical call order: ggml_add(alpha, ssm_dt)).
     const ggml_tensor * x  = nullptr;
     const ggml_tensor * dt = nullptr;
-    if (is_hvec(add->src[1]) && !is_hvec(add->src[0])) {
+    if (is_hvec(add->src[1])) {
         x  = add->src[0];
         dt = add->src[1];
-    } else if (is_hvec(add->src[0]) && !is_hvec(add->src[1])) {
+    } else if (is_hvec(add->src[0])) {
         x  = add->src[1];
         dt = add->src[0];
     } else {

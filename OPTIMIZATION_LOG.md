@@ -413,6 +413,46 @@ Net: G4 committed. The env is opt-in and default-off; no regression when
 LLAMA_GDN_STATE_F16 is unset (the f32 path is byte-identical to before).
 
 
+## G3: fusion long-tail
+
+### add_softplus_mul fusion fix for single-seq decode
+
+Status: committed. Neutral on the C=16 bench, real win on C=1 / llama-cli.
+
+The existing add_softplus_mul fusion (delta-net alpha gate prep:
+`ADD(alpha, ssm_dt) -> SOFTPLUS -> MUL(., ssm_a)`) required an exact
+either-or hvec shape: `is_hvec(src[1]) && !is_hvec(src[0])` (or vice
+versa). In single-seq decode (n_seqs=1, n_seq_tokens=1) both addends are
+hvec-shaped: alpha has `[num_v_heads, 1, 1, 1]` and ssm_dt has
+`[num_v_heads]`. The strict either-or rejected this case, so the fusion
+silently failed and 18 ADD + 18 SOFTPLUS + 18 MUL ran unfused.
+
+Fix: relax to "at least one hvec, prefer src[1] as the broadcast addend
+(matches the historical call order ggml_add(alpha, ssm_dt))".
+
+Validated with GGML_VK_PERF_LOGGER=1 single-seq decode:
+- before: `SOFTPLUS: 18 x 8.2us = 148us`, `MUL: 18 x 8.2us = 148us` (unfused)
+- after: `ADD_SOFTPLUS_MUL: 18 x 8.0us = 144us` (fused, no separate SOFTPLUS/MUL)
+
+That eliminates 36 dispatches per single-seq step (~288us out of ~5000us =
+~5.7% on the llama-cli C=1 workload; not measured directly because llama-cli
+has per-step sampling sync).
+
+C=16 s4k bench (3 iters each): baseline S_TG avg ~1900, with-fix S_TG avg
+~1893. Within noise (-0.4%). At C=16 the alpha tensor has shape
+`[num_v_heads, 1, 16]` (ne[2]=16, not hvec), so the existing fusion already
+fired there - the fix only changes the n_seqs=1 case.
+
+Why the C=16 case is "alpha has ne[2]=16": the bench decodes 16 sequences in
+parallel, so the GDN alpha projection output has the seqs dimension populated.
+In single-seq decode that dimension collapses to 1, making alpha hvec-shaped
+and triggering the previously-broken case.
+
+Lesson: the AGENTS.md rule "each change must help the current bench AND
+plausibly help other regimes" works in both directions - this change doesn't
+help the current bench but does help a plausible other regime (C=1
+single-stream, the llama-cli default). Kept.
+
 ## vLLM gap-closure summary (2026-07-18)
 
 Of the gap-analysis plan:

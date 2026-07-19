@@ -3683,7 +3683,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     const bool small_rows = n_rows < 32;
 
     if (small_rows) {
-        result.block_rows = 32;
+        result.block_rows = 16;  // was 32; smaller block = more workgroups for low-row decode iters
         result.block_cols = 32;
     } else if (ggml_is_quantized(k_type) || ggml_is_quantized(v_type) || hsk >= 256 || hsv >= 256) {
         result.block_rows = (hsk >= 512 || hsv >= 512) ? 32 : 64;

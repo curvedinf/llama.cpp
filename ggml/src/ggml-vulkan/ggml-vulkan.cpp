@@ -4154,7 +4154,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_warptile_mmq_k = l_warptile_mmq;
         m_warptile_mmq_k = m_warptile_mmq;
         s_warptile_mmq_k = s_warptile_mmq;
-        s_warptile_mmq_k[3] = 64;
+        s_warptile_mmq_k[3] = 128;
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };

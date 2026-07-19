@@ -17420,7 +17420,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
+    // Estimate the amount of compute work using flops, and submit roughly every 1/20 of the total
+    // graph's flops (was 1/40), so small-graph decode iterations don't generate dozens of submits.
+    // Bounded by the flops_cap below.
+    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 20u);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (first_node_in_batch) {

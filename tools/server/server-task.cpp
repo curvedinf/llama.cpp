@@ -250,6 +250,9 @@ json result_timings::to_json() const {
         {"predicted_ms",           predicted_ms},
         {"predicted_per_token_ms", predicted_per_token_ms},
         {"predicted_per_second",   predicted_per_second},
+
+        {"first_token_ms",         first_token_ms},
+        {"queue_ms",               queue_ms},
     };
 
     if (draft_n > 0) {

@@ -272,6 +272,12 @@ struct result_timings {
     double predicted_per_token_ms = 0.0;
     double predicted_per_second = 0.0;
 
+    // Streaming-UX metrics (P2). Time from request POST to first token emitted,
+    // and time the request spent waiting in the queue before admission to a slot.
+    // Negative when not measured (e.g. empty prompt, no generation).
+    double first_token_ms = -1.0;
+    double queue_ms       = -1.0;
+
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;

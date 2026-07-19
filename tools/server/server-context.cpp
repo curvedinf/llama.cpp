@@ -283,6 +283,13 @@ struct server_slot {
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
 
+    // Streaming-UX metrics (P2). t_first_token_us is the time the first generated
+    // token was emitted (relative to process epoch); t_post_us is the time the
+    // task was created (i.e. POST received). Reported in timings as
+    // first_token_ms and queue_ms.
+    int64_t t_post_us         = 0;
+    int64_t t_first_token_us  = 0;
+
     std::function<void(int /* id_slot */)> callback_on_release;
 
     // Speculative decoding stats
@@ -509,6 +516,14 @@ struct server_slot {
         timings.predicted_ms           = t_token_generation;
         timings.predicted_per_token_ms = t_token_generation / n_decoded;
         timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
+
+        // P2: streaming-UX metrics. first_token_ms is the time from POST to the
+        // first generated token (the latency a streaming user perceives before
+        // the first byte). queue_ms is the time spent waiting for slot admission.
+        timings.first_token_ms = (t_post_us && t_first_token_us)
+            ? (t_first_token_us - t_post_us) / 1e3 : -1.0;
+        timings.queue_ms = t_post_us
+            ? (t_start_process_prompt - t_post_us) / 1e3 : -1.0;
 
         // Add speculative metrics
         if (n_draft_total > 0) {
@@ -1876,6 +1891,10 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
+        // P2 metrics: record POST time so we can report queue_ms and first_token_ms
+        slot.t_post_us        = ggml_time_us();
+        slot.t_first_token_us = 0;
+
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
@@ -3137,6 +3156,37 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // LLAMA_UX_DYNAMIC_BUDGET: P1 fair-share chunked prefill (Sarathi-Serve style).
+        // Instead of letting the first prefilling slot consume the whole remaining
+        // n_batch, give each prefilling slot an equal share of (n_batch - n_decoding)
+        // floored at LLAMA_UX_MIN_CHUNK (default 256). Decoders always go first; this
+        // only affects how the leftover budget is split among pending prefills.
+        // Default off (preserves legacy behavior); validated in tools/ux-bench.
+        static const bool ux_dynamic_budget = []{
+            const char * e = getenv("LLAMA_UX_DYNAMIC_BUDGET");
+            return e && e[0] == '1';
+        }();
+        static const int ux_min_chunk = []{
+            const char * e = getenv("LLAMA_UX_MIN_CHUNK");
+            return e ? std::max(1, atoi(e)) : 256;
+        }();
+
+        // Count current decoders (already in batch) and pending prefills for the budget split.
+        const int n_decoding_this_iter = (int) generating.size();
+        int n_prefilling_pending = 0;
+        if (ux_dynamic_budget) {
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    if (slot_batched && !slot_batched->can_batch_with(slot)) return;
+                    if (slot.state == SLOT_STATE_WAIT_OTHER) return;
+                    n_prefilling_pending++;
+                }
+            });
+        }
+        const int ux_per_slot_budget = ux_dynamic_budget && n_prefilling_pending > 0
+            ? std::max(ux_min_chunk, (n_batch - n_decoding_this_iter) / n_prefilling_pending)
+            : 0;  // 0 = legacy (LLAMA_PREFILL_CHUNK or n_batch)
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -3585,6 +3635,16 @@ private:
                         //   cap is hit we yield the rest to the next iteration so
                         //   that already-running decode tokens and other slots'
                         //   prompt chunks can share the batch.
+                        //
+                        // Two cap modes:
+                        //   - LLAMA_PREFILL_CHUNK (legacy fixed cap, unchanged)
+                        //   - LLAMA_UX_DYNAMIC_BUDGET (P1 fair share): per-slot cap
+                        //     = max(MIN, (n_batch - n_decoding) / n_prefilling_pending)
+                        //     so multiple slots prefill per iteration instead of one
+                        //     slot monopolizing the batch.
+                        if (ux_per_slot_budget > 0 && batch.size() - n_tokens_prev >= ux_per_slot_budget) {
+                            break;
+                        }
                         if (prefill_chunk > 0 && batch.size() - n_tokens_prev >= prefill_chunk) {
                             break;
                         }
@@ -3912,6 +3972,10 @@ private:
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                 metrics.on_prompt_eval(slot);
+                // P2: first decode token -> first streaming emission timestamp
+                if (slot.t_first_token_us == 0) {
+                    slot.t_first_token_us = t_now;
+                }
             }
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;

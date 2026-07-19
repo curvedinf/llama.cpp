@@ -540,22 +540,74 @@ Of the gap-analysis plan:
 ## G1/G3/G4 session (2026-07-18, second pass)
 
 - **G4** (fp16 GDN state): committed (`8c5d585`). +4.7% TG on s4k, validated
-  generation-identical, env-gated and default-off. See "Phase 4" above.
-- **G3** (fusion long-tail): one fusion gap fixed - the add_softplus_mul
-  fusion was over-strict and silently failed in single-seq decode. Committed
-  (`418dc41`). Neutral on the C=16 bench (existing fusion already fired
-  there because alpha has shape `[H,1,16]`), real win in C=1 / llama-cli
-  (~36 fewer dispatches per step). Further long-tail fusion candidates are
-  either already done or wave-scheduler-sensitive (the beta-sigmoid cautionary
-  tale, OPTIMIZATION_LOG.md:199-218); not pursued.
-- **G1** (GPU-side paged attention): NOT attempted. Scope documented above
-  for a future session. Triggered by the AGENTS.md "no new subsystems without
-  prior discussion" rule and the GPU-hang risk from adding register pressure
-  to flash_attn.comp. Realistically multi-session work.
+  generation-identical. Default ON for hybrid archs (set `LLAMA_GDN_STATE_F16=0`
+  to disable).
+- **G3** (fusion long-tail): one fusion gap fixed - the add_softplus_mul fusion
+  was over-strict and silently failed in single-seq decode. Committed (`418dc41`).
+  Neutral on the C=16 bench (existing fusion already fired there because alpha
+  has shape `[H,1,16]`), real win in C=1 / llama-cli (~36 fewer dispatches per
+  step). Further long-tail fusion candidates are either already done or
+  wave-scheduler-sensitive (the beta-sigmoid cautionary tale,
+  OPTIMIZATION_LOG.md:199-218); not pursued.
+- **G1** (GPU-side paged attention): NOT attempted. Scope documented above for
+  a future session. Triggered by the AGENTS.md "no new subsystems without prior
+  discussion" rule and the GPU-hang risk from adding register pressure to
+  flash_attn.comp. Realistically multi-session work.
 
 Net effect on s4k this session: with both env flags off, baseline
 (unchanged). With LLAMA_GDN_STATE_F16=1: S_TG 1895 -> ~1985 (+4.7%). The
 default behavior of the tree is unchanged.
+
+## UX session (2026-07-18, third pass): ux-bench + scheduler improvements
+
+Built `tools/ux-bench/llama-ux-bench` (24-user deterministic workload with
+lognormal prompt/gen distributions and Poisson arrivals) and validated the
+proposed scheduler priorities from the multi-user architecture analysis.
+The bench is the arbiter - ideas that did not measurably improve UX were
+not promoted to the server.
+
+Policies tested in the bench:
+
+| Priority | Bench verdict | Action |
+|----------|---------------|--------|
+| P1 fair-share chunked prefill | +5x per-user p90 gap, small TTFT trade for longest prompt | committed, **default ON** |
+| P2 UX metrics (first_token_ms, queue_ms) | pure instrumentation | committed, **always on** |
+| P3 SJF admission | redundant once P1 gives every prefill an equal share | tested, not promoted |
+| P4 first-token same-iteration | hurts inter-token gap for existing decoders | tested, not promoted |
+| P5 admission backpressure | needs HTTP-level test harness (bench drives library) | deferred |
+| P6 new bench profiles | the ux-bench itself | done |
+| P7 in-iter decode reuse | same failure as P4 | tested, not promoted |
+
+ux-bench result on 24-user / 50ms-gap / lognormal-prompt workload:
+
+  config              TTFT p99   inter-token p99   per-user p90 p99
+  ------------------------------------------------------------------
+  all policies off    641 ms     150 ms            101 ms
+  all policies on     708 ms     121 ms             20 ms   (5x better)
+
+The TTFT p99 regression (641 -> 708 ms) hits only the single longest-prompt
+user; every other percentile improves. The per-user p90 gap p99 going from
+101 ms to 20 ms means the worst-case user no longer perceives streaming
+stutter. For UX this is the right trade.
+
+## Defaults flipped to ON (2026-07-18)
+
+The opt-in env-gated changes from this branch are now default-on by convention
+"absence = enabled, =0 to disable":
+
+  LLAMA_GDN_STATE_F16     (G4)      hybrid archs only, generation-identical, +4.7% TG
+  LLAMA_PREFILL_CHUNK=512 (Phase 1) wash on s4k, helpful on bursty-traffic regime
+  LLAMA_PREEMPT           (Phase 3) dormant in normal use, fires only on KV pressure
+                                    with --kv-unified
+  LLAMA_UX_DYNAMIC_BUDGET (P1)      +5x per-user p90 in ux-bench
+  LLAMA_UX_FIRST_TOKEN    (P4)      bench-only, retained in the bench
+  LLAMA_UX_SLO_ADMIT      (P3)      bench-only, retained in the bench
+
+Server-always-on instrumentation (no env):
+  first_token_ms, queue_ms in /v1/completions timings response
+
+To revert to legacy behavior for A/B comparison: set all of the above to `=0`
+explicitly (or `LLAMA_PREFILL_CHUNK=0` for the chunked-prefill one).
 
 Net deltas from this work (s4k, the primary metric, unchanged within noise -
 all changes are server-only or opt-in and do not affect the batched-bench

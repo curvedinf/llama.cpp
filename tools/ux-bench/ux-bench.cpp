@@ -74,8 +74,9 @@ static int env_int(const char * k, int def) {
 static double env_double(const char * k, double def) {
     const char * e = getenv(k); return e ? atof(e) : def;
 }
-static bool env_flag(const char * k) {
-    const char * e = getenv(k); return e && e[0] == '1';
+// default-on flag: enabled unless explicitly set to "0"
+static bool env_flag_on(const char * k) {
+    const char * e = getenv(k); return e == nullptr || e[0] != '0';
 }
 
 // --- user state ---
@@ -149,11 +150,11 @@ int main(int argc, char ** argv) {
     const int    GEN_MIN       = env_int   ("GEN_MIN",      16);
     const int    GEN_MAX       = env_int   ("GEN_MAX",      512);
 
-    // scheduler policy
-    const bool P1_DYNAMIC_BUDGET = env_flag("LLAMA_UX_DYNAMIC_BUDGET");
-    const bool P4_FIRST_TOKEN    = env_flag("LLAMA_UX_FIRST_TOKEN");
-    const bool P3_SLO_ADMIT      = env_flag("LLAMA_UX_SLO_ADMIT");
-    const int  MIN_CHUNK         = env_int ("LLAMA_UX_MIN_CHUNK", 64);
+    // scheduler policy (default ON; set to "0" to disable for A/B comparison)
+    const bool P1_DYNAMIC_BUDGET = env_flag_on("LLAMA_UX_DYNAMIC_BUDGET");
+    const bool P4_FIRST_TOKEN    = env_flag_on("LLAMA_UX_FIRST_TOKEN");
+    const bool P3_SLO_ADMIT      = env_flag_on("LLAMA_UX_SLO_ADMIT");
+    const int  MIN_CHUNK         = env_int ("LLAMA_UX_MIN_CHUNK", 256);
 
     const int n_batch  = params.n_batch;
     const int n_ubatch = params.n_ubatch;

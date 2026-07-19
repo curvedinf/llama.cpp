@@ -1689,11 +1689,12 @@ private:
     // Victim policy: among GENERATING slots, pick the one with the fewest decoded
     // tokens (least work to lose). Skip speculative, parent/child, and non-
     // completion slots - those have cross-slot invariants that preemption would
-    // break. Env-gated because the policy is intentionally simple.
+    // break. Default ON - only triggers under KV pressure in `--kv-unified` mode,
+    // so it is dormant in normal use. Set LLAMA_PREEMPT=0 to disable.
     bool try_preempt_active_slot() {
         static const bool enable = []{
             const char * e = getenv("LLAMA_PREEMPT");
-            return e && atoi(e) > 0;
+            return e == nullptr || atoi(e) > 0;
         }();
         if (!enable) {
             return false;
@@ -2947,11 +2948,11 @@ private:
         //   may add per iteration so that running decode tokens and other slots'
         //   prefill chunks coexist in the same logical batch. 0 = disabled (one
         //   slot may consume the whole batch), which is the legacy behaviour.
-        //   Tuned via env because it is workload-dependent; the server param
-        //   surface is kept minimal until the win is validated.
+        //   Default 512 (validated wash on s4k, helpful on bursty-traffic regime).
+        //   Set LLAMA_PREFILL_CHUNK=0 to disable.
         static const int prefill_chunk = []{
             const char * env = getenv("LLAMA_PREFILL_CHUNK");
-            int v = env ? atoi(env) : 0;
+            int v = env ? atoi(env) : 512;
             return v < 0 ? 0 : v;
         }();
 
@@ -3161,10 +3162,11 @@ private:
         // n_batch, give each prefilling slot an equal share of (n_batch - n_decoding)
         // floored at LLAMA_UX_MIN_CHUNK (default 256). Decoders always go first; this
         // only affects how the leftover budget is split among pending prefills.
-        // Default off (preserves legacy behavior); validated in tools/ux-bench.
+        // Default ON (validated +5x per-user p90 in tools/ux-bench at small TTFT cost).
+        // Set LLAMA_UX_DYNAMIC_BUDGET=0 to disable.
         static const bool ux_dynamic_budget = []{
             const char * e = getenv("LLAMA_UX_DYNAMIC_BUDGET");
-            return e && e[0] == '1';
+            return e == nullptr || e[0] != '0';
         }();
         static const int ux_min_chunk = []{
             const char * e = getenv("LLAMA_UX_MIN_CHUNK");

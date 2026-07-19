@@ -453,6 +453,66 @@ plausibly help other regimes" works in both directions - this change doesn't
 help the current bench but does help a plausible other regime (C=1
 single-stream, the llama-cli default). Kept.
 
+## G1: GPU-side paged attention - scope for a future session
+
+Status: NOT attempted this session. Scope written below so the next session
+can pick it up.
+
+Why deferred: G1 is a new subsystem (per-AGENTS.md, "no new subsystems without
+prior discussion"). It also adds register/LDS pressure to the hottest shader
+on the hot path, which per the AGENTS.md GPU safety rules "can HANG the GPU in
+a way the VRAM watchdog cannot catch." The change touches three FA shader
+variants (flash_attn.comp 758 lines, _cm1 645, _cm2 481), the graph input
+builder, the kv_cache, and the ggml FA op signature - realistically
+multi-session work, with mandatory `llama-cli -n 8` validation between every
+shader-level commit.
+
+The goal: eliminate D2D copies and the K-shift graph by giving the FA kernel
+a per-sequence block table so sequences no longer need contiguous KV cells.
+
+Current state (what G1 would replace):
+- `llama_kv_cells` (src/llama-kv-cells.h:49): block-granular bookkeeping with
+  refcounts. vLLM-style *on the host side*. The kernel still sees flat K/V.
+- `llama_kv_cache::copy_cells` (src/llama-kv-cache.cpp:1325): physical D2D
+  copy of K/V cells for prefix-cache hits and cross-stream sharing. Eliminated
+  by G1.
+- `llama_kv_cache::update` do_shift path (src/llama-kv-cache.cpp:932): full
+  RoPE-shift graph after context-shift / defrag. Eliminated by G1.
+
+Scope of the change:
+1. **New FA shader variant family** - one per existing variant (f32, f16, bf16
+   x cm1/cm2/non-coopmat). Adds:
+   - A block_table binding (I32 [n_blocks, n_seqs]).
+   - K/V load loops that indirect `kv_idx -> block_id * block_size + offset`
+     via the block_table instead of flat kv_idx.
+   - The DSV4/iswa variants may also need similar treatment.
+2. **kv_cache**: populate block_table per-sequence from cells metadata at
+   apply_ubatch time. New graph input tensor alongside k_idxs/v_idxs.
+3. **ggml FA op signature**: take an optional block_table src; existing
+   callers pass nullptr and get the legacy flat-index path.
+4. **Dispatch**: pick the paged variant when block_table != nullptr.
+5. **Scheduler**: stop requiring contiguous positions per seq; prefix_copy
+   becomes pure bookkeeping (no D2D); K-shift becomes dead code.
+
+Validation plan (mandatory per AGENTS.md):
+- `llama-cli -n 8` under `./run-guarded.sh` after EACH shader-level commit.
+- `test-prefix-cache` and `test-prefix-cache-e2e` for the prefix-copy path.
+- Generation-identity on the standard prompt set (the existing FA path is
+  the reference).
+- Then `./bench-c16.sh build g1-paged s4k`.
+
+Estimated impact per the bandwidth analysis: prefix-cache hits currently cost
+a D2D copy of N_blocks * 32 tokens * layer_count; at C=16 with 4k prompts
+that is ~28 MB / step at the cut-over, more at longer prefixes. The K-shift
+graph is a one-shot cost on context shift / defrag, eliminated entirely. The
+FA kernel itself becomes ~10-15% more expensive from the indirect load. Net
+expected: positive on workloads with frequent prefix reuse or KV pressure,
+neutral-to-slightly-negative on the steady-state s4k bench. Worth doing for
+the longer-context / larger-C regimes even if s4k is flat.
+
+Do NOT attempt in a session that has already done other shader work - the
+VRAM watchdog cannot catch a shader hang, and combining risks compounds.
+
 ## vLLM gap-closure summary (2026-07-18)
 
 Of the gap-analysis plan:
@@ -468,10 +528,30 @@ Of the gap-analysis plan:
   (`LLAMA_PREEMPT=1`), requires `--kv-unified`. CPU swap dropped per AGENTS.md.
   Implemented but not live-verified - the live-server test crashed the host
   (bypassed `run-guarded.sh`). s4k regression check is within noise.
-- Phase 4 (fp16 recurrent state): **committed**, env-gated
+- Phase 4 (fp16 recurrent state): **committed** (`8c5d585`), env-gated
   (`LLAMA_GDN_STATE_F16=1`, hybrid archs only). Validated generation-identical
   on the standard prompt; **+4.7% TG** on s4k (above the +3% estimate).
   FP8 KV, paged attention, MoE, TP - all dropped per AGENTS.md roadmap scope.
+
+## G1/G3/G4 session (2026-07-18, second pass)
+
+- **G4** (fp16 GDN state): committed (`8c5d585`). +4.7% TG on s4k, validated
+  generation-identical, env-gated and default-off. See "Phase 4" above.
+- **G3** (fusion long-tail): one fusion gap fixed - the add_softplus_mul
+  fusion was over-strict and silently failed in single-seq decode. Committed
+  (`418dc41`). Neutral on the C=16 bench (existing fusion already fired
+  there because alpha has shape `[H,1,16]`), real win in C=1 / llama-cli
+  (~36 fewer dispatches per step). Further long-tail fusion candidates are
+  either already done or wave-scheduler-sensitive (the beta-sigmoid cautionary
+  tale, OPTIMIZATION_LOG.md:199-218); not pursued.
+- **G1** (GPU-side paged attention): NOT attempted. Scope documented above
+  for a future session. Triggered by the AGENTS.md "no new subsystems without
+  prior discussion" rule and the GPU-hang risk from adding register pressure
+  to flash_attn.comp. Realistically multi-session work.
+
+Net effect on s4k this session: with both env flags off, baseline
+(unchanged). With LLAMA_GDN_STATE_F16=1: S_TG 1895 -> ~1985 (+4.7%). The
+default behavior of the tree is unchanged.
 
 Net deltas from this work (s4k, the primary metric, unchanged within noise -
 all changes are server-only or opt-in and do not affect the batched-bench

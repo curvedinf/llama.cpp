@@ -455,17 +455,21 @@ single-stream, the llama-cli default). Kept.
 
 ## G1: GPU-side paged attention - scope for a future session
 
-Status: NOT attempted this session. Scope written below so the next session
-can pick it up.
+Status: NOT attempted. Read flash_attn_cm2.comp; scope revised downward.
 
 Why deferred: G1 is a new subsystem (per-AGENTS.md, "no new subsystems without
-prior discussion"). It also adds register/LDS pressure to the hottest shader
-on the hot path, which per the AGENTS.md GPU safety rules "can HANG the GPU in
-a way the VRAM watchdog cannot catch." The change touches three FA shader
-variants (flash_attn.comp 758 lines, _cm1 645, _cm2 481), the graph input
-builder, the kv_cache, and the ggml FA op signature - realistically
-multi-session work, with mandatory `llama-cli -n 8` validation between every
-shader-level commit.
+prior discussion"). Thecm2 FA path (used on RDNA3 / the target hardware) uses
+`coopMatLoadTensorNV` with a single hardware-strided tensor layout per K/V load.
+Block-table indirection is **incompatible** with that load instruction - a
+paged variant cannot use the tensor-load path at all and must fall back to
+per-element gather via `buffer_reference` (the same path the dequant code uses
+for Q4/Q8 KV). For the bench's F16/Q8_0 KV, that means paged FA would be
+measurably slower than the current path, in addition to eliminating the
+gather copies. Net effect on s4k is likely negative.
+
+This revises the original scope estimate ("adds ~10-15% to the FA kernel").
+The realistic estimate is 1.5-2x FA kernel cost when paged, because the
+hardware tensor-load acceleration is lost.
 
 The goal: eliminate D2D copies and the K-shift graph by giving the FA kernel
 a per-sequence block table so sequences no longer need contiguous KV cells.
@@ -479,18 +483,21 @@ Current state (what G1 would replace):
 - `llama_kv_cache::update` do_shift path (src/llama-kv-cache.cpp:932): full
   RoPE-shift graph after context-shift / defrag. Eliminated by G1.
 
-Scope of the change:
+Scope of the change (realistic):
 1. **New FA shader variant family** - one per existing variant (f32, f16, bf16
-   x cm1/cm2/non-coopmat). Adds:
+   x cm1/cm2/non-coopmat). Each adds:
    - A block_table binding (I32 [n_blocks, n_seqs]).
-   - K/V load loops that indirect `kv_idx -> block_id * block_size + offset`
-     via the block_table instead of flat kv_idx.
-   - The DSV4/iswa variants may also need similar treatment.
+   - A complete per-element K/V load path via buffer_reference, looking up
+     `physical_block = block_table[seq][logical_pos / block_size]` then
+     `physical_cell = physical_block * block_size + logical_pos % block_size`.
+     The cm2 path can no longer use coopMatLoadTensorNV; it must use the
+     faDecode{K,V} per-element path that quantized types already use.
 2. **kv_cache**: populate block_table per-sequence from cells metadata at
    apply_ubatch time. New graph input tensor alongside k_idxs/v_idxs.
 3. **ggml FA op signature**: take an optional block_table src; existing
-   callers pass nullptr and get the legacy flat-index path.
-4. **Dispatch**: pick the paged variant when block_table != nullptr.
+   callers pass nullptr and get the legacy strided path.
+4. **Dispatch**: pick the paged variant when block_table != nullptr. Default
+   off until benchmarked.
 5. **Scheduler**: stop requiring contiguous positions per seq; prefix_copy
    becomes pure bookkeeping (no D2D); K-shift becomes dead code.
 
@@ -501,14 +508,11 @@ Validation plan (mandatory per AGENTS.md):
   the reference).
 - Then `./bench-c16.sh build g1-paged s4k`.
 
-Estimated impact per the bandwidth analysis: prefix-cache hits currently cost
-a D2D copy of N_blocks * 32 tokens * layer_count; at C=16 with 4k prompts
-that is ~28 MB / step at the cut-over, more at longer prefixes. The K-shift
-graph is a one-shot cost on context shift / defrag, eliminated entirely. The
-FA kernel itself becomes ~10-15% more expensive from the indirect load. Net
-expected: positive on workloads with frequent prefix reuse or KV pressure,
-neutral-to-slightly-negative on the steady-state s4k bench. Worth doing for
-the longer-context / larger-C regimes even if s4k is flat.
+Expected impact (revised): negative on s4k steady-state (the bench's KV is
+F16/Q8_0; paged FA loses the tensor-load path). Net positive only on
+workloads with very high prefix-reuse rates or heavy KV fragmentation -
+neither of which the current bench exercises. The right bench for G1 is
+s256-mixed or s256-over (mixed prefill+decode or oversubscribed), not s4k.
 
 Do NOT attempt in a session that has already done other shader work - the
 VRAM watchdog cannot catch a shader hang, and combining risks compounds.

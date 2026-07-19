@@ -609,6 +609,53 @@ Server-always-on instrumentation (no env):
 To revert to legacy behavior for A/B comparison: set all of the above to `=0`
 explicitly (or `LLAMA_PREFILL_CHUNK=0` for the chunked-prefill one).
 
+## Throughput optimization cycle (2026-07-19)
+
+Indefinite-throughput pass against ux-bench (24 users / 50ms gap / lognormal
+prompts) with the constraint that only generalizable (non-workload-specialized)
+changes get committed. Each cycle: measure, attempt a change, re-measure,
+commit if better, revert if not.
+
+Cumulative committed improvements (5 commits):
+
+| commit | change                                   | ux-bench decode  | ux-bench total  | s4k S_TG     |
+|--------|------------------------------------------|------------------|-----------------|--------------|
+| (start)| (baseline at session start)              | 522 tok/s        | 7130 tok/s      | ~1900 tok/s  |
+| 1213ec7| max_nodes_per_submit 100 -> 1000         | 530 (+1.5%)      | 7245 (+1.6%)    | ~1982        |
+| 3ad8003| GGML_VK_ALLOW_GRAPHICS_QUEUE default-on  | 579 (+9.2%)      | 7900 (+10.8%)   | ~2088        |
+| 91c7c5d| flops_per_submit divisor 40 -> 20        | 578 (flat)       | 7900 (flat)     | ~2075        |
+| 7ff67ec| coopmat2 FA block_rows 32 -> 16 small-rows| 580 (+0.3%)      | 7926 (+0.3%)    | ~2070        |
+| 870b6e2| K-quant s_warptile BK 64 -> 128          | 582 (+0.3%)      | 7950 (+0.3%)    | ~2115 (+2%)  |
+| **net**|                                          | **582 (+11.5%)** | **7950 (+11.5%)**| **2115 (+11%)** |
+
+Each win is a host-side or shader-tile tweak backed by 3-10 clean bench runs.
+No workload-specialized tuning; all changes apply to any model / batch shape.
+
+Failed attempts (reverted, not committed):
+- split-K cap 8 -> 24: -1.3% (reduction overhead)
+- graph cache 8 -> 32: -9% (compile/lookup overhead)
+- graph-optimize NUM_TO_CHECK 20 -> 40/80: within noise
+- m_warptile_mmq_k BK=64 / 128: slower or neutral
+- l_warptile_mmq_k BK=128: **ErrorDeviceLost** (shared memory limit)
+- l_warptile_mmq_k BK=64: -3% (register pressure)
+- FA mask_opt threshold 32 -> 16: -5%
+- GGML_VK_ASYNC_USE_TRANSFER_QUEUE: -6%
+- GGML_VK_DISABLE_FUSION: -10%
+- GGML_VK_DISABLE_GRAPH_OPTIMIZE: -1.5%
+- GGML_VK_FORCE_MMVQ / DISABLE_MMVQ: -6%
+- GGML_VK_DISABLE_INTEGER_DOT_PRODUCT: -3%
+- GGML_VK_ENABLE_MEMORY_PRIORITY: -3%
+- GGML_VK_SUBALLOCATION_BLOCK_SIZE variations: -1% to -5%
+
+Lesson re-learned on l_warptile BK=128: AGENTS.md warns that shader changes
+that increase per-workgroup resources can crash the GPU in ways the VRAM
+watchdog cannot catch. The crash was a vk::DeviceLostError, not an OOM.
+Validate shader tile changes with `llama-cli -n 8` under `run-guarded.sh`
+*before* running the bench. The crash here happened during bench warmup, not
+at small scale, because the FA pre-allocation path triggered the new shader.
+
+
+
 Net deltas from this work (s4k, the primary metric, unchanged within noise -
 all changes are server-only or opt-in and do not affect the batched-bench
 hot path):

@@ -196,6 +196,23 @@ public:
 
     bool get_has_shift() const;
 
+    // true when GPU paged attention is active (env: LLAMA_KV_PAGED):
+    // seq-aligned cell allocation + block-table graph input
+    bool get_paged() const;
+
+    // force paged mode off (used by llama_kv_cache_iswa, whose graph inputs have no
+    // block-table wiring)
+    void set_paged(bool enabled);
+
+    // true when paged mode is on and the ubatch layout supports per-sequence block table
+    // columns (single-seq tokens, equal number of tokens per sequence, seq-major order).
+    // ubatches that fail this check transparently use the legacy flat attention path
+    bool paged_ubatch(const llama_ubatch & ubatch) const;
+
+    // logical KV length covered by the block table / mask in paged mode (padded max
+    // sequence length of the ubatch) - the physical pool size is always get_size()
+    uint32_t get_n_kv_paged(const llama_ubatch & ubatch) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -211,6 +228,12 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
+    // paged mode: views of the full physical K/V pool (single slice) - multi-sequence
+    // ubatches are handled with one FA node per sequence (see build_attn_mha), each with
+    // its own block table column, since the kernel gathers rows via the table anyway
+    ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const;
+    ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -244,15 +267,23 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // paged attention block table, I32 [kv_size/32, n_seqs_unq] - one column per sequence
+    // of the ubatch. return nullptr when paged mode is off or the ubatch layout does not
+    // support it (see paged_ubatch)
+    ggml_tensor * build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
+    void set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_paged(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -299,6 +330,9 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // env: LLAMA_KV_PAGED - GPU paged attention (vLLM-style block table), HIP/CUDA only
+    bool paged = false;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -436,6 +470,9 @@ public:
 
     uint32_t get_n_kv() const;
 
+    // true when the current ubatch uses GPU paged attention (block table input)
+    bool get_paged() const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -458,11 +495,16 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // paged attention block table - nullptr when paged mode is disabled
+    ggml_tensor * build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -503,4 +545,8 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // true when the current ubatch is processed with GPU paged attention
+    // (set in apply() via llama_kv_cache::paged_ubatch)
+    bool paged = false;
 };

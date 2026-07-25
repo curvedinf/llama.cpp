@@ -499,6 +499,391 @@ static void test_randomized() {
     }
 }
 
+// seq-aligned (paged) allocation: a token with logical position p lands at cell
+// b*block_size + p%block_size of a block covering the same aligned range and owned by
+// the token's sequence
+static void test_seq_aligned_alloc() {
+    fprintf(stderr, "%s\n", __func__);
+
+    constexpr uint32_t bs = llama_kv_cells::block_size;
+
+    llama_kv_cells cells;
+    cells.resize(9*bs);
+
+    auto fill_aligned = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+        std::vector<llama_pos>    poss(n);
+        std::vector<llama_seq_id> seqs(n, seq_id);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            poss[i] = p0 + (llama_pos) i;
+        }
+
+        std::vector<uint32_t> idxs;
+
+        CHECK(cells.alloc_find_seq_aligned(poss.data(), seqs.data(), n, idxs) == n);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            CHECK(idxs[i]%bs == (uint32_t) poss[i]%bs);
+
+            cells.pos_set(idxs[i], poss[i]);
+            cells.seq_add(idxs[i], seq_id);
+        }
+
+        return idxs;
+    };
+
+    // seq 0 takes positions [0, 16): block 0, cells [0, 16)
+    const auto idxs0 = fill_aligned(0, 0, 16);
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(idxs0[i] == i);
+    }
+
+    // seq 1 takes positions [16, 32): the tail of block 0 is free, but the block belongs
+    // to seq 0 - seq 1 gets its own block (at the matching offsets)
+    const auto idxs1 = fill_aligned(1, 16, 16);
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(idxs1[i] == bs + 16 + i);
+    }
+
+    // seq 0 continues with positions [16, 32): extends its own block 0
+    const auto idxs2 = fill_aligned(0, 16, 16);
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(idxs2[i] == 16 + i);
+    }
+
+    // seq 1 continues with positions [32, 48): a new aligned range - a new block, never
+    // the tail of a block covering a different range
+    const auto idxs3 = fill_aligned(1, 32, 16);
+    for (uint32_t i = 0; i < 16; ++i) {
+        CHECK(idxs3[i] == 2*bs + i);
+    }
+
+    // share seq 1's range-1 block with seq 2 (mimics a prefix re-attach), then seq 2
+    // continues the same range - it extends the shared block since every cell of the
+    // block has seq 2 as a member
+    for (uint32_t j = 2*bs; j < 3*bs; ++j) {
+        cells.seq_add(j, 2);
+    }
+
+    const auto idxs4 = fill_aligned(2, 48, 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        CHECK(idxs4[i] == 2*bs + 16 + i);
+    }
+
+    // ... but seq 0 cannot extend that block - it is not a member of its cells
+    const auto idxs5 = fill_aligned(0, 32, 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        CHECK(idxs5[i] == 3*bs + i);
+    }
+
+    // tokens of different sequences in one call never share a fresh block
+    {
+        const llama_pos    poss2[2] = { 64, 65 };
+        const llama_seq_id seqs2[2] = { 3, 4 };
+
+        std::vector<uint32_t> idxs6;
+
+        CHECK(cells.alloc_find_seq_aligned(poss2, seqs2, 2, idxs6) == 2);
+        CHECK(idxs6[0]/bs != idxs6[1]/bs);
+
+        for (uint32_t i = 0; i < 2; ++i) {
+            cells.pos_set(idxs6[i], poss2[i]);
+            cells.seq_add(idxs6[i], seqs2[i]);
+        }
+    }
+
+    // a shared multi-sequence run (one cell, several members) can be continued by any
+    // member sequence
+    {
+        const llama_pos    poss3[2] = { 96, 97 };
+        const llama_seq_id seqs3[2] = { 5, 5 };
+
+        std::vector<uint32_t> idxs7;
+
+        CHECK(cells.alloc_find_seq_aligned(poss3, seqs3, 2, idxs7) == 2);
+
+        for (uint32_t i = 0; i < 2; ++i) {
+            cells.pos_set(idxs7[i], poss3[i]);
+            cells.seq_add(idxs7[i], 5);
+            cells.seq_add(idxs7[i], 6);
+        }
+
+        const auto idxs8 = fill_aligned(6, 98, 4);
+        for (uint32_t i = 0; i < 4; ++i) {
+            CHECK(idxs8[i] == idxs7[0] + 2 + i);
+        }
+    }
+
+    // exhaust the remaining free blocks, then a new range must fail even though
+    // individual cells are still free
+    fill_aligned(7, 128, 32);
+    fill_aligned(7, 160, 32);
+
+    const llama_pos    poss_full = 192;
+    const llama_seq_id seqs_full = 7;
+
+    std::vector<uint32_t> idxs_full;
+
+    CHECK(cells.alloc_find_seq_aligned(&poss_full, &seqs_full, 1, idxs_full) == 0);
+}
+
+// per-sequence paged-attention block table built from the cell metadata
+static void test_seq_block_table() {
+    fprintf(stderr, "%s\n", __func__);
+
+    constexpr uint32_t bs = llama_kv_cells::block_size;
+
+    llama_kv_cells cells;
+    cells.resize(4*bs);
+
+    auto fill_aligned = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+        std::vector<llama_pos>    poss(n);
+        std::vector<llama_seq_id> seqs(n, seq_id);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            poss[i] = p0 + (llama_pos) i;
+        }
+
+        std::vector<uint32_t> idxs;
+
+        CHECK(cells.alloc_find_seq_aligned(poss.data(), seqs.data(), n, idxs) == n);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            cells.pos_set(idxs[i], poss[i]);
+            cells.seq_add(idxs[i], seq_id);
+        }
+    };
+
+    fill_aligned(0, 0, 32);  // block 0
+    fill_aligned(0, 32, 40); // block 1 + block 2, offsets [0, 8)
+    fill_aligned(1, 0, 32);  // block 3 (blocks 0/1 are owned by seq 0)
+
+    for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+        std::vector<int32_t> table(4, -2);
+
+        CHECK(cells.seq_block_table(seq_id, table));
+
+        const llama_pos p_min = cells.seq_pos_min(seq_id);
+        const llama_pos p_max = cells.seq_pos_max(seq_id);
+
+        CHECK(p_min >= 0);
+
+        // every position of the sequence resolves through the table
+        for (llama_pos p = p_min; p <= p_max; ++p) {
+            const int32_t b = table[p/bs];
+
+            CHECK(b >= 0);
+
+            const uint32_t cell = (uint32_t) b*bs + (uint32_t) p%bs;
+
+            CHECK(!cells.is_empty(cell));
+            CHECK(cells.pos_get(cell) == p);
+            CHECK(cells.seq_has(cell, seq_id));
+        }
+
+        // logical blocks outside the sequence range are -1
+        for (uint32_t lb = 0; lb < table.size(); ++lb) {
+            const bool has = (llama_pos) (lb*bs) <= p_max && (llama_pos) (lb*bs + bs - 1) >= p_min;
+
+            if (!has) {
+                CHECK(table[lb] == -1);
+            }
+        }
+    }
+
+    // an absent sequence has an empty table
+    {
+        std::vector<int32_t> table(4, -2);
+
+        CHECK(cells.seq_block_table(2, table));
+
+        for (const auto b : table) {
+            CHECK(b == -1);
+        }
+    }
+
+    // sharing cells of another block covering the same aligned range makes the table of
+    // the sequence ambiguous - must be detected
+    for (uint32_t j = 3*bs; j < 4*bs; ++j) {
+        cells.seq_add(j, 0);
+    }
+
+    {
+        std::vector<int32_t> table(4, -2);
+
+        CHECK(!cells.seq_block_table(0, table));
+    }
+}
+
+// re-application of already-cached positions (MTP draft/verify, rollback re-writes):
+// the aligned cell occupied by the same sequence is reused instead of spilling to a new
+// block - this is what keeps one block per (sequence, aligned range)
+static void test_seq_aligned_reuse() {
+    fprintf(stderr, "%s\n", __func__);
+
+    constexpr uint32_t bs = llama_kv_cells::block_size;
+
+    llama_kv_cells cells;
+    cells.resize(4*bs);
+
+    auto fill_aligned = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+        std::vector<llama_pos>    poss(n);
+        std::vector<llama_seq_id> seqs(n, seq_id);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            poss[i] = p0 + (llama_pos) i;
+        }
+
+        std::vector<uint32_t> idxs;
+
+        CHECK(cells.alloc_find_seq_aligned(poss.data(), seqs.data(), n, idxs) == n);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!cells.is_empty(idxs[i])) {
+                cells.rm(idxs[i]);
+            }
+
+            cells.pos_set(idxs[i], poss[i]);
+            cells.seq_add(idxs[i], seq_id);
+        }
+
+        return idxs;
+    };
+
+    const auto idxs0 = fill_aligned(0, 0, 40); // blocks 0 and 1 (offsets [0, 8))
+
+    // re-applying positions [32, 40) of seq 0 reuses exactly the same cells
+    const auto idxs1 = fill_aligned(0, 32, 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        CHECK(idxs1[i] == idxs0[32 + i]);
+    }
+
+    // a different sequence does not reuse those cells - it gets its own block
+    const auto idxs2 = fill_aligned(1, 32, 8);
+    for (uint32_t i = 0; i < 8; ++i) {
+        CHECK(idxs2[i] == 2*bs + i);
+    }
+
+    // the block table of seq 0 is still unambiguous
+    {
+        std::vector<int32_t> table(4, -2);
+
+        CHECK(cells.seq_block_table(0, table));
+        CHECK(table[0] == 0 && table[1] == 1 && table[2] == -1);
+    }
+}
+
+// paged prefix sharing (Phase 2): a prefix block is shared read-only across sequences
+// via pure bookkeeping (seq_add, the cells-level equivalent of the loc_same re-attach
+// in llama_kv_cache::prefix_copy_impl) - no cells are allocated or copied, and both
+// sequences' block tables map the shared ranges to the same physical blocks
+static void test_paged_prefix_share() {
+    fprintf(stderr, "%s\n", __func__);
+
+    constexpr uint32_t bs = llama_kv_cells::block_size;
+
+    llama_kv_cells cells;
+    cells.resize(8*bs);
+
+    auto fill_aligned = [&](llama_seq_id seq_id, llama_pos p0, uint32_t n) {
+        std::vector<llama_pos>    poss(n);
+        std::vector<llama_seq_id> seqs(n, seq_id);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            poss[i] = p0 + (llama_pos) i;
+        }
+
+        std::vector<uint32_t> idxs;
+
+        CHECK(cells.alloc_find_seq_aligned(poss.data(), seqs.data(), n, idxs) == n);
+
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!cells.is_empty(idxs[i])) {
+                cells.rm(idxs[i]);
+            }
+
+            cells.pos_set(idxs[i], poss[i]);
+            cells.seq_add(idxs[i], seq_id);
+        }
+
+        return idxs;
+    };
+
+    // seq 0 owns positions [0, 96): blocks 0, 1, 2
+    fill_aligned(0, 0, 96);
+
+    // blocks 0 and 1 are registered in the prefix cache (pinned)
+    cells.block_pin(0);
+    cells.block_pin(1);
+
+    const uint32_t used_before = cells.get_used();
+
+    // re-attach the shared prefix to seq 1 (pure bookkeeping - no allocation)
+    for (uint32_t j = 0; j < 2*bs; ++j) {
+        cells.seq_add(j, 1);
+    }
+
+    // no cells were allocated or copied by the re-attach
+    CHECK(cells.get_used() == used_before);
+
+    // seq 1 continues past the shared prefix with its own tail
+    const auto idxs1 = fill_aligned(1, 64, 32);
+    for (uint32_t i = 0; i < 32; ++i) {
+        CHECK(idxs1[i] == 3*bs + i); // a new block - block 2 is owned by seq 0
+    }
+
+    // both sequences' block tables map the shared ranges to the same physical blocks
+    {
+        std::vector<int32_t> t0(8, -2), t1(8, -2);
+
+        CHECK(cells.seq_block_table(0, t0));
+        CHECK(cells.seq_block_table(1, t1));
+
+        CHECK(t0[0] == 0 && t0[1] == 1 && t0[2] == 2);
+        CHECK(t1[0] == 0 && t1[1] == 1 && t1[2] == 3);
+        CHECK(t0[3] == -1 && t1[3] == -1);
+
+        // every position of both sequences resolves through its table
+        for (llama_seq_id s = 0; s < 2; ++s) {
+            const auto & t = s == 0 ? t0 : t1;
+
+            for (llama_pos p = 0; p < 96; ++p) {
+                const uint32_t c = (uint32_t) t[p/bs]*bs + (uint32_t) p%bs;
+
+                CHECK(!cells.is_empty(c));
+                CHECK(cells.pos_get(c) == p);
+                CHECK(cells.seq_has(c, s));
+            }
+        }
+    }
+
+    // removing seq 0 keeps the shared cells (seq 1 still references them) and its table
+    CHECK(cells.seq_rm_range(0, 0, std::numeric_limits<llama_pos>::max()) == 0);
+
+    {
+        std::vector<int32_t> t1(8, -2);
+
+        CHECK(cells.seq_block_table(1, t1));
+        CHECK(t1[0] == 0 && t1[1] == 1 && t1[2] == 3);
+
+        for (llama_pos p = 0; p < 96; ++p) {
+            const uint32_t c = (uint32_t) t1[p/bs]*bs + (uint32_t) p%bs;
+
+            CHECK(!cells.is_empty(c));
+            CHECK(cells.seq_has(c, 1));
+            CHECK(!cells.seq_has(c, 0));
+        }
+    }
+
+    // removing seq 1 leaves the pinned blocks retained as cache-owned, the rest freed
+    CHECK(cells.seq_rm_range(1, 0, std::numeric_limits<llama_pos>::max()) == 0);
+    CHECK(cells.get_used() == 2*bs);
+    CHECK(cells.block_all_seqless(0));
+    CHECK(cells.block_all_seqless(1));
+    CHECK(cells.block_is_free(2));
+    CHECK(cells.block_is_free(3));
+}
+
 int main() {
     test_alloc_rollback();
     test_exhaustion();
@@ -508,6 +893,10 @@ int main() {
     test_duplicate_pos();
     test_cp_set();
     test_randomized();
+    test_seq_aligned_alloc();
+    test_seq_block_table();
+    test_seq_aligned_reuse();
+    test_paged_prefix_share();
 
     if (n_fail == 0) {
         fprintf(stderr, "all tests passed\n");

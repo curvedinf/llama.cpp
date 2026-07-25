@@ -1830,13 +1830,21 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+    // When src1's batch dims (ne12, ne13) are contiguous and src0 is shared across them,
+    // they can be folded into columns (see ggml_cuda_mul_mat_vec_f/ggml_cuda_mul_mat_f).
+    // Base the mmvf/mmf routing decision on the folded column count (capped at 16).
+    const bool fold_ok = ne02 == 1 && ne03 == 1 && ne12*ne13 > 1 &&
+        nb12 == nb11*ne11 && nb13 == nb12*ne12 && nb2 == nb1*ne1 && nb3 == nb2*ne2;
+    const int64_t ne11_fold = fold_ok ? ne11*ne12*ne13 : ne11;
+    const int64_t ne11_eff  = ne11_fold <= 16 ? ne11_fold : ne11;
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11_eff)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11_eff, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1846,6 +1854,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ne11_fold != ne11 && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)) {
+        // Treat the folded batch dims as columns of a single 2D GEMM so that hipBLAS
+        // reads src0 only once instead of once per (channel, sample) batch.
+        ggml_tensor src1_2d = *src1;
+        ggml_tensor dst_2d  = *dst;
+        src1_2d.ne[1] = ne11_fold; src1_2d.ne[2] = 1; src1_2d.ne[3] = 1;
+        src1_2d.nb[2] = src1_2d.nb[1]*src1_2d.ne[1]; src1_2d.nb[3] = src1_2d.nb[2];
+        dst_2d.ne[1]  = ne11_fold; dst_2d.ne[2]  = 1; dst_2d.ne[3]  = 1;
+        dst_2d.nb[2]  = dst_2d.nb[1]*dst_2d.ne[1];   dst_2d.nb[3]  = dst_2d.nb[2];
+        ggml_cuda_mul_mat_cublas(ctx, src0, &src1_2d, &dst_2d);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -2319,6 +2339,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_IDX:
+            ggml_cuda_op_gated_delta_net_idx(ctx, dst);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -5004,7 +5027,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRANSPOSE:
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:
-        case GGML_OP_SCALE:
         case GGML_OP_SQR:
         case GGML_OP_SQRT:
         case GGML_OP_SIN:
@@ -5012,6 +5034,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
             return true;
+        case GGML_OP_SCALE:
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->type == op->src[0]->type;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
@@ -5031,6 +5056,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         }
         case GGML_OP_SSM_CONV: {
+            if (op->src[2] != nullptr) {
+                // indexed in-place form (ggml_ssm_conv_idx)
+                // one thread per channel, assumes d_inner % threads == 0
+                const int64_t d_conv = op->src[1]->ne[0];
+                return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                       op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_I32 &&
+                       op->src[0]->nb[0] == sizeof(float) && op->src[0]->nb[1] == op->src[0]->ne[0]*sizeof(float) &&
+                       op->src[1]->nb[0] == sizeof(float) && op->src[2]->nb[0] == sizeof(float) &&
+                       op->src[0]->ne[1] % 128 == 0 &&
+                       (d_conv == 3 || d_conv == 4 || d_conv == 5 || d_conv == 9 || d_conv == 15);
+            }
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
@@ -5092,6 +5128,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_GATED_DELTA_NET_IDX:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
             return false;

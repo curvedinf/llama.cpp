@@ -157,6 +157,98 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
+// indexed in-place variant (ggml_ssm_conv_idx): one thread per channel, one block column per sequence.
+// the state row is read from / written to the store in place, s_idxs is read from device memory
+// at run time so the kernel is safe to capture in a CUDA graph.
+template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+                                        const float * __restrict__ bias, float * __restrict__ src2,
+                                        const int32_t * __restrict__ sidx, const int src0_nb1, const int src0_nb2,
+                                        const int src1_nb1, const int src2_nb1, float * __restrict__ dst,
+                                        const int dst_nb1, const int dst_nb2, const int64_t n_t) {
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int bidy = blockIdx.y;
+
+    const int r = bidy * split_d_inner + tid;
+
+    const int32_t row = sidx[bidx];
+    float * s_row = (float *) ((char *) src2 + (int64_t) row * src2_nb1);
+
+    const float * x_row = (const float *) ((const char *) src0 + (int64_t) bidx * src0_nb2 + r * src0_nb1); // [n_t]
+    const float * w_row = (const float *) ((const char *) src1 + r * src1_nb1);                             // [d_conv]
+
+    float * st = s_row + r * (d_conv - 1); // state columns of channel r
+
+    float w[d_conv];
+    float x[d_conv];
+
+#pragma unroll
+    for (size_t j = 0; j < d_conv; j++) {
+        w[j] = w_row[j];
+    }
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        x[j] = st[j];
+    }
+    x[d_conv - 1] = x_row[0];
+
+    const float b = bias != nullptr ? bias[r] : 0.0f;
+
+    for (int64_t i = 0; i < n_t; i++) {
+        if (i > 0) {
+#pragma unroll
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                x[j] = x[j + 1];
+            }
+            x[d_conv - 1] = x_row[i];
+        }
+
+        float sumf = 0.0f;
+#pragma unroll
+        for (size_t j = 0; j < d_conv; j++) {
+            sumf += x[j] * w[j];
+        }
+        sumf += b;
+        *(float *) ((char *) dst + (int64_t) bidx * dst_nb2 + i * dst_nb1 + r * sizeof(float)) =
+            apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+    }
+
+    // write the new state (window columns [n_t, n_t + d_conv - 2] of [old state | new tokens]) back to the
+    // store row; reads are always at a higher column index than the writes done so far, so no staging is needed
+#pragma unroll
+    for (size_t c = 0; c < d_conv - 1; c++) {
+        const int64_t wcol = n_t + (int64_t) c;
+        st[c] = wcol < (int64_t) (d_conv - 1) ? st[wcol] : x_row[wcol - (d_conv - 1)];
+    }
+}
+
+template <bool apply_silu>
+static void ssm_conv_idx_f32_cuda(const float * src0, const float * src1, const float * bias, float * src2,
+                                  const int32_t * sidx, const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                  const int src2_nb1, float * dst, const int dst_nb1, const int dst_nb2,
+                                  const int64_t nc, const int64_t nr, const int64_t n_t, const int64_t n_s,
+                                  cudaStream_t stream) {
+    const int threads = 128;
+    GGML_ASSERT(nr % threads == 0);
+
+    auto launch_kernel = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
+        ssm_conv_idx_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
+            src0, src1, bias, src2, sidx, src0_nb1, src0_nb2, src1_nb1, src2_nb1, dst, dst_nb1, dst_nb2, n_t);
+    };
+
+    switch (nc) {
+        case 3:  launch_kernel(std::integral_constant<int, 3 >{}); break;
+        case 4:  launch_kernel(std::integral_constant<int, 4 >{}); break;
+        case 5:  launch_kernel(std::integral_constant<int, 5 >{}); break;
+        case 9:  launch_kernel(std::integral_constant<int, 9 >{}); break;
+        case 15: launch_kernel(std::integral_constant<int, 15>{}); break;
+        default: GGML_ABORT("Only support kernel sizes 3, 4, 5, 9, 15 right now.");
+    }
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -176,6 +268,44 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t nr  = src0->ne[1];                // d_inner
     const int64_t n_t = out->ne[1];                 // tokens per sequence
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
+
+    if (dst->src[2] != nullptr) {
+        // indexed in-place form (ggml_ssm_conv_idx)
+        const struct ggml_tensor * src2 = dst->src[2]; // state store [(d_conv - 1)*d_inner, n_rows]
+        const struct ggml_tensor * src3 = dst->src[3]; // sidx [n_s]
+
+        GGML_ASSERT(out->ne[0] == nr);
+        GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src2->type == GGML_TYPE_F32 && src3->type == GGML_TYPE_I32);
+        GGML_ASSERT(out->type  == GGML_TYPE_F32);
+        GGML_ASSERT(src0->nb[0] == sizeof(float) && src0->nb[1] == src0->ne[0]*sizeof(float));
+        GGML_ASSERT(src1->nb[0] == sizeof(float));
+        GGML_ASSERT(src2->nb[0] == sizeof(float));
+        GGML_ASSERT(out->nb[0]  == sizeof(float));
+        if (fuse_bias) {
+            GGML_ASSERT(bias->type == GGML_TYPE_F32);
+            GGML_ASSERT(ggml_is_contiguous(bias));
+            GGML_ASSERT(ggml_nelements(bias) == nr);
+        }
+
+        const float *   src0_d = (const float *)   src0->data;
+        const float *   src1_d = (const float *)   src1->data;
+        const float *   bias_d = fuse_bias ? (const float *) bias->data : nullptr;
+        float *         src2_d = (float *)         src2->data;
+        const int32_t * sidx_d = (const int32_t *) src3->data;
+        float *         dst_d  = (float *)         out->data;
+        cudaStream_t    stream = ctx.stream();
+
+        if (fuse_silu) {
+            ssm_conv_idx_f32_cuda<true>(src0_d, src1_d, bias_d, src2_d, sidx_d, src0->nb[1], src0->nb[2], src1->nb[1],
+                                        src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
+        } else {
+            ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, src0->nb[1], src0->nb[2], src1->nb[1],
+                                         src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
+        }
+        return;
+    }
+
 
     GGML_ASSERT(out->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));

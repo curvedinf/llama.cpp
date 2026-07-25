@@ -1353,6 +1353,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     graph_cache_slot * slot = nullptr;
 
+    const int32_t n_reused_before = n_reused;
+
     if (!graph_reuse_disable) {
         // find a cached graph that is compatible with the new parameters
         for (auto & s : graph_cache) {
@@ -1364,7 +1366,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (slot != nullptr) {
-        //LLAMA_LOG_DEBUG("%s: reusing cached graph\n", __func__);
+        LLAMA_LOG_DEBUG("%s: graph cache hit  (n_reused = %d, n_miss = %d)\n", __func__, n_reused + 1, n_graph_miss);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
@@ -1375,6 +1377,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        LLAMA_LOG_DEBUG("%s: graph cache miss (n_reused = %d, n_miss = %d)\n", __func__, n_reused, n_graph_miss + 1);
+
         slot = graph_cache_acquire();
 
         auto * res = slot->res.get();
@@ -1417,7 +1421,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         n_graph_miss++;
     }
 
-    slot->t_last = ++graph_cache_clock;
+    if (n_reused == n_reused_before) {
+        // freshly built graph: mark it as cold so that one-off shapes (e.g. prefill chunks,
+        // transient concurrency levels) are evicted before graphs that have proven to be
+        // reusable. a graph that gets reused later is promoted to a full timestamp on hit.
+        slot->t_last = graph_cache_clock;
+    } else {
+        slot->t_last = ++graph_cache_clock;
+    }
 
     sched_active = slot->sched.get();
 

@@ -5,7 +5,7 @@
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
-static __global__ void mul_mat_vec_f(
+static __global__ void __launch_bounds__(block_size, 2) mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -688,13 +688,39 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;
-    const int64_t nchannels_y        = ids ? ne11 : ne12;
-    const int64_t nchannels_dst      = ids ? ne1  : ne2;
-    const int64_t stride_col_dst     = ids ? s2   : s1;
-    const int64_t stride_col_y       = ids ? s12  : s11;
-    const int64_t stride_channel_dst = ids ? s1   : s2;
-    const int64_t stride_channel_y   = ids ? s11  : s12;
+    int64_t ncols_dst          = ids ? ne2  : ne1;
+    int64_t nchannels_y        = ids ? ne11 : ne12;
+    int64_t nchannels_dst      = ids ? ne1  : ne2;
+    int64_t stride_col_dst     = ids ? s2   : s1;
+    int64_t stride_col_y       = ids ? s12  : s11;
+    int64_t stride_channel_dst = ids ? s1   : s2;
+    int64_t stride_channel_y   = ids ? s11  : s12;
+    int64_t nsamples_y         = ne13;
+    int64_t nsamples_dst       = ne3;
+    int64_t stride_sample_y    = s13;
+    int64_t stride_sample_dst  = s3;
+
+    if (!ids && ne02 == 1 && ne03 == 1 && nchannels_dst*nsamples_dst > 1) {
+        // Fold contiguous batch dims (ne12, ne13) of src1/dst into columns so that each
+        // row of src0 is read once for all columns instead of once per (channel, sample).
+        const int64_t ncols_fold = ncols_dst * nchannels_dst * nsamples_dst;
+        const bool    has_fusion = fusion && (fusion->gate || fusion->x_bias || fusion->gate_bias);
+        const bool    cont_src1  = nb12 == nb11*ne11 && nb13 == nb12*ne12;
+        const bool    cont_dst   = nb2  == nb1 *ne1  && nb3  == nb2 *ne2;
+        if (!has_fusion && ncols_fold > 1 && ncols_fold <= MMVF_MAX_BATCH_SIZE && cont_src1 && cont_dst) {
+            ncols_dst          = ncols_fold;
+            nchannels_y        = 1;
+            nchannels_dst      = 1;
+            stride_col_dst     = s1;
+            stride_col_y       = s11;
+            stride_channel_dst = 0;
+            stride_channel_y   = 0;
+            nsamples_y         = 1;
+            nsamples_dst       = 1;
+            stride_sample_y    = 0;
+            stride_sample_dst  = 0;
+        }
+    }
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
@@ -703,19 +729,19 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             const float * src0_d = (const float *) src0->data;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-                ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+                ne03,     nsamples_dst,  s03, stride_sample_y, stride_sample_dst, ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_F16: {
             const half * src0_d = (const half *) src0->data;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-                ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+                ne03,     nsamples_dst,  s03, stride_sample_y, stride_sample_dst, ids_stride, prec, ctx.stream());
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0->data;
             mul_mat_vec_f_cuda(src0_d, src1_d, ids_d, fusion_local, dst_d, ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst,
                 ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-                ne03,              ne3,           s03, s13,              s3,                 ids_stride, prec, ctx.stream());
+                ne03,     nsamples_dst,  s03, stride_sample_y, stride_sample_dst, ids_stride, prec, ctx.stream());
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
@@ -811,6 +837,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (GGML_CUDA_CC_IS_CDNA1(cc)) {
+                    // gfx908: the fp32 MFMA path (MMF) requires src0 rows % 64 == 0, and
+                    // shapes that miss it fall back to hipBLAS which is >10x slower than
+                    // this kernel for the small F32 matmuls typical at decode time.
+                    return ne11 <= 8;
+                }
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
                 }

@@ -309,6 +309,8 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+
+        paged = other->paged;
     } else {
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
@@ -364,6 +366,80 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_PREFIX_CACHE_DISABLE = getenv("LLAMA_PREFIX_CACHE_DISABLE");
     prefix_enabled = LLAMA_PREFIX_CACHE_DISABLE ? !atoi(LLAMA_PREFIX_CACHE_DISABLE) : true;
+
+    // env: LLAMA_KV_PAGED - GPU-side paged attention: the flash-attention kernel receives a
+    // vLLM-style block table (src[5] of GGML_OP_FLASH_ATTN_EXT) and gathers K/V through it.
+    // switches the cell allocator to seq-aligned blocks and the K/V views to full width.
+    // default OFF. requires flash attention, non-SWA and a HIP(ROCm)/CUDA KV buffer - the
+    // CPU backend asserts on src[5] != nullptr, so refuse to enable anywhere else.
+    if (!other) {
+        const char * LLAMA_KV_PAGED = getenv("LLAMA_KV_PAGED");
+
+        paged = LLAMA_KV_PAGED && atoi(LLAMA_KV_PAGED) != 0;
+    }
+
+    if (paged) {
+        bool ok = true;
+
+        if (v_trans) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED requires flash attention - falling back to the legacy path\n", __func__);
+            ok = false;
+        }
+
+        if (n_swa > 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED is only supported for non-SWA caches - falling back to the legacy path\n", __func__);
+            ok = false;
+        }
+
+        if (n_stream != 1) {
+            // the block table addresses the physical pool of a single (unified) stream
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED requires a unified KV cache (-kvu) - falling back to the legacy path\n", __func__);
+            ok = false;
+        }
+
+        if (kv_size % llama_kv_cells::block_size != 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED requires kv_size = %u to be a multiple of the block size %u - falling back to the legacy path\n",
+                    __func__, kv_size, llama_kv_cells::block_size);
+            ok = false;
+        }
+
+        // the HIP/CUDA paged FA kernel currently supports head size 128/256 and F16/Q8_0 K/V only
+        // (mirrors ggml_cuda_fattn_paged_supported - attaching the block table for any other
+        // configuration would make the op unsupported and crash the CPU fallback)
+        const bool head_ok = (n_embd_head_k_all == 128 || n_embd_head_k_all == 256) &&
+                             (n_embd_head_v_all == 128 || n_embd_head_v_all == 256) &&
+                             n_embd_head_k_all == n_embd_head_v_all;
+        if (!head_ok) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED requires head size 128 or 256 (got k = %d, v = %d) - falling back to the legacy path\n",
+                    __func__, n_embd_head_k_all, n_embd_head_v_all);
+            ok = false;
+        }
+
+        if (type_k != type_v || (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_Q8_0)) {
+            LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED requires F16 or Q8_0 K/V cache types (got %s/%s) - falling back to the legacy path\n",
+                    __func__, ggml_type_name(type_k), ggml_type_name(type_v));
+            ok = false;
+        }
+
+        if (ok && !other) {
+            for (const auto & [buft, ctx] : ctx_map) {
+                const char * buft_name = ggml_backend_buft_name(buft);
+
+                if (strncmp(buft_name, "ROCm", 4) != 0 && strncmp(buft_name, "CUDA", 4) != 0) {
+                    LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED is only supported on the HIP/CUDA backend (got buffer type '%s') - falling back to the legacy path\n",
+                            __func__, buft_name);
+                    ok = false;
+                }
+            }
+        }
+
+        paged = ok;
+
+        if (paged) {
+            LLAMA_LOG_INFO("%s: paged attention enabled (LLAMA_KV_PAGED): block size = %u, %u blocks/stream\n",
+                    __func__, llama_kv_cells::block_size, kv_size/llama_kv_cells::block_size);
+        }
+    }
 
     chains.resize(LLAMA_MAX_SEQ);
 }
@@ -612,6 +688,14 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    if (paged && shift % (llama_pos) llama_kv_cells::block_size != 0) {
+        // a non-block-aligned shift breaks the seq-aligned invariant that the block table
+        // relies on (cell offset == position offset) - the K-shift graph still runs, but
+        // the gathered positions will be wrong
+        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED does not support non-block-aligned position shifts (shift = %d) - results will be wrong\n",
+                __func__, shift);
+    }
+
     uint32_t new_head = cells.size();
 
     if (p0 < 0) {
@@ -674,6 +758,11 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
 
     if (d == 1) {
         return;
+    }
+
+    if (paged) {
+        // position division breaks the seq-aligned invariant that the block table relies on
+        LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED does not support position division - results will be wrong\n", __func__);
     }
 
     if (p0 < 0) {
@@ -1213,7 +1302,10 @@ bool llama_kv_cache::prefix_copy_impl(llama_seq_id seq_id, const std::vector<uin
         }
 
         if (loc_same) {
-            // the cells already hold the right contents and positions - re-attach them
+            // the cells already hold the right contents and positions - re-attach them.
+            // in paged mode this is the entire prefix copy: pure bookkeeping - the block
+            // stays shared (read-only, pinned) and the sequence's block table simply maps
+            // the range to it (see llama_kv_cells::seq_block_table)
             for (uint32_t j = 0; j < llama_kv_cells::block_size; ++j) {
                 const uint32_t i = cells.cell_begin(loc_same->block) + j;
 
@@ -1226,6 +1318,18 @@ bool llama_kv_cache::prefix_copy_impl(llama_seq_id seq_id, const std::vector<uin
         }
 
         if (!loc_any) {
+            ok = false;
+            break;
+        }
+
+        if (paged) {
+            // paged mode never performs physical prefix copies: blocks are shared
+            // read-only via pin handles and re-attached (loc_same), which already covers
+            // every location of the single (unified) stream, so this point is only
+            // reachable if the matching block was concurrently mutated or evicted.
+            // the caller falls back to processing the prompt normally
+            LLAMA_LOG_DEBUG("%s: skipping physical prefix copy in paged mode (hash %d, pos %d)\n",
+                    __func__, (int) k, p0);
             ok = false;
             break;
         }
@@ -1503,9 +1607,24 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         }
 
         if (!cont) {
-            // allocate empty cells with the block allocator - partially-used blocks first,
-            //   then free blocks. the blocks themselves are updated in apply_ubatch()
-            cells.alloc_find(n_tokens, res.idxs[s]);
+            if (paged) {
+                // seq-aligned allocation: the token with logical position p goes to cell
+                // block_table[seq][p/32]*32 + p%32 of a block owned by its sequence - never
+                // shares a partial-block tail with another sequence or aligned range.
+                // the blocks themselves are updated in apply_ubatch()
+                const uint32_t i0 = n_stream > 1 ? s*n_tokens : 0;
+
+                std::vector<llama_seq_id> seqs(n_tokens);
+                for (uint32_t ii = 0; ii < n_tokens; ++ii) {
+                    seqs[ii] = ubatch.seq_id[i0 + ii][0];
+                }
+
+                cells.alloc_find_seq_aligned(ubatch.pos + i0, seqs.data(), n_tokens, res.idxs[s]);
+            } else {
+                // allocate empty cells with the block allocator - partially-used blocks first,
+                //   then free blocks. the blocks themselves are updated in apply_ubatch()
+                cells.alloc_find(n_tokens, res.idxs[s]);
+            }
 
             if (res.idxs[s].size() < n_tokens && n_swa > 0) {
                 // not enough empty cells - reuse cells with SWA-masked positions, starting
@@ -1553,7 +1672,12 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             // keep the indices sorted - helps the contiguous fast path of the state restore
-            std::sort(res.idxs[s].begin(), res.idxs[s].end());
+            // note: in paged mode the token -> cell mapping is positional (the token with
+            //       logical position p must go to cell offset p%32), so the ubatch order
+            //       of the indices must be preserved
+            if (!paged) {
+                std::sort(res.idxs[s].begin(), res.idxs[s].end());
+            }
 
             continue;
         }
@@ -1656,6 +1780,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             const auto idx = sinfo.idxs[s][ii];
 
+            // the paged allocation must place every token at its seq-aligned cell -
+            // checked because apply_ubatch pairs indices and positions by ubatch order
+            GGML_ASSERT(!paged || (uint32_t) ubatch.pos[i]%llama_kv_cells::block_size == idx%llama_kv_cells::block_size);
+
             if (!cells.is_empty(idx)) {
                 assert(cells.seq_count(idx) == 1);
 
@@ -1719,6 +1847,12 @@ bool llama_kv_cache::get_can_shift() const {
     if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
+    if (paged) {
+        // position shifts move cells off their seq-aligned offsets, which the paged
+        // block table cannot represent (cell offset == position offset). disabling
+        // shifts makes the server fall back to reprocessing instead of shifting
+        return false;
+    }
     return true;
 }
 
@@ -1740,6 +1874,84 @@ bool llama_kv_cache::get_has_shift() const {
     }
 
     return result;
+}
+
+bool llama_kv_cache::get_paged() const {
+    return paged;
+}
+
+void llama_kv_cache::set_paged(bool enabled) {
+    paged = enabled;
+}
+
+bool llama_kv_cache::paged_ubatch(const llama_ubatch & ubatch) const {
+    if (!paged) {
+        return false;
+    }
+
+    // the paged FA kernel addresses each sequence through its own block table column:
+    // the tokens of the ubatch must be grouped per sequence (seq-major), with an equal
+    // number of tokens per sequence and no multi-sequence (coupled) tokens
+    const uint32_t n_seq = ubatch.n_seqs_unq;
+
+    if (n_seq == 0 || ubatch.n_tokens % n_seq != 0) {
+        return false;
+    }
+
+    const uint32_t n_tps = ubatch.n_tokens/n_seq;
+
+    // the paged FA kernel is used only for single-token-per-sequence ubatches (decode).
+    // the n_tps > 1 shapes (prefill chunks, multi-token MTP verify) take the legacy path:
+    // the HIP paged vec kernel with ncols = 2 intermittently hits an illegal memory
+    // access on gfx908 (see the crash logs of the bench validation)
+    if (n_tps != 1) {
+        return false;
+    }
+
+    llama_seq_id seq_cur = -1;
+
+    for (uint32_t g = 0; g < n_seq; ++g) {
+        // note: reserved ubatches (graph_reserve) carry null seq_id pointers past the
+        // first few tokens - they are never paged-eligible
+        if (ubatch.n_seq_id[g*n_tps] != 1 || ubatch.seq_id[g*n_tps] == nullptr) {
+            return false;
+        }
+
+        const llama_seq_id seq_id = ubatch.seq_id[g*n_tps][0];
+
+        if (seq_id == seq_cur) {
+            // the tokens of this sequence are not grouped in a single contiguous block
+            return false;
+        }
+
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const uint32_t i = g*n_tps + ii;
+
+            if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != seq_id) {
+                return false;
+            }
+        }
+
+        seq_cur = seq_id;
+    }
+
+    return true;
+}
+
+uint32_t llama_kv_cache::get_n_kv_paged(const llama_ubatch & ubatch) const {
+    uint32_t result = 0;
+
+    // the logical KV length is the padded max sequence length of the ubatch
+    // note: called after apply_ubatch(), so the current positions are included
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const auto seq_id = ubatch.seq_id_unq[s];
+
+        result = std::max(result, (uint32_t) (v_cells[seq_to_stream[seq_id]].seq_pos_max(seq_id) + 1));
+    }
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(result, n_pad_cur)));
 }
 
 ggml_type llama_kv_cache::type_k() const {
@@ -1833,6 +2045,56 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const {
+    GGML_UNUSED(n_seq);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * k = layers[ikv].k;
+
+    const uint64_t kv_size      = get_size();
+    const uint64_t n_embd_k_gqa = k->ne[0];
+
+    assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+
+    // the full physical pool (a single slice) - the kernel resolves the actual rows for
+    // each sequence through the block table (src[5]). note: the pool cannot be aliased
+    // into one view per sequence (nb[3] = 0) - ggml's view-size assert counts the
+    // broadcast dim against the source size, so multi-sequence ubatches use one FA node
+    // per sequence instead (see build_attn_mha)
+    return ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), kv_size, 1,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(k->type, n_embd_k_gqa),
+            0,
+            0);
+}
+
+ggml_tensor * llama_kv_cache::get_v_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const {
+    GGML_UNUSED(n_seq);
+
+    const int32_t ikv = map_layer_ids.at(il);
+
+    auto * v = layers[ikv].v;
+
+    const uint64_t kv_size      = get_size();
+    const uint64_t n_embd_v_gqa = v->ne[0];
+
+    // [TAG_V_CACHE_VARIABLE]
+    assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+
+    // paged mode requires flash attention, so the V cache is not transposed
+    assert(!v_trans);
+
+    // see get_k_paged
+    return ggml_view_4d(ctx, v,
+            hparams.n_embd_head_v(il), hparams.n_head_kv(il), kv_size, 1,
+            ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+            ggml_row_size(v->type, n_embd_v_gqa),
+            0,
+            0);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -1952,6 +2214,28 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+ggml_tensor * llama_kv_cache::build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (!paged_ubatch(ubatch)) {
+        return nullptr;
+    }
+
+    // I32 [n_block, n_seq] - one column per sequence of the ubatch, in the order in which
+    // the sequences appear in the (seq-major) token axis of q. entry = physical block id,
+    // k/v for logical position p of sequence s lives at row table[p/32][s]*32 + p%32 of
+    // the physical pool. unused entries are filled with 0 by set_input_block_table (the
+    // kernel dereferences the table unconditionally; the mask makes the gathered rows
+    // ineffective). the mask is logically indexed: mask column p covers logical position p.
+    const uint32_t n_block = get_size()/llama_kv_cells::block_size;
+
+    ggml_tensor * block_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_block, ubatch.n_seqs_unq);
+
+    ggml_set_input(block_table);
+
+    ggml_set_name(block_table, "attn_inp_block_table");
+
+    return block_table;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
@@ -2037,6 +2321,49 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                     data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
                 }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    GGML_ASSERT(paged);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const uint32_t n_block = get_size()/llama_kv_cells::block_size;
+    const uint32_t n_seq   = ubatch->n_seqs_unq;
+    const uint32_t n_tps   = ubatch->n_tokens/n_seq;
+
+    GGML_ASSERT((uint32_t) dst->ne[0] == n_block);
+    GGML_ASSERT((uint32_t) dst->ne[1] == n_seq);
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t g = 0; g < n_seq; ++g) {
+        // the sequence of column g - the tokens are seq-major (see paged_ubatch)
+        const llama_seq_id seq_id = ubatch->seq_id[g*n_tps][0];
+
+        int32_t * dst_col = data + (size_t) g*n_block;
+
+        // unused entries must address valid memory - the kernel reads them unconditionally
+        std::fill(dst_col, dst_col + n_block, 0);
+
+        std::vector<int32_t> table(n_block, -1);
+
+        if (!v_cells[seq_to_stream[seq_id]].seq_block_table(seq_id, table)) {
+            // cells of one (seq, aligned range) pair in multiple blocks - the table
+            // cannot represent this. should not happen with the seq-aligned
+            // allocation policy - attention for this sequence will be wrong
+            LLAMA_LOG_ERROR("%s: ambiguous block table for sequence %d - paged allocation policy violated\n",
+                    __func__, seq_id);
+        }
+
+        for (uint32_t b = 0; b < n_block; ++b) {
+            if (table[b] >= 0) {
+                dst_col[b] = table[b];
             }
         }
     }
@@ -2295,6 +2622,101 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+// paged variant of set_input_kq_mask: the mask is indexed by LOGICAL position (the FA
+// kernel gathers the physical rows through the block table), with one slice per sequence
+// of the ubatch (dst->ne[3] == n_seqs_unq)
+template<typename T>
+static void set_input_kq_mask_paged_impl(
+        const llama_hparams & hparams,
+        const llama_ubatch  * ubatch,
+        const llama_kv_cells_vec & v_cells,
+        const std::vector<uint32_t> & seq_to_stream,
+        bool causal_attn,
+        ggml_tensor * dst,
+        T * data) {
+    const int64_t n_kv  = dst->ne[0]; // logical KV length
+    const int64_t n_seq = dst->ne[3];
+    const int64_t n_tps = dst->ne[1];
+
+    const uint32_t bs = llama_kv_cells::block_size;
+
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+
+    std::vector<int32_t> table;
+
+    for (int64_t g = 0; g < n_seq; ++g) {
+        const llama_seq_id seq_id = ubatch->seq_id[g*n_tps][0];
+
+        const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+        // resolve the logical positions of this sequence through its block table:
+        // has_pos[p] == true iff a cell with position p of this sequence exists
+        table.resize((n_kv + bs - 1)/bs);
+
+        cells.seq_block_table(seq_id, table);
+
+        std::vector<uint8_t> has_pos(n_kv, 0);
+
+        for (int64_t p = 0; p < n_kv; ++p) {
+            const int32_t b = table[p/bs];
+
+            if (b < 0) {
+                continue;
+            }
+
+            const uint32_t c = (uint32_t) b*bs + (uint32_t) p%bs;
+
+            if (c < cells.size() && !cells.is_empty(c) && cells.pos_get(c) == p && cells.seq_has(c, seq_id)) {
+                has_pos[p] = 1;
+            }
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = g*n_tps + ii;
+
+            const llama_pos p1 = ubatch->pos[i];
+
+            T * row = data + ((size_t) g*n_tps + ii)*n_kv;
+
+            int64_t p = 0;
+
+            if (hparams.use_alibi) {
+                for (; p <= p1 && p < n_kv; ++p) {
+                    row[p] = has_pos[p] ? llama_cast<T>(static_cast<float>(-std::abs(p - p1))) : mask_drop;
+                }
+            } else {
+                for (; p <= p1 && p < n_kv; ++p) {
+                    row[p] = has_pos[p] ? mask_keep : mask_drop;
+                }
+            }
+
+            for (; p < n_kv; ++p) {
+                if (has_pos[p] && !causal_attn) {
+                    row[p] = hparams.use_alibi ? llama_cast<T>(static_cast<float>(-std::abs(p - p1))) : mask_keep;
+                } else {
+                    row[p] = mask_drop;
+                }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask_paged(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(paged);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    GGML_ASSERT(dst->ne[3] == ubatch->n_seqs_unq);
+    GGML_ASSERT(dst->ne[1]*dst->ne[3] == ubatch->n_tokens);
+
+    if (dst->type == GGML_TYPE_F16) {
+        set_input_kq_mask_paged_impl<ggml_fp16_t>(hparams, ubatch, v_cells, seq_to_stream, causal_attn, dst, (ggml_fp16_t *) dst->data);
+    } else {
+        set_input_kq_mask_paged_impl<float>      (hparams, ubatch, v_cells, seq_to_stream, causal_attn, dst, (float       *) dst->data);
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -3098,7 +3520,9 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     kv->prefix_note_applied(sinfos[i_cur]);
 
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    paged = kv->paged_ubatch(ubatches[i_cur]);
+
+    n_kv = paged ? kv->get_n_kv_paged(ubatches[i_cur]) : kv->get_n_kv(sinfos[i_cur]);
 
     return true;
 }
@@ -3117,6 +3541,10 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+bool llama_kv_cache_context::get_paged() const {
+    return paged;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -3126,10 +3554,18 @@ ggml_type llama_kv_cache_context::type_v() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
+    if (paged) {
+        return kv->get_k_paged(ctx, il, ubatches[i_cur].n_seqs_unq);
+    }
+
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
+    if (paged) {
+        return kv->get_v_paged(ctx, il, ubatches[i_cur].n_seqs_unq);
+    }
+
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
@@ -3147,6 +3583,17 @@ ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, con
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_v_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_block_table(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    // note: gate on the context state (set in apply()), not just on the ubatch layout, so
+    // that the block table and the mask/view shapes are always built consistently.
+    // non-batch contexts (init_full/update, e.g. graph reserve) always take the legacy path
+    if (!paged) {
+        return nullptr;
+    }
+
+    return kv->build_input_block_table(ctx, ubatch);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
@@ -3169,7 +3616,16 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
+void llama_kv_cache_context::set_input_block_table(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_block_table(dst, ubatch, sinfos[i_cur]);
+}
+
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (paged) {
+        kv->set_input_kq_mask_paged(dst, ubatch, causal_attn);
+        return;
+    }
+
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 

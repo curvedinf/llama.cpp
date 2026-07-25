@@ -325,6 +325,14 @@ static bool run_case_conv_inplace(ggml_backend_t backend, const test_conv_cfg & 
     // indexed in-place path
     ggml_tensor * out_i = ggml_ssm_conv_idx(ctx, tokens, weight, store, idx);
 
+    // this test computes the graph directly, bypassing the scheduler's supports_op fallback;
+    // skip shapes the backend does not claim (e.g. the HIP ssm-conv kernels require nr % 128 == 0)
+    if (!ggml_backend_supports_op(backend, ref) || !ggml_backend_supports_op(backend, out_i)) {
+        fprintf(stderr, "%s: SKIP (unsupported on %s)\n", name, ggml_backend_name(backend));
+        ggml_free(ctx);
+        return true;
+    }
+
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, ref);
@@ -508,6 +516,8 @@ int main(int, char **) {
             { 4, 16,  2, 2,  5}, // n_t < nc - 1: state tail + tokens
             { 4, 16,  5, 2,  6}, // n_t >= nc - 1: state fully from tokens
             { 3,  8,  1, 4,  9},
+            { 4, 128, 1, 3,  7}, // HIP-supported shape (nr % 128 == 0)
+            { 4, 128, 5, 2,  6}, // HIP-supported, state fully from tokens
         };
         for (const auto & cfg : conv_cases) {
             ok &= run_case_conv_inplace(backend, cfg);

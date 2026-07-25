@@ -4617,6 +4617,46 @@ static void ggml_compute_forward_scale_f32(
     }
 }
 
+static void ggml_compute_forward_scale_f16(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float s; // scale factor
+    float b; // bias
+
+    memcpy(&s, (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&b, (float *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc = src0->ne[0];
+    const int nr = ggml_nrows(src0);
+
+    // rows per thread
+    const int dr = (nr + nth - 1)/nth;
+
+    // row range for this thread
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    const size_t nb1 = dst->nb[1];
+
+    for (int i1 = ir0; i1 < ir1; i1++) {
+        ggml_fp16_t * dst_row  = (ggml_fp16_t *) ((char *) dst->data  + i1*nb1);
+        ggml_fp16_t * src0_row = (ggml_fp16_t *) ((char *) src0->data + i1*nb1);
+        for (int i = 0; i < nc; i++) {
+            dst_row[i] = GGML_FP32_TO_FP16(s * GGML_FP16_TO_FP32(src0_row[i]) + b);
+        }
+    }
+}
+
 void ggml_compute_forward_scale(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -4627,6 +4667,10 @@ void ggml_compute_forward_scale(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_scale_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_scale_f16(params, dst);
             } break;
         default:
             {
@@ -9202,6 +9246,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[5] == nullptr && "paged attention (block table) is not supported by the CPU backend");
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
@@ -10858,14 +10903,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // state_ip (op param, indexed K == 1 form): operate on the input state rows directly
     const bool sip = ggml_get_op_params_i32(dst, 1) != 0;
     GGML_ASSERT(!sip || (K == 1 && src_sidx != nullptr));
-    // per-seq stride in floats (seq s starts at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // the state store may be f16 (storage only; compute stays f32)
+    const bool state_f16 = src_state->type == GGML_TYPE_F16;
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32 || state_f16);
+    // per-seq stride in elements (seq s starts at state + s * seq_stride)
+    const int64_t state_seq_stride = src_state->nb[3] / ggml_element_size(src_state);
+
+    const int64_t per_thread = S_v + ((K > 1 || state_f16) ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = (K > 1 || state_f16) ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
     // attn_scores: S_v * H * n_tokens * n_seqs    floats
@@ -10906,20 +10955,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iseq = sidx != nullptr ? sidx[iv3] : iv3;
         GGML_ASSERT(iseq >= 0 && iseq < n_state_rows);
 
-        const float * s_in = state_in_base + iseq * state_seq_stride + iv1 * S_v * S_v;
+        const int64_t s_row_off = iseq * state_seq_stride + iv1 * S_v * S_v;
 
         // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
         // For K>1, work in scratch and copy out per-token when the slot is in range.
-        // state_ip: operate on the input state row directly (it is left updated).
-        float * s_out = (K > 1)
+        // state_ip: operate on the input state row directly (it is left updated); an f16 store
+        // row is converted into f32 scratch first and written back after the token loop.
+        float * s_out = (K > 1 || (sip && state_f16))
             ? state_work
             : sip
-            ? (float *) s_in
+            ? (float *) (state_in_base + s_row_off)
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
-        if (!sip) {
-            memcpy(s_out, s_in, S_v * S_v * sizeof(float));
+        if (state_f16) {
+            const ggml_fp16_t * s_in_f16 = (const ggml_fp16_t *) src_state->data + s_row_off;
+            for (int64_t e = 0; e < S_v * S_v; e++) {
+                s_out[e] = GGML_FP16_TO_FP32(s_in_f16[e]);
+            }
+        } else if (!sip) {
+            memcpy(s_out, state_in_base + s_row_off, S_v * S_v * sizeof(float));
         }
 
         // attn output pointer for first token of this (head, seq)
@@ -10977,6 +11032,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                                      (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
                 }
+            }
+        }
+
+        // state_ip with an f16 store: convert the final state back into the row it came from
+        if (sip && state_f16) {
+            ggml_fp16_t * s_out_f16 = (ggml_fp16_t *) src_state->data + s_row_off;
+            for (int64_t e = 0; e < S_v * S_v; e++) {
+                s_out_f16[e] = GGML_FP32_TO_FP16(s_out[e]);
             }
         }
     }

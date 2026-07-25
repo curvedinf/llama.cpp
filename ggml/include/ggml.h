@@ -2438,6 +2438,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // attach an optional paged-attention block table (stored in src[5]).
+    // block_table: I32 [max_logical_blocks, n_seq] (or [max_logical_blocks, n_seq, n_stream]);
+    // entry = physical block id, k/v for logical position p of seq s lives at
+    // row block_table[p / block_size][s] * block_size + p % block_size of the flat k/v buffers.
+    GGML_API void ggml_flash_attn_ext_set_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * block_table);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

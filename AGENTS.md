@@ -87,6 +87,24 @@ must keep these invariants valid:
 
 Each phase: bench cycle, log to `OPTIMIZATION_LOG.md`, revert on regression.
 
+## ROCm/gfx908 port (branch concurrency-gfx908)
+
+A ROCm/HIP port of this branch's optimizations exists on branch
+`concurrency-gfx908` (4x MI100, ROCm 7.2.0). See `OPTIMIZATION_LOG.md` for
+the full session log.
+
+- Paged attention (G1) is implemented for the HIP backend, gated by
+  `LLAMA_KV_PAGED=1` (default OFF - measured ~2.6x slower than paged-off on
+  the server c=8 bench).
+- Build (gfx908):
+  `cmake -B build -G Ninja -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx908 -DCMAKE_BUILD_TYPE=Release -DGGML_HIP_GRAPHS=ON -DCMAKE_HIP_FLAGS="-isystem /opt/rocm-7.2.0/include -L/opt/rocm-7.2.0/lib"`
+  Gotchas: the system `/usr/include/hip` is ROCm 5.7 and breaks builds - the
+  `-isystem /opt/rocm-7.2.0/include` flag above is required. Use the cmake
+  and ninja in `~/.venvs/cmake-ninja/bin`.
+- Environment caveat: all 4 MI100s run with sclk pinned at 300 MHz
+  (max 1502 MHz; unpinning needs root) - all perf numbers are at 300 MHz and
+  kernels are issue/latency-bound.
+
 ## Useful references (load on demand)
 
 - `OPTIMIZATION_LOG.md` - experiment history, current numbers, bandwidth analysis.

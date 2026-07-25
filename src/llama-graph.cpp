@@ -30,7 +30,10 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+
+    // paged attention addresses each sequence through its own block table column,
+    // so the mask gets one slice per sequence (logically indexed)
+    const auto n_stream = mctx->get_paged() ? ubatch.n_seqs_unq : (cparams.kv_unified ? 1 : ubatch.n_seqs_unq);
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -46,10 +49,11 @@ static bool can_reuse_kq_mask(
         ggml_tensor * kq_mask,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        int debug = 0) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto n_stream = mctx->get_paged() ? ubatch.n_seqs_unq : (cparams.kv_unified ? 1 : ubatch.n_seqs_unq);
 
     bool res = true;
 
@@ -57,6 +61,14 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
+
+    if (!res && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: kq_mask mismatch: ne = [%lld, %lld, %lld, %lld], expected [%lld, %lld, 1, %lld] (n_kv = %u, n_tokens = %u, n_stream = %u)\n",
+                __func__,
+                (long long) kq_mask->ne[0], (long long) kq_mask->ne[1], (long long) kq_mask->ne[2], (long long) kq_mask->ne[3],
+                (long long) n_kv, (long long) (n_tokens/n_stream), (long long) n_stream,
+                n_kv, n_tokens, n_stream);
+    }
 
     return res;
 }
@@ -355,6 +367,17 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= rs_z == mctx->get_rs_z();
     res &= direct == mctx->get_direct();
 
+    if (!res && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
+                __func__,
+                (long long) s_copy->ne[0], mctx->get_n_rs(),
+                (long long) s_copy_main->ne[0], params.ubatch.n_seqs,
+                (long long) s_copy_extra->ne[0], mctx->get_n_rs() - params.ubatch.n_seqs,
+                head, mctx->get_head(),
+                rs_z, mctx->get_rs_z(),
+                direct, mctx->get_direct());
+    }
+
     return res;
 }
 
@@ -469,6 +492,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    // paged attention: refill the block table in place (persistent graph input)
+    if (self_block_table) {
+        mctx->set_input_block_table(self_block_table, ubatch);
+    }
+
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
@@ -494,7 +522,12 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    if (self_block_table) {
+        res &= mctx->get_paged();
+        res &= self_block_table->ne[1] == params.ubatch.n_seqs_unq;
+    }
+
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, debug);
 
     return res;
 }
@@ -514,7 +547,7 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams, debug);
 
     return res;
 }
@@ -541,8 +574,8 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs_mla->ne[0] == params.ubatch.n_tokens;
     res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
-    res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams, debug);
+    res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams, debug);
 
     return res;
 }
@@ -604,7 +637,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_kq_mask && self_kq_mask->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(self_kq_mask, mctx->get_base(), params.ubatch, params.cparams, debug);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -614,7 +647,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
-        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(self_kq_mask_swa, mctx->get_swa(), params.ubatch, params.cparams, debug);
     }
 
     return res;
@@ -992,7 +1025,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams, debug);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1002,6 +1035,17 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+
+    if (!res && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
+                __func__,
+                (long long) inp_rs->s_copy->ne[0], mctx->get_recr()->get_n_rs(),
+                (long long) inp_rs->s_copy_main->ne[0], params.ubatch.n_seqs,
+                (long long) inp_rs->s_copy_extra->ne[0], mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs,
+                inp_rs->head, mctx->get_recr()->get_head(),
+                inp_rs->rs_z, mctx->get_recr()->get_rs_z(),
+                inp_rs->direct, mctx->get_recr()->get_direct());
+    }
 
     return res;
 }
@@ -1036,7 +1080,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams, debug);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1046,6 +1090,17 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+
+    if (!res && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
+                __func__,
+                (long long) inp_rs->s_copy->ne[0], mctx->get_recr()->get_n_rs(),
+                (long long) inp_rs->s_copy_main->ne[0], params.ubatch.n_seqs,
+                (long long) inp_rs->s_copy_extra->ne[0], mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs,
+                inp_rs->head, mctx->get_recr()->get_head(),
+                inp_rs->rs_z, mctx->get_recr()->get_rs_z(),
+                inp_rs->direct, mctx->get_recr()->get_direct());
+    }
 
     return res;
 }
@@ -1117,7 +1172,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, attn_ctx->get_base(), params.ubatch, params.cparams, debug);
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
@@ -1125,7 +1180,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
       //res &= inp_attn->self_v_idxs_swa->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams, debug);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -1135,6 +1190,17 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+
+    if (!res && debug > 0) {
+        LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
+                __func__,
+                (long long) inp_rs->s_copy->ne[0], mctx->get_recr()->get_n_rs(),
+                (long long) inp_rs->s_copy_main->ne[0], params.ubatch.n_seqs,
+                (long long) inp_rs->s_copy_extra->ne[0], mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs,
+                inp_rs->head, mctx->get_recr()->get_head(),
+                inp_rs->rs_z, mctx->get_recr()->get_rs_z(),
+                inp_rs->direct, mctx->get_recr()->get_direct());
+    }
 
     return res;
 }
@@ -1276,7 +1342,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
-    if (!this->params.allow_reuse(params)) {
+    if (!this->params.allow_reuse(params, debug)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1290,11 +1356,11 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    for (auto & input : inputs) {
-        const bool cur = input->can_reuse(params);
+    for (int i = 0; i < (int) inputs.size(); ++i) {
+        const bool cur = inputs[i]->can_reuse(params);
 
         if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
+            LLAMA_LOG_DEBUG("%s: input[%d]: can_reuse = %d\n", __func__, i, cur);
         }
 
         res = res && cur;
@@ -2394,7 +2460,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * block_table) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2409,6 +2476,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+
+    // the paged-attention block table is only wired for the flash-attention path
+    // (models with a KQ bias take the soft_max path, which has no paged variant)
+    GGML_ASSERT(block_table == nullptr || use_flash_attn);
+
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -2425,12 +2497,64 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (block_table && block_table->ne[1] > 1) {
+            // paged attention with multiple sequences in the ubatch: the unified K/V pool
+            // is shared by all sequences and ggml cannot alias it into one view per
+            // sequence (its view-size assert counts the aliased dim), so each sequence
+            // gets its own FA node over the full pool with its own block table column
+            // and mask slice. the results are concatenated along the sequence axis
+            const int64_t n_seq = block_table->ne[1];
+            const int64_t n_tps = q->ne[1]/n_seq;
 
-        ggml_flash_attn_ext_add_sinks(cur, sinks);
-        ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+            GGML_ASSERT(q->ne[1]%n_seq == 0);
+            GGML_ASSERT(kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_seq);
+
+            ggml_tensor * cur_seq = nullptr;
+
+            for (int64_t g = 0; g < n_seq; ++g) {
+                ggml_tensor * q_g = ggml_view_4d(ctx0, q,
+                        q->ne[0], n_tps, q->ne[2], 1,
+                        q->nb[1], q->nb[2], q->nb[3],
+                        (size_t) g*n_tps*q->nb[1]);
+
+                ggml_tensor * mask_g = ggml_view_4d(ctx0, kq_mask,
+                        kq_mask->ne[0], n_tps, 1, 1,
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3],
+                        (size_t) g*kq_mask->nb[3]);
+
+                ggml_tensor * bt_g = ggml_view_2d(ctx0, block_table,
+                        block_table->ne[0], 1,
+                        block_table->nb[1],
+                        (size_t) g*block_table->ne[0]*sizeof(int32_t));
+
+                ggml_tensor * cur_g = ggml_flash_attn_ext(ctx0, q_g, k, v, mask_g, kq_scale,
+                                                          hparams.f_max_alibi_bias,
+                                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_g, il});
+
+                ggml_flash_attn_ext_add_sinks      (cur_g, sinks);
+                ggml_flash_attn_ext_set_prec       (cur_g, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_block_table(cur_g, bt_g);
+
+                cur_seq = cur_seq == nullptr ? cur_g : ggml_concat(ctx0, cur_seq, cur_g, 3);
+            }
+
+            cur = cur_seq;
+        } else {
+            cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                      hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+            if (block_table) {
+                // paged attention (LLAMA_KV_PAGED): src[5] carries the I32 block table.
+                // only ever attached when the KV cache gated paged mode on, which requires
+                // the HIP/CUDA backend - the CPU backend asserts on src[5] != nullptr
+                ggml_flash_attn_ext_set_block_table(cur, block_table);
+            }
+        }
 
         if (v_mla) {
 #if 0
@@ -2612,6 +2736,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
+        // paged attention (LLAMA_KV_PAGED) - nullptr when disabled
+        inp->self_block_table = mctx_cur->build_input_block_table(ctx0, ubatch);
+
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
@@ -2678,7 +2805,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->self_block_table);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

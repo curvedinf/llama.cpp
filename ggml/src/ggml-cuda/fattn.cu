@@ -262,6 +262,30 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
 
+    if (dst->src[5] != nullptr) {
+        // Paged (block-table) attention is implemented by the vector kernel only; restricted config set.
+        GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
+        GGML_ASSERT(Q->ne[0] == 128 || Q->ne[0] == 256);
+        switch (K->type) {
+            case GGML_TYPE_F16:
+                if (Q->ne[0] == 128) {
+                    ggml_cuda_flash_attn_ext_vec_paged_case<128, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_paged_case<256, GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+                }
+                return;
+            case GGML_TYPE_Q8_0:
+                if (Q->ne[0] == 128) {
+                    ggml_cuda_flash_attn_ext_vec_paged_case<128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                } else {
+                    ggml_cuda_flash_attn_ext_vec_paged_case<256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+                }
+                return;
+            default:
+                GGML_ABORT("fatal error");
+        }
+    }
+
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_F16)
@@ -357,6 +381,53 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
+// Paged (block-table) flash attention (dst->src[5] != nullptr) is implemented by the vector kernel
+// only, for a restricted configuration set. Anything else must return false here so that the
+// llama-side gating (which only attaches a block table for supported configs) fails loudly.
+static bool ggml_cuda_fattn_paged_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * bt    = dst->src[5];
+
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (Q->ne[0] != K->ne[0] || Q->ne[0] != V->ne[0] || (Q->ne[0] != 128 && Q->ne[0] != 256)) { // head_dim 128 or 256 only
+        return false;
+    }
+    if (K->type != V->type) {
+        return false;
+    }
+    if (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    if (K->ne[1] % 32 != 0 || V->ne[1] != K->ne[1]) { // physical pools are whole 32-row blocks
+        return false;
+    }
+    // The logical KV length is taken from mask->ne[0]; mask rows must be contiguous.
+    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || !ggml_is_contiguous(mask)) {
+        return false;
+    }
+    if (bt->type != GGML_TYPE_I32 || bt->ne[2] != 1 || bt->ne[3] != 1) {
+        return false;
+    }
+    if (bt->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+    if (bt->ne[1] != Q->ne[3]) { // one table column per sequence
+        return false;
+    }
+    if ((int64_t) bt->ne[0]*32 > K->ne[1]) { // table must address within the physical pool
+        return false;
+    }
+    return true;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -368,6 +439,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+
+    if (dst->src[5] != nullptr) {
+#ifdef FLASH_ATTN_AVAILABLE
+        return ggml_cuda_fattn_paged_supported(dst) ? BEST_FATTN_KERNEL_VEC : BEST_FATTN_KERNEL_NONE;
+#else
+        return BEST_FATTN_KERNEL_NONE;
+#endif// FLASH_ATTN_AVAILABLE
+    }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -551,6 +630,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     GGML_ASSERT(K != nullptr);
     GGML_ASSERT(V != nullptr);
+
+    if (dst->src[5] != nullptr) {
+        // Paged path: K/V are never converted to f16, but the parallel-blocks combine scratch is
+        // reserved in the op's own allocation so that it stays valid for the graph's lifetime
+        // (per-stream pool buffers can be recycled between graph capture and replay).
+        return ggml_cuda_fattn_vec_paged_scratch_offset(dst) + ggml_cuda_fattn_vec_paged_scratch_nbytes(device, dst);
+    }
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 

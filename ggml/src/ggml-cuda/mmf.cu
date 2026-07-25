@@ -53,15 +53,39 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     ggml_cuda_pool_alloc<int32_t> expert_bounds_dev;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
-    const int64_t ncols_dst          = ids ? ne2  : ne1;
-    const int64_t nchannels_dst      = ids ? ne1 : ne2;
+    int64_t ncols_dst          = ids ? ne2  : ne1;
+    int64_t nchannels_dst      = ids ? ne1 : ne2;
 
-    const int64_t stride_col_dst     = ids ? s2   : s1;
-    const int64_t stride_col_y       = ids ? s12  : s11;
-    const int64_t stride_channel_dst = ids ? s1 : s2;
+    int64_t stride_col_dst     = ids ? s2   : s1;
+    int64_t stride_col_y       = ids ? s12  : s11;
+    int64_t stride_channel_dst = ids ? s1 : s2;
 
-    int64_t stride_channel_y         = ids ? s11  : s12;
-    int64_t nchannels_y              = ids ? ne11 : ne12;
+    int64_t stride_channel_y   = ids ? s11  : s12;
+    int64_t nchannels_y        = ids ? ne11 : ne12;
+
+    int64_t nsamples_dst       = ne3;
+    int64_t stride_sample_y    = s13;
+    int64_t stride_sample_dst  = s3;
+
+    if (!ids && ne02 == 1 && ne03 == 1 && nchannels_dst*nsamples_dst > 1) {
+        // Fold contiguous batch dims (ne12, ne13) of src1/dst into columns so that each
+        // row of src0 is read once for all columns instead of once per (channel, sample).
+        const int64_t ncols_fold = ncols_dst * nchannels_dst * nsamples_dst;
+        const bool    cont_src1  = nb12 == nb11*ne11 && nb13 == nb12*ne12;
+        const bool    cont_dst   = nb2  == nb1 *ne1  && nb3  == nb2 *ne2;
+        if (ncols_fold > 1 && ncols_fold <= 16 && cont_src1 && cont_dst) {
+            ncols_dst          = ncols_fold;
+            nchannels_y        = 1;
+            nchannels_dst      = 1;
+            stride_col_dst     = s1;
+            stride_col_y       = s11;
+            stride_channel_dst = 0;
+            stride_channel_y   = 0;
+            nsamples_dst       = 1;
+            stride_sample_y    = 0;
+            stride_sample_dst  = 0;
+        }
+    }
 
     //mul_mat_id: handle broadcast
     if (ids && nchannels_y == 1) {
@@ -107,7 +131,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<float>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, nsamples_dst, s03/vals_per_T, stride_sample_y, stride_sample_dst, ctx.stream(), ids_info_ptr);
         } break;
         case GGML_TYPE_F16: {
             const half2 * src0_d = (const half2 *) src0->data;
@@ -115,7 +139,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<half2>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, nsamples_dst, s03/vals_per_T, stride_sample_y, stride_sample_dst, ctx.stream(), ids_info_ptr);
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
@@ -123,7 +147,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<nv_bfloat162>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, nsamples_dst, s03/vals_per_T, stride_sample_y, stride_sample_dst, ctx.stream(), ids_info_ptr);
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));

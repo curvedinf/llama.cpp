@@ -2,6 +2,8 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <type_traits>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -72,6 +74,33 @@ static __global__ void k_get_rows_float(
             const src0_t * src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
             dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        }
+    }
+}
+
+static __global__ void k_get_rows_float_f32_vec4(
+        const float * __restrict__ src0, const int32_t * __restrict__ src1, float * __restrict__ dst,
+        const int64_t ne00_vec4,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00_vec4; i00 += gridDim.y*blockDim.x) {
+            const int i10 = blockIdx.x;
+            const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
+            const int i11 = dm.x;
+            const int i12 = dm.y;
+
+            const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+            float4 * dst_row = (float4 *) (dst + i10*s1 + i11*s2 + i12*s3);
+            const float4 * src0_row = (const float4 *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+
+            dst_row[i00] = src0_row[i00];
         }
     }
 }
@@ -167,6 +196,22 @@ static void get_rows_cuda_float(
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<dst_t, float>) {
+        if (ne00 % 4 == 0 && nb01 % alignof(float4) == 0 && nb02 % alignof(float4) == 0 && nb03 % alignof(float4) == 0 &&
+                nb1 % alignof(float4) == 0 && nb2 % alignof(float4) == 0 && nb3 % alignof(float4) == 0) {
+            const int64_t ne00_vec4 = ne00 / 4;
+            const int block_num_y_vec4 = (ne00_vec4 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+            const dim3 block_nums_vec4(ne10, MIN(block_num_y_vec4, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            const ggml_cuda_kernel_launch_params launch_params_vec4 = ggml_cuda_kernel_launch_params{block_nums_vec4, block_dims, 0, stream};
+            ggml_cuda_kernel_launch(k_get_rows_float_f32_vec4, launch_params_vec4,
+                src0_d, src1_d, dst_d,
+                ne00_vec4, ne11, ne12_fdv,
+                s1, s2, s3,
+                nb01, nb02, nb03,
+                s10, s11, s12);
+            return;
+        }
+    }
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
         src0_d, src1_d, dst_d,
         ne00, /*ne01, ne02, ne03,*/

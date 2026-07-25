@@ -2,6 +2,7 @@
 
 #include "llama-arch.h"
 #include "llama-batch.h"
+#include "llama-impl.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
@@ -340,6 +341,8 @@ public:
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+
+    ggml_tensor * self_block_table = nullptr; // I32 [kv_size/32, n_seqs_unq] (paged attention, optional)
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
@@ -716,7 +719,7 @@ struct llm_graph_params {
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
-    bool allow_reuse(const llm_graph_params & other) const {
+    bool allow_reuse(const llm_graph_params & other, int debug = 0) const {
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -730,16 +733,43 @@ struct llm_graph_params {
                 (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
             );
 
+        if (!can_reuse_ubatch && debug > 1) {
+            LLAMA_LOG_DEBUG("%s: ubatch mismatch: eq %d/%d tok %u/%u n_seq_tokens %u/%u n_seqs %u/%u unq %u/%u token %p/%p embd %p/%p\n",
+                    __func__,
+                    ubatch.equal_seqs(), other.ubatch.equal_seqs(),
+                    ubatch.n_tokens,     other.ubatch.n_tokens,
+                    ubatch.n_seq_tokens, other.ubatch.n_seq_tokens,
+                    ubatch.n_seqs,       other.ubatch.n_seqs,
+                    ubatch.n_seqs_unq,   other.ubatch.n_seqs_unq,
+                    (const void *) ubatch.token, (const void *) other.ubatch.token,
+                    (const void *) ubatch.embd,  (const void *) other.ubatch.embd);
+        }
+
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
-        if (can_reuse_ubatch && ubatch.equal_seqs()) {
+        // note: with a unified KV cache there is a single attention stream shared by all sequences and the
+        //   per-sequence data (k/v idxs, masks, block tables, recurrent state copies) is provided through
+        //   set_input(), so the graph topology does not depend on the sequence identities
+        if (can_reuse_ubatch && ubatch.equal_seqs() && !cparams.kv_unified) {
             if (!ubatch.data) {
                 // if the old ubatch does not own it's data, then we cannot guarantee that it is still alive, and
                 //   therefore we cannot perform the sequence id check. normally should never happen
                 can_reuse_ubatch = false;
+
+                if (debug > 1) {
+                    LLAMA_LOG_DEBUG("%s: ubatch does not own its data\n", __func__);
+                }
             } else {
                 for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-                    can_reuse_ubatch &= ubatch.seq_id_unq[s] == other.ubatch.seq_id_unq[s];
+                    if (ubatch.seq_id_unq[s] != other.ubatch.seq_id_unq[s]) {
+                        can_reuse_ubatch = false;
+
+                        if (debug > 1) {
+                            LLAMA_LOG_DEBUG("%s: seq_id_unq[%u] mismatch: %d/%d\n", __func__, s, ubatch.seq_id_unq[s], other.ubatch.seq_id_unq[s]);
+                        }
+
+                        break;
+                    }
                 }
             }
         }
@@ -749,22 +779,42 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            if (debug > 1) {
+                LLAMA_LOG_DEBUG("%s: n_outputs mismatch: %u/%u\n", __func__, n_outputs, other.n_outputs);
+            }
+
             return false;
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            if (debug > 1) {
+                LLAMA_LOG_DEBUG("%s: samplers mismatch\n", __func__);
+            }
+
             return false;
         }
 
         if (samplers.size() > 0) {
             if (!ubatch.data || !other.ubatch.data) {
+                if (debug > 1) {
+                    LLAMA_LOG_DEBUG("%s: ubatch data missing for sampler output check\n", __func__);
+                }
+
                 return false;
             }
 
             // check that the outputs are the same for all samplers
+            // note: the seq_id of a token only affects the graph topology for output tokens
+            //   (it determines which sampler the token's logits are routed to), so skip it
+            //   for non-output tokens
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (ubatch.output[i]    != other.ubatch.output[i] ||
-                    ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                if (ubatch.output[i] != other.ubatch.output[i] ||
+                    (ubatch.output[i] && ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0])) {
+                    if (debug > 1) {
+                        LLAMA_LOG_DEBUG("%s: output[%u] mismatch: out %d/%d seq_id %d/%d\n",
+                                __func__, i, ubatch.output[i], other.ubatch.output[i], ubatch.seq_id[i][0], other.ubatch.seq_id[i][0]);
+                    }
+
                     return false;
                 }
             }
@@ -772,10 +822,14 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            if (debug > 1) {
+                LLAMA_LOG_DEBUG("%s: nextn_layer_offset mismatch\n", __func__);
+            }
+
             return false;
         }
 
-        return
+        const bool res =
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -785,6 +839,22 @@ struct llm_graph_params {
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
+
+        if (!res && debug > 1) {
+            LLAMA_LOG_DEBUG("%s: cparams/arch/gtype mismatch: emb %d/%d emb_nextn %d/%d emb_nextn_masked %d/%d causal %d/%d arch %d/%d gtype %d/%d cvec %p/%p loras %p/%p cross %p/%p\n",
+                    __func__,
+                    cparams.embeddings,              other.cparams.embeddings,
+                    cparams.embeddings_nextn,        other.cparams.embeddings_nextn,
+                    cparams.embeddings_nextn_masked, other.cparams.embeddings_nextn_masked,
+                    cparams.causal_attn,             other.cparams.causal_attn,
+                    arch,  other.arch,
+                    gtype, other.gtype,
+                    (const void *) cvec,  (const void *) other.cvec,
+                    (const void *) loras, (const void *) other.loras,
+                    (const void *) cross, (const void *) other.cross);
+        }
+
+        return res;
     }
 };
 
@@ -1077,7 +1147,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * block_table = nullptr) const; // I32 [kv_size/32, n_seq] (paged attention, optional)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

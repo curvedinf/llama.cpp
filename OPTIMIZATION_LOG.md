@@ -666,3 +666,123 @@ env flags (`LLAMA_PREFILL_CHUNK`, `LLAMA_PREEMPT`) is on by default.
 
 
 
+
+## ROCm/gfx908 (4x MI100) port + paged attention (G1) implementation (2026-07-25)
+
+Branch: `concurrency-gfx908`. Hardware: 4x MI100 (gfx908), ROCm 7.2.0, HIP
+backend. Target model: Qwen3.6-27B (hybrid delta-net + attention), Q6_K_XL.
+The Vulkan-based optimizations of the parent branch were ported to HIP, and
+the G1 paged-attention roadmap item was implemented on top.
+
+### Vulkan -> HIP port of the branch optimizations
+
+- GATED_DELTA_NET_IDX CUDA kernel: indexed state read, `state_ip` in-place
+  write-back (the in-place GDN state write-back from the Vulkan branch), and
+  f16 state store (the G4 f16-state equivalent).
+- Indexed SSM_CONV HIP kernel: in-place conv state read/write (the conv
+  state in-place optimization).
+- F16 SCALE HIP kernel (needed by the recurrent-memory state zeroing, same
+  role as the Vulkan scale_f16_f32 variant).
+- hipCUB enablement for TOP_K/ARGSORT: backend/GPU sampling works on ROCm.
+- ggml flash-attn block-table extension: `ggml_flash_attn_ext_set_block_table`
+  passes the block table as `src[5]`, plus a paged fattn-vec kernel
+  (D=128/256, f16 and q8_0 KV, block table read on device, bounds-guarded;
+  combine scratch moved off the leg pool for graph-capture safety).
+
+### llama-side paged attention (`LLAMA_KV_PAGED=1`, default OFF)
+
+- Seq-aligned 32-cell block allocation.
+- Per-seq block table graph input (CUDA-graph safe).
+- Per-seq FA node decomposition for n_seq > 1.
+- Prefill gated to legacy FA (paged kernel is decode-path only).
+- Prefix-copy eliminated to pure bookkeeping in paged mode (Phase 2).
+- Context shift disabled in paged mode.
+
+Deviations from `GPU_PAGED_ATTENTION_BLOCK_TABLE.md`: implemented on ROCm
+(HIP kernels) instead of Vulkan shaders; unused block-table entries are 0,
+not -1 (the kernel reads the table unconditionally, so entries must point at
+a valid block); Phase 3 (the optimized paged kernel) was not done - the
+shipped paged kernel is the fattn-vec gather variant.
+
+### Cherry-picked gfx908 one-liners
+
+- getrows f32 vec4 load path.
+- quantize: division elimination.
+- mmvf launch bounds.
+- gdn launch bounds.
+
+### Graph-cache improvements
+
+Cold-insertion LRU policy + `kv_unified` `seq_id_unq` relax + output-token-only
+sequence check: steady-state graph-cache hit rate 85% -> 95%.
+
+### gfx908 decode matmul work
+
+- mmvf batch-dim fold: ssm_out f16 1552 -> 128 us.
+- F32 mmvf threshold ne11 <= 8: ssm_alpha/beta moved off hipBLAS, 200 -> 54 us.
+- Folded 2D GEMM routing.
+- mmq-config-cdna: Q6_K/Q8_0 J=16 config -> 256 threads, occupancy 2, I=64.
+- stream_k grid = nsm x occupancy.
+- Q6_K/Q8_0 loader / vec-dot batching.
+
+Engine pure decode (`llama-batched-bench -npp 0 -ntg 64 -npl 8`):
+41.62 -> 63.75 tok/s.
+
+### Server c=8 results (bench_qwen36_openai.py)
+
+1024x100 workload, 4 endpoints x c=8, MTP drafts=2, Q6_K_XL, all GPUs pinned
+at 300 MHz sclk (see environment finding below):
+
+| stage | per-endpoint tok/s | note |
+|-------|--------------------|------|
+| baseline branch build | ~5.8 | CPU fallback (kernels not ported yet) |
+| after kernel ports | ~13.5 | |
+| after graph + sampling | ~10.8 | regression from churn |
+| after matmul fixes | 16.1 - 18.7 | agg 65.0, TPOT med 288-352 ms, TTFT med 10.8-15.5 s, 1 failed |
+| MTP A/B (nospec) | - | agg 57.9 - MTP is worth +12% |
+| paged ON | - | agg 24.8, 0 failures |
+
+Paged-on is ~2.6x slower than paged-off (per-seq FA decomposition + vec
+gather + alloc scans), so `LLAMA_KV_PAGED` stays gated OFF by default per the
+plan's bench-driven default rule.
+
+### vLLM reference
+
+`final_default_095_c8_np32`: 2 endpoints, TP2 x c=8, GPTQ-8bit: agg_out 71.4
+tok/s, per-endpoint ~36, TPOT med ~110 ms, TTFT med ~10 s.
+Per-GPU: vLLM 17.85 vs llama.cpp 16.25 tok/s (~91%).
+
+### KEY ENVIRONMENT FINDING
+
+All 4 MI100s run with sclk pinned at 300 MHz
+(`power_dpm_force_performance_level=manual`, max is 1502 MHz). All kernels
+are therefore issue/latency-bound, not clock-bound. Unpinning needs root.
+All numbers above are at the pinned 300 MHz.
+
+### Remaining headroom
+
+- Q6_K MMQ: ~195 GB/s, issue-bound at 300 MHz.
+- Server step overhead: ~90 ms/step beyond engine time.
+- Paged per-seq FA node batching (single multi-seq paged kernel launch).
+- Paged alloc O(n_blocks) scans.
+- TTFT prefill chunk tuning.
+- Graph-cache n_kv band misses.
+
+### Prefill chunk sweep + prefill matmul investigation (2026-07-25, gfx908)
+
+- Prefill matmuls: at ncols>=512 Q6_K/Q8_0 route dequant+hipBLAS, sustaining ~25-35 TFLOPS = 68-95% of fp16-MFMA peak at the pinned 300 MHz sclk. Forcing MMQ at large ncols is worse (11.7-18.8 TFLOPS). No change kept; prefill is already near-roofline for this clock. fp16-MFMA MMQ (removing int8 per-element scale fixups) is the documented 15-25% prefill headroom, not yet implemented.
+- LLAMA_PREFILL_CHUNK=2048 + LLAMA_UX_MIN_CHUNK=1024: agg 61.8 tok/s (vs 65.0 default 512 - within machine variance), TTFT med 13-15s -> ~10s. TPOT unchanged (~320-345ms).
+- Full unit suite green: test-kv-cells, test-prefix-cache, test-graph-cache, test-gdn-indexed-state, test-prefix-cache-e2e (GPU).
+- Environment note: mmap model load can livelock on this host (HIP runtime wedge) - run all llama binaries with --no-mmap; 300 MHz sclk pin needs root to unpin.
+
+### Decode-only isolation + fp16-MFMA MMQ verdict (2026-07-25, gfx908)
+
+- fp16-MFMA MMQ (ncols>=48, Q6_K/Q8_0, CDNA1): fully implemented, microbenchmarked, REVERTED - hipBLAS Cijk already runs at 25-35 TFLOPS (68-95% of fp16-MFMA peak at 300 MHz) and the custom path capped at ~18 TFLOPS (occupancy-1 stalls, dequant-in-loader, LDS traffic). Wins only on the anomalous Q6_K attn_qkv [5120,10240]x512 shape (2989 vs 5613 us, ~19% of prefill); no shape-general rule kept.
+- DECODE-ONLY isolation bench (input-len 32, output 100, c=8 x 4 endpoints, MTP2, chunk 2048): agg 164.9 tok/s, per-endpoint 41.3-43.7, TPOT med 160-172ms, TTFT ~1.6-2.2s, 0 failed. Compare vllm per-endpoint ~36 (TP2 = 2 GPUs per endpoint): llama.cpp decode throughput per GPU now EXCEEDS the vllm target. The 1024x100 benchmark gap (agg ~62-65 vs 71.4) is driven by prefill compute (dequant+hipBLAS near-roofline at the pinned 300 MHz) and prefill/decode co-location, not by decode.
+
+### Scheduler/ubatch sweep (2026-07-25, gfx908, c=8 x 4 ep, MTP2)
+
+- BEST CONFIG: -b 4096 -ub 1024 + LLAMA_UX_DYNAMIC_BUDGET=0 + LLAMA_PREFILL_CHUNK=1024: agg 70.6 tok/s (vllm reference 71.4), per-ep 17.3-20.6, TPOT med 301-337ms, TTFT med 6.1-9.3s, 0 failed. The fair-share dynamic budget (default on, branch default) throttles prefill admission and costs ~9% agg on this fixed burst workload; disabling it also cut TTFT from 10-15s to 6-9s.
+- -ub 2048 variant: agg 41.1, 96 failed (compute-buffer/KV pressure at np 8) - do not use.
+- New defaults baked into run_4x_bench.sh (UX_DYNAMIC_BUDGET=0, PREFILL_CHUNK=1024, -b 4096 -ub 1024, all env-overridable).
+- Scoreboard vs vllm target (final_default_095_c8_np32: agg 71.4 over 16 concurrent on 4 GPUs, ~36/ep at c=8): llama.cpp agg 70.6 over 32 concurrent (99% per-GPU), decode-only 164.9 agg / ~42 per ep (exceeds vllm per GPU).

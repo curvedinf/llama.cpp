@@ -402,9 +402,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     const int kbx  = txi / QI8_0;
     const int kqsx = txi % QI8_0;
 
+    // Batch all global loads of this tile into registers before storing to shared
+    // memory (see ggml_cuda_mmq_load_tiles_q6_K for the rationale).
+    constexpr int rows_per_pass = nrows*nwarps;
+    constexpr int npass = I / rows_per_pass;
+    static_assert(I % rows_per_pass == 0, "bad I for Q8_0 tile loader");
+
+    int qs_lo[npass];
+    int qs_hi[npass];
+
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
-        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    for (int p = 0; p < npass; ++p) {
+        int i = p*rows_per_pass + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
         if (fallback) {
             i = min(i, i_max);
@@ -412,12 +421,24 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i*stride + kbx;
 
+        qs_lo[p] = get_int_b2(bxi[0].qs,                   kqsx);
+        qs_hi[p] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+    }
+
+#pragma unroll
+    for (int p = 0; p < npass; ++p) {
+        int i = p*rows_per_pass + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
-        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+        x_qs[i*sram_stride + 0             + txi] = qs_lo[p];
+        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = qs_hi[p];
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(bxi[0].qs,                   kqsx);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = qs_lo[p];
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = qs_hi[p];
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
@@ -876,9 +897,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int nrows = warp_size / threads_per_row;
     const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
 
+    // Batch all global loads of this tile into registers before unpacking/storing to
+    // shared memory. Interleaving the (latency-bound) loads with the LDS stores would
+    // otherwise serialize them on the latency-bound loads.
+    constexpr int rows_per_pass = nrows*nwarps;
+    constexpr int npass = I / rows_per_pass;
+    static_assert(I % rows_per_pass == 0, "bad I for Q6_K tile loader");
+
+    int ql_v[npass];
+    int qh_v[npass];
+
 #pragma unroll
-    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
-        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    for (int p = 0; p < npass; ++p) {
+        int i = p*rows_per_pass + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
         if (fallback) {
             i = min(i, i_max);
@@ -886,11 +917,23 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
         const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + i*stride;
 
-        const int ql = get_int_b2(bxi->ql, txi);
+        ql_v[p] = get_int_b2(bxi->ql, txi);
+        qh_v[p] = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
+    }
+
+#pragma unroll
+    for (int p = 0; p < npass; ++p) {
+        int i = p*rows_per_pass + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const int ql = ql_v[p];
         const int ql0 = (ql >> 0) & 0x0F0F0F0F;
         const int ql1 = (ql >> 4) & 0x0F0F0F0F;
 
-        const int qh = get_int_b2(bxi->qh, (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
+        const int qh = qh_v[p];
         const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
         const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
 

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -251,6 +252,202 @@ public:
 
         for (uint32_t b = free_head; b != (uint32_t) -1 && res < n; b = blocks[b].next) {
             res += block_empty_cells(b, n - res, out);
+        }
+
+        return res;
+    }
+
+    // seq-aligned ("paged") variant of alloc_find() for GPU paged attention (LLAMA_KV_PAGED):
+    //
+    // the token with logical position poss[i] (belonging to sequence seqs[i]) is placed at
+    // cell
+    //
+    //   b*block_size + poss[i] % block_size
+    //
+    // of a block b whose used cells all (a) have positions in the same aligned block_size
+    // range and (b) belong to sequence seqs[i]. this is what the paged-attention block
+    // table requires:
+    //
+    //   cell_of(seq, p) == block_table[seq][p/block_size]*block_size + p%block_size
+    //
+    // constraint (a) keeps every block mapped to a single aligned range; constraint (b)
+    // keeps all cells of one (seq, range) pair in a single block, so the per-sequence
+    // block table is unambiguous. cells shared by multiple sequences (prefix sharing)
+    // satisfy (b) for every member sequence and can therefore be extended by any of them.
+    //
+    // matching partial blocks are drawn first, then free blocks. like alloc_find(), the
+    // block state itself is not modified - that happens in pos_set(). return the number of
+    // indices collected
+    uint32_t alloc_find_seq_aligned(const llama_pos * poss, const llama_seq_id * seqs, uint32_t n, std::vector<uint32_t> & out) const {
+        // true if every used cell of block b belongs to sequence seq_id
+        auto block_owned_by = [&](uint32_t b, llama_seq_id seq_id) {
+            for (uint32_t j = cell_begin(b); j < cell_end(b); ++j) {
+                if (!is_empty(j) && !seq_has(j, seq_id)) {
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
+        // assignments made during this call, since the cell state changes only in pos_set():
+        //   - blk_range[b]: block b (originally free) is reserved for this aligned range
+        //   - blk_seqs[b]:  intersection of the seq sets of the tokens placed in b - a new
+        //                   token can join only if its own sequence is in the intersection
+        //                   (the in-call analogue of constraint (b) above)
+        //   - cell_taken:   individual cells already handed out
+        std::unordered_map<uint32_t, uint32_t>                   blk_range;
+        std::unordered_map<uint32_t, std::vector<llama_seq_id>>  blk_seqs;
+        std::unordered_set<uint32_t>                             cell_taken;
+
+        uint32_t res = 0;
+
+        for (uint32_t i = 0; i < n; ++i) {
+            const llama_pos    p = poss[i];
+            const llama_seq_id s = seqs[i];
+
+            const uint32_t range = (uint32_t) p/block_size;
+            const uint32_t off   = (uint32_t) p%block_size;
+
+            const llama_pos p_min = (llama_pos) (range*block_size);
+            const llama_pos p_max = (llama_pos) (range*block_size + block_size - 1);
+
+            uint32_t b_sel = (uint32_t) -1;
+
+            // pass 0: the aligned cell may already be occupied by the same sequence - e.g.
+            // MTP draft tokens waiting for verification in the shared cells, or positions
+            // re-applied after a rollback. reusing it keeps the sequence in a single block
+            // per aligned range. never reuse cells shared with other sequences - the
+            // caller rewrites the cell (apply_ubatch), which requires single membership
+            for (uint32_t b = lwm; b < hwm; ++b) {
+                if (blocks[b].list == LIST_FREE) {
+                    continue;
+                }
+
+                if (blocks[b].pos_min < p_min || blocks[b].pos_max > p_max) {
+                    continue;
+                }
+
+                const uint32_t c = b*block_size + off;
+
+                if (c < pos.size() && !is_empty(c) && cell_taken.count(c) == 0 &&
+                        seq_count(c) == 1 && seq_get(c) == s) {
+                    b_sel = b;
+                    break;
+                }
+            }
+
+            // pass 1: used blocks covering the same aligned range, owned by this sequence
+            for (uint32_t b = lwm; b < hwm && b_sel == (uint32_t) -1; ++b) {
+                if (blocks[b].list == LIST_FREE) {
+                    continue;
+                }
+
+                if (blocks[b].pos_min < p_min || blocks[b].pos_max > p_max) {
+                    continue;
+                }
+
+                if (!block_owned_by(b, s)) {
+                    continue;
+                }
+
+                const uint32_t c = b*block_size + off;
+
+                if (c >= pos.size() || !is_empty(c) || cell_taken.count(c) != 0) {
+                    continue;
+                }
+
+                b_sel = b;
+                break;
+            }
+
+            // pass 2: free blocks
+            if (b_sel == (uint32_t) -1) {
+                for (uint32_t b = 0; b < blocks.size(); ++b) {
+                    if (blocks[b].list != LIST_FREE) {
+                        continue;
+                    }
+
+                    // a block reserved earlier in this call can only grow within its range
+                    //   and only for sequences that own every cell placed there so far
+                    const auto it = blk_range.find(b);
+                    if (it != blk_range.end()) {
+                        if (it->second != range) {
+                            continue;
+                        }
+
+                        const auto & sb = blk_seqs[b];
+
+                        if (std::find(sb.begin(), sb.end(), s) == sb.end()) {
+                            continue;
+                        }
+                    }
+
+                    const uint32_t c = b*block_size + off;
+
+                    if (c >= pos.size() || cell_taken.count(c) != 0) {
+                        continue;
+                    }
+
+                    b_sel = b;
+                    break;
+                }
+            }
+
+            if (b_sel == (uint32_t) -1) {
+                break;
+            }
+
+            if (blk_range.emplace(b_sel, range).second) {
+                blk_seqs[b_sel] = { s };
+            }
+
+            cell_taken.insert(b_sel*block_size + off);
+
+            out.push_back(b_sel*block_size + off);
+
+            res++;
+        }
+
+        return res;
+    }
+
+    // fill out with the paged-attention block table of the given sequence:
+    //   out[p/block_size] = physical block id of the cell holding position p, -1 elsewhere
+    // only meaningful with seq-aligned allocation (alloc_find_seq_aligned)
+    // return false if the table is ambiguous - i.e. cells of the same aligned range of this
+    // sequence ended up in more than one block (should not happen with the allocation
+    // policy above - treated as an error by the caller)
+    bool seq_block_table(llama_seq_id seq_id, std::vector<int32_t> & out) const {
+        std::fill(out.begin(), out.end(), -1);
+
+        bool res = true;
+
+        for (uint32_t b = lwm; b < hwm; ++b) {
+            if (blocks[b].list == LIST_FREE) {
+                continue;
+            }
+
+            for (uint32_t j = cell_begin(b); j < cell_end(b); ++j) {
+                if (is_empty(j) || !seq_has(j, seq_id)) {
+                    continue;
+                }
+
+                const llama_pos p = pos[j];
+
+                // seq-aligned allocation guarantees that the cell offset matches the position
+                assert((uint32_t) p%block_size == j%block_size);
+
+                const uint32_t lb = (uint32_t) p/block_size;
+
+                if (lb < out.size()) {
+                    if (out[lb] != -1 && out[lb] != (int32_t) b) {
+                        res = false;
+                    }
+
+                    out[lb] = (int32_t) b;
+                }
+            }
         }
 
         return res;

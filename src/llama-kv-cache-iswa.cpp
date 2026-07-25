@@ -107,6 +107,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     // prefix caching is not supported for iSWA caches (SWA blocks expire) - keep it off
     kv_base->prefix_set_enabled(false);
     kv_swa ->prefix_set_enabled(false);
+
+    // paged attention is not wired into the iSWA graph inputs - keep it off
+    kv_base->set_paged(false);
+    kv_swa ->set_paged(false);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {

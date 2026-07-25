@@ -163,20 +163,36 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // Load all A fragments and per-row scales into registers first, then run the MFMA
+    // chain (see ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma for the rationale).
+    constexpr int nsteps = MMQ_TILE_NE_K / QI8_0;
+    tile_A A[nsteps][ntx];
+    float  dA[nsteps][ntx][tile_C::ne];
+
+#pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
         const int k0 = k00 + k01;
-
-        tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            load_ldmatrix(A[k01/QI8_0][n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n*tile_A::I + tile_C::get_i(l);
+                dA[k01/QI8_0][n][l] = x_df[i*sram_stride + k0/QI8_0];
+            }
+        }
+    }
+
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        tile_B B[nsteps];
+
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+            load_ldmatrix(B[k01/QI8_0], y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             float dB;
             const int j = j0 + tile_C::get_j(0);
             if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D4) {
@@ -188,13 +204,11 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
-                mma(C, A[n], B);
+                mma(C, A[k01/QI8_0][n], B[k01/QI8_0]);
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    const float dA = x_df[i*sram_stride + k0/QI8_0];
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) C.x[l] * (dA[k01/QI8_0][n][l] * dB);
                 }
             }
         }
@@ -1038,33 +1052,58 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
-        const int k0 = k00 + k01;
+    // Hoist the per-row scales (x_sc) and block scales (x_df) out of the k loop:
+    // they only depend on the fragment row i, not on k01. This removes ~100 LDS
+    // loads per thread per tile iteration on CDNA (byte-wise scale reads dominate).
+    float df_h[ntx][tile_C::ne];
+    int   sc_h[ntx][tile_C::ne][2];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+            const int i = i0 + n*tile_C::I + tile_C::get_i(l);
+            df_h[n][l]    = x_df[i*sram_stride];
+            sc_h[n][l][0] = x_sc[i*sram_stride + k00/16 + 0];
+            sc_h[n][l][1] = x_sc[i*sram_stride + k00/16 + 1];
+        }
+    }
 
-        tile_A A[ntx];
+    // Load all A fragments for the 8 k-steps into registers first, then run the MFMA
+    // chain. Interleaving ds_read + MFMA (as before) forces a full lgkmcnt(0) drain
+    // before every MFMA, serializing LDS latency with the MFMA pipe.
+    constexpr int nsteps = MMQ_TILE_NE_K / 4;
+    tile_A A[nsteps][ntx];
+
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            load_ldmatrix(A[k01/4][n], x_qs + (i0 + n*tile_A::I)*sram_stride + k00 + k01, sram_stride);
+        }
+    }
+
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        tile_B B[nsteps];
+
+#pragma unroll
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+            load_ldmatrix(B[k01/4], y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-
+        for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
             const int j = j0 + tile_C::get_j(0);
             const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
 
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
-                mma(C, A[n], B);
+                mma(C, A[k01/4][n], B[k01/4]);
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
-                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
-                    const int8_t * sc = (const int8_t *) (x_sc + i*sram_stride + k00/16);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += C.x[l] * sc[k01/4] * x_df[i*sram_stride] * dB;
+                    const int scb = (int8_t) (sc_h[n][l][k01/16] >> (8*(k01/4 % 4)));
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) (C.x[l] * scb) * (df_h[n][l] * dB);
                 }
             }
         }

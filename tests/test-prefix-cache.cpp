@@ -351,12 +351,124 @@ static void test_cells_pin_retention() {
     CHECK(cells.block_ref(b0) == 0);
 }
 
+// paged-mode prefix copy (Phase 2): re-attaching a matched prefix to another sequence is
+// pure bookkeeping - the blocks are shared via the registry pin, no cells are allocated
+// or copied, and both sequences' block tables map the shared ranges to the same blocks
+static void test_paged_reattach_bookkeeping() {
+    fprintf(stderr, "%s\n", __func__);
+
+    llama_prefix_cache reg;
+    llama_kv_cells     cells;
+
+    cells.resize(8*BS);
+
+    const auto prompt = make_tokens(2*BS, 0);
+
+    std::vector<uint64_t> hashes;
+    hash_n_blocks(prompt, 2, &hashes);
+
+    // seq 0 fills the first two blocks with aligned cells
+    {
+        std::vector<llama_pos>    poss(2*BS);
+        std::vector<llama_seq_id> seqs(2*BS, 0);
+
+        for (uint32_t i = 0; i < 2*BS; ++i) {
+            poss[i] = (llama_pos) i;
+        }
+
+        std::vector<uint32_t> idxs;
+
+        CHECK(cells.alloc_find_seq_aligned(poss.data(), seqs.data(), 2*BS, idxs) == 2*BS);
+
+        for (uint32_t i = 0; i < 2*BS; ++i) {
+            cells.pos_set(idxs[i], poss[i]);
+            cells.seq_add(idxs[i], 0);
+        }
+
+        CHECK(idxs[0] == 0 && idxs.back() == 2*BS - 1);
+    }
+
+    // register both blocks as prefix locations (pinned)
+    for (uint32_t b = 0; b < 2; ++b) {
+        const auto res = reg.insert(hashes[b], prompt.data() + b*BS, { 0, b, (llama_pos) (b*BS) });
+        CHECK(res.second);
+
+        cells.block_pin(b);
+    }
+
+    const uint32_t used_before = cells.get_used();
+
+    // seq 1 matches the prefix (registry level)
+    uint64_t handle = 0;
+
+    const uint32_t n_match = reg.match(prompt.data(), 2*BS, false, handle);
+
+    CHECK(n_match == 2*BS);
+    CHECK(handle != 0);
+
+    // re-attach at the cells level (llama_kv_cache::prefix_copy_impl loc_same in paged
+    // mode): bookkeeping only - no allocation, no copies
+    for (uint32_t k = 0; k < 2; ++k) {
+        const auto * e = reg.find(hashes[k]);
+
+        CHECK(e != nullptr && !e->locs.empty());
+
+        const auto & loc = e->locs.front();
+
+        CHECK(loc.stream == 0 && loc.block == k);
+
+        for (uint32_t j = 0; j < BS; ++j) {
+            cells.seq_add(loc.block*BS + j, 1);
+        }
+    }
+
+    // no cells were allocated or copied
+    CHECK(cells.get_used() == used_before);
+
+    // both sequences' block tables map the shared ranges to the same physical blocks
+    {
+        std::vector<int32_t> t0(8, -2), t1(8, -2);
+
+        CHECK(cells.seq_block_table(0, t0));
+        CHECK(cells.seq_block_table(1, t1));
+
+        CHECK(t0[0] == 0 && t0[1] == 1);
+        CHECK(t1[0] == 0 && t1[1] == 1);
+
+        // the cells are shared read-only
+        for (uint32_t j = 0; j < 2*BS; ++j) {
+            CHECK(cells.seq_count(j) == 2);
+        }
+    }
+
+    // unregistering + unpinning keeps the cells alive while seq 1 still uses them
+    reg.release(handle);
+
+    reg.remove_loc({ 0, 0, 0 });
+    reg.remove_loc({ 0, 1, (llama_pos) BS });
+
+    CHECK(!cells.block_unpin(0)); // ref reaches 0, but the cells are not seqless
+    CHECK(!cells.block_unpin(1));
+
+    for (uint32_t j = 0; j < 2*BS; ++j) {
+        CHECK(!cells.is_empty(j));
+        CHECK(cells.seq_has(j, 1));
+    }
+
+    // removing both sequences then frees everything (blocks are unpinned now)
+    cells.seq_rm_range(1, 0, std::numeric_limits<llama_pos>::max());
+    cells.seq_rm_range(0, 0, std::numeric_limits<llama_pos>::max());
+
+    CHECK(cells.get_used() == 0);
+}
+
 int main() {
     test_hash();
     test_registry_match();
     test_registry_evict();
     test_chain();
     test_cells_pin_retention();
+    test_paged_reattach_bookkeeping();
 
     if (n_fail > 0) {
         fprintf(stderr, "FAILED: %d checks failed\n", n_fail);

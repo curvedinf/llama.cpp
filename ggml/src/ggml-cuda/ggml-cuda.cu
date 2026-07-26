@@ -1082,36 +1082,11 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     const ggml_type type = tensors[0]->type;
 
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) {
-        GGML_LOG_DEBUG("%s: internal unsupported: type=%d\n", __func__, (int) type);
         return false;
     }
 
     if (ne == 0) {
         return true;
-    }
-
-    for (size_t i = 0; i < n_backends; ++i) {
-        if (tensors[i] == nullptr) {
-            GGML_LOG_ERROR("%s: internal failed: tensor[%zu] is null\n", __func__, i);
-            return false;
-        }
-        if (ggml_nelements(tensors[i]) != ne || tensors[i]->type != type) {
-            GGML_LOG_ERROR("%s: internal failed: tensor[%zu] ne=%" PRId64 " type=%d expected ne=%" PRId64 " type=%d\n",
-                           __func__, i, ggml_nelements(tensors[i]), (int) tensors[i]->type, ne, (int) type);
-            return false;
-        }
-        if (!ggml_is_contiguously_allocated(tensors[i])) {
-            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] is not contiguously allocated: ne=%" PRId64 " nbytes=%zu packed=%zu type=%d\n",
-                           __func__, i, ne, ggml_nbytes(tensors[i]),
-                           (size_t) ne * ggml_type_size(type) / ggml_blck_size(type), (int) type);
-            return false;
-        }
-        if (((uintptr_t) tensors[i]->data & 0xF) != 0) {
-            GGML_LOG_DEBUG("%s: internal unsupported: tensor[%zu] data pointer is not 16-byte aligned: %p type=%d ne=%" PRId64 "\n",
-                           __func__, i, tensors[i]->data, (int) type, ne);
-            return false;
-        }
-        GGML_ASSERT((ggml_nbytes(tensors[i]) & 0xF) == 0);
     }
 
     return ggml_cuda_ar_allreduce(comm_ctx->ar_pipeline, comm_ctx->backends.data(), tensors);

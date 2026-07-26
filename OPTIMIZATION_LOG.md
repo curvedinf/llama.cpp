@@ -1652,3 +1652,8 @@ Sampling is NOT the bottleneck (3.2 ms).
 - T5 showed sampling is 3.2 ms/step (1 pct of total). Even full elimination saves < 1 pct.
 - Decode (3 forward calls) is 303 ms/step (88 pct) - the real target.
 - T8 deferred: ROI too low given the meta-backend restructure complexity.
+
+### T9: MTP draft on GPU (2026-07-26)
+- Same ROI analysis as T8. Draft sampling is < 2 ms/step.
+- Draft forward calls (GPU compute) are the cost, not sampling.
+- Deferred.

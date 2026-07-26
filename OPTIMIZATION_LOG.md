@@ -1523,3 +1523,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Engine npl8: 149 tok/s. Decode-heavy c8: ~50 tok/s.
 - AR is 24% of GPU time. MMQ Q6_K is 25%. Both at hw limit.
 - Server overhead: CPU sampling + logits readback + batch construction.
+
+### Q6_K MMQ occ4 attempt (2026-07-25)
+
+- 128thr/occ4/I=32: crash (stream_k fixup grid broken). Reverted.
+- Q6_K MMQ stays at 256thr/occ2/I=64 (committed config).

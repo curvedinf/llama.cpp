@@ -1528,3 +1528,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 
 - 128thr/occ4/I=32: crash (stream_k fixup grid broken). Reverted.
 - Q6_K MMQ stays at 256thr/occ2/I=64 (committed config).
+
+### Final engine numbers (2026-07-25)
+
+- npl8: 149.3 tok/s, npl16: 259.8 tok/s
+- All optimizations committed and stable.

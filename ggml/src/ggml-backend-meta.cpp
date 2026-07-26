@@ -521,6 +521,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
+            } else if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                // MIRRORED sources are compatible with any split state (broadcast)
+                continue;
+            } else if (ret.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
                 ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
                 break;

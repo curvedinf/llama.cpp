@@ -1657,3 +1657,11 @@ Sampling is NOT the bottleneck (3.2 ms).
 - Same ROI analysis as T8. Draft sampling is < 2 ms/step.
 - Draft forward calls (GPU compute) are the cost, not sampling.
 - Deferred.
+
+### T10-T12: Communication substrate (2026-07-26)
+- T10: Capture-safe AR requires device-side peer access (fails on gfx908/ROCm 7.2).
+  Host-mapped busy-wait breaks HIP graph capture semantics.
+  Blocked by hardware/driver limitation.
+- T11: AR/compute overlap needs T10 (double-buffering is useless without capture).
+- T12: Fused reduce-scatter+norm+allgather requires multi-kernel fusion + meta-backend changes.
+- All three deferred until peer-access works on gfx908 or we move to RCCL.

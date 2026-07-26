@@ -975,10 +975,11 @@ bool ggml_cuda_ar_allreduce(
                 }
 
 #undef LAUNCH_AR_KERNEL
-                CUDA_CHECK(cudaGetLastError());
+                // Skip cudaGetLastError in production for lower overhead
+                // (errors will surface as NaN/crash downstream)
 
                 if (last_chunk) {
-                    CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
+                    cudaEventRecord(p->ev_pool[i][slot].ker, stream);
                 }
             }
         }

@@ -1320,3 +1320,14 @@ correctness issue above.
 - Bottleneck: serialized CPU sampling (full-vocab argmax x N seqs per step).
 - Ring-allreduce committed (bandwidth-optimal, latency-neutral at current sizes).
 - Next: reduce sampling overhead or implement TP backend sampler properly.
+
+### TP backend sampler investigation (2026-07-25)
+
+- Mirroring output.weight+bias: logits become AXIS_1 split (not AXIS_0).
+  handle_per_row passes, but downstream ops still hit UNKNOWN split state
+  (likely the PAD wrapping logits or sampler graph inputs).
+- Allreduce on last subgraph: split states are cached at init_tensor time,
+  not recomputed post-allreduce. Cannot use this approach.
+- Conclusion: TP backend sampler requires meta-backend architecture changes
+  to support post-allreduce split state updates. Deferred.
+- Current best TP4: 29.5 tok/s (np16, MTP2, CPU sampling).

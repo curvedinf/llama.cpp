@@ -1579,3 +1579,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 ### Parallel set_logits + early backend check (2026-07-25)
 - Decode-heavy c8: 46.0 tok/s (within 44-53 variance band)
 - Committed.
+
+### GPU argmax for TP4 (2026-07-25)
+- Decode-heavy c8: 45.8 tok/s (within variance band)
+- Correct output verified.
+- Committed.

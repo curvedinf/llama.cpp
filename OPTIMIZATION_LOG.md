@@ -1595,3 +1595,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Verify uses n_tok=3, n_seq varies
 - Shape alternation causes cache misses. Intrinsic to MTP design.
 - Committed rs head fix. Debug print reverted.
+
+### T1: Reshape-view keystone - VERIFIED FIXED (2026-07-26)
+- 3 sequential requests: all correct output
+- npl24: 188 tok/s, no crash
+- npl8: 149 tok/s
+- Fix was the lazy-init in graph rebuild (commit 143c57dd3)

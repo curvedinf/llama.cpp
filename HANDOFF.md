@@ -86,3 +86,72 @@ cmake -B build -G Ninja -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx908 -DCMAKE_BUILD_TYPE
 - `ggml/src/ggml-backend-meta.cpp` and `src/llama-model.cpp` - **reverted to upstream** (the corrupting Path B/Path A changes are gone)
 
 The reshape-view fix (delta-net-base.cpp:475 + handle_reshape) is the keystone - fix that and the server items unblock.
+
+# Gap Task List — `concurrency-optimization` @ HEAD `581572b9e` (100 commits ahead)
+
+Respecified after evaluating the 31 commits pushed 2026-07-26 (17:09→19:49 UTC). Supersedes the sequencing in `concurrency-optimization-vs-vllm-gap-analysis.md`.
+
+## What the 31 commits changed (evaluation)
+
+**Landed (code):**
+- **Greedy logits-readback elimination under TP4** (`b9d332787` + `dfac64b92` + `677bb1eba`): GPU argmax populates `sampling.sampled`; `common_sampler_sample` checks backend-sampled token before `set_logits`, skipping the 600KB/seq copy for temp≤0. **Measured gain: none** — 45.8/46.0 tok/s inside the 44–53 variance band (±15% run-to-run). Committed as "algorithmically correct, marginal at c8".
+- **AR hot-path trims** (`98948da56`, `dc90c4c86`): removed `cudaGetLastError` + 512 per-step validation checks. Final engine: npl8 149.3, npl16 259.8 tok/s. AR still 24% of GPU time (129 ARs/forward), "at hw limit".
+- **`handle_generic` MIRRORED broadcast** (`d8a51320c`): enabler for future sampler ops with mixed MIRRORED/split sources.
+- **rs-head `can_reuse` fix** (`75b9fca8e`): correct, but graph reuse still 8/20 — draft/verify shape alternation evicts.
+
+**Failed/reverted (with structural findings):**
+- **TP backend sampler attempt 3**: split states are computed at `init_tensor` (graph build), *before* AR runs → a real TP sampler requires restructuring when `init_tensor` executes. Reverted.
+- **output.weight mirror**: 27.5 tok/s (worse — full-vocab projection replicated per GPU). Reverted.
+- **Q6_K MMQ occ4**: crash, reverted. Graph cache 32: worse. Layer-split: worse than tensor-split.
+
+**Confirmed facts (measurement):**
+- **Server overhead is the dominant gap: engine 6.7 ms/tok vs server 54 ms/tok at c8 → 47 ms/tok orchestration overhead.** At c=1 overhead ≈ 0. Sampling fast-paths didn't dent it → cost is structural (per-slot serialized loop + MTP orchestration), not per-call.
+- **HIP graphs are dead under TP4**: identical on/off — "small per-subgraph graphs, AR invalidates capture".
+- **Chunked prefill doesn't help TP4** (compute-bound, GPU saturated in prefill). FA vec = 2% of step. GDN state cache split = optimal. MTP2 optimal (MTP3 crashes). c8 decode aggregate 110 tok/s @ 85% draft acceptance.
+
+**Untouched:** reshape-view keystone, prefix cache under TP, varlen paged FA (still 2.6× slower, default OFF), dtype program, async scheduler.
+
+---
+
+## P0 — Correctness keystone (still blocks all server-side TP claims)
+
+- [ ] **T1. Fix recurrent-state reshape view under TP** (`delta-net-base.cpp:475` / meta `handle_reshape` nr>1). Recommended: HANDOFF path 2 — store conv state in the 3D layout the GDN kernel consumes, eliminating the reshape. *Accept:* 2nd+ request and npl≥24 produce output identical to single-GPU greedy; formal divergence gate (Phase 0.2) in CI.
+- [ ] **T2. Re-enable prefix cache under TP** (D4: nr>1 gather in `get/set_tensor_async`). *Accept:* no `LLAMA_PREFIX_CACHE_DISABLE=1` needed; measured prefix-hit rate >0 at TP4; correctness gate green.
+- [ ] **T3. Re-verify + fix D1 sustained-burst degradation** (103→77 tok/s, VRAM 7.1→9.6 GB/GPU) after T1; audit graph-cache under TP. *Accept:* 3 consecutive bursts within variance; flat VRAM.
+- [ ] **T4. MTP3 crash.** Draft-count-3 crash is uninvestigated. *Accept:* MTP3 runs or is bounded with an assert explaining the limit.
+
+## P1 — Server step overhead: 47 ms/tok at c8 (the dominant *measured* gap; 7× engine step)
+
+- [ ] **T5. Instrument the server step.** Per-phase timers: batch construction, per-slot sampling loop, draft/verify orchestration, logits readback, HTTP/streaming. Rationale: three sampling fast-paths landed with zero measured gain — the cost is in the loop structure, not the calls. Do not optimize further blind. *Accept:* per-phase ms breakdown published to OPTIMIZATION_LOG at c1/c8/c16.
+- [ ] **T6. Batch the per-slot sampling path.** Single `set_logits` over all outputs; one sampler invocation per step across slots (vLLM's model); collapse draft+verify per-slot round-trips into batch operations. *Accept:* c8 server step ≤ 15 ms/tok (from 54); c8 aggregate ≥ 200 tok/s decode.
+- [ ] **T7. MTP graph-cache thrash.** Draft/verify shape alternation causes 8/20 reuse. Shape-specialized entries keyed on (n_tokens × n_seqs) or reserved dual slots. *Accept:* reuse ≥ 18/20 with MTP2.
+
+## P2 — TP sampler done structurally
+
+- [ ] **T8. Restructure `init_tensor` timing** so split states resolve post-AR (attempt-3 finding); then shard the sampler: per-rank local argmax/top-k over AXIS_1 logits + all-gather of candidates (vLLM-style), covering **non-greedy** params. *Accept:* zero full-vocab readback at TP4 for any sampler config.
+- [ ] **T9. MTP draft sampling on GPU** (D3, depends on T8). *Accept:* the ~1.5–2× decode at C≥8 that HANDOFF estimates; CPU draft path removed under TP.
+
+## P3 — Communication substrate (at hw limit for the current design)
+
+- [ ] **T10. Capture-safe AR.** Replace host-spin/pinned flags with device-memory synchronization (or RCCL under graph capture) so HIP graphs engage under TP. Own finding: "AR invalidates capture" → graphs are currently wasted. *Accept:* `GGML_HIP_GRAPHS=ON` produces a measurable TP4 gain (today: identical).
+- [ ] **T11. AR/compute overlap, retry.** Double-buffered shadow AR — only after T10 and after P1 stops dominating (nothing to hide behind today). *Accept:* ≥10% step-time reduction at c8 decode.
+- [ ] **T12. Fuse reduce-scatter + RMSNorm + allgather** around the post-attention/post-MLP ARs (FlashInfer-style): halves AR bytes, kills a kernel boundary. *Accept:* AR share of step < 15% (from 24%).
+
+## P4 — Paged attention: from tax to feature
+
+- [ ] **T13. Batched varlen paged FA kernel** — one FA node per batch instead of per-seq+concat; hoist table walk. *Accept:* paged ≥ dense decode at c≥8; flip `LLAMA_KV_PAGED` default ON.
+- [ ] **T14. int8-MFMA q8_0 KQ dots in fattn-vec** (HANDOFF 4.4) and paged-prefill path (ncols≥2 without IMA). *Accept:* paged kernel within 20% of vLLM-ROCm FA on same hardware.
+
+## P5 — Compute dtype program (the self-described "FUNDAMENTAL" term)
+
+- [ ] **T15.** GDN recurrent F32→bf16 MFMA (4.1) → conv-state f16 (4.2) → GDN activations f16 (4.5). *Accept:* decode +10% at TP4, generation-identical.
+- [ ] **T16.** hipblasLt int8 GEMM for prefill on gfx908 (4.6, stability unknown — spike first). *Accept:* prefill ≥1.5× or document the hardware ceiling.
+
+## P6 — Topology & scheduling
+
+- [ ] **T17. Poisson-arrival bench** (Phase 6.1/6.2) to make the DP-vs-TP call with data: 4 independent endpoints already match vLLM-tp4 aggregate; TP4's edge is TTFT. *Accept:* routing/topology recommendation in OPTIMIZATION_LOG.
+- [ ] **T18. Async scheduler thread** — re-evaluate after T5's profile; previously deferred as ≤5%, which assumed the wrong overhead model. *Accept:* scheduler CPU time off the GPU critical path.
+
+**Deprioritized by evidence:** chunked-prefill tuning under TP4 (compute-bound, no effect), FA vec kernel micro-opt (2% of step), AR block/stride sweeps (optimal found), graph-cache resizing (8 optimal).
+
+**Critical path:** T1 → T2/T3 → T5 → T6 → T8/T9 → T10 → T11/T12. P4/P5 parallel-safe anytime.

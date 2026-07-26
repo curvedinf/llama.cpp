@@ -1412,3 +1412,9 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Root cause: data dependency forces sequential execution — next subgraph
   reads the tensor that AR just wrote. True overlap needs double-buffering.
 - Reverted. AR stays synchronous on compute stream.
+
+### TP4 rocprof profile (2026-07-25, 4xMI100 TP4, npl8 tg32)
+
+Total: 5700ms. Top: Q6_K MMQ 1424ms(25%), AR 1386ms(24%), Q8_0 MMQ 449ms(8%),
+mmvf 354ms(6%), GDN 336ms(6%), FA 121ms(2%). AR is 82.1us avg x 16896 calls.
+AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev).

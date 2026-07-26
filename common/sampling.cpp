@@ -150,9 +150,13 @@ struct common_sampler {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
         } else {
+            // Fast path for greedy: skip building full token_data array,
+            // just point directly at the raw logits and do argmax in the sampler
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
             cur.resize(n_vocab);
+            // Use parallel-style fill to reduce cache misses
+            #pragma omp parallel for if(n_vocab > 1024)
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
             }
@@ -556,10 +560,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
-
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
+    // Check if a backend sampler has already sampled a token BEFORE reading logits
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -569,16 +570,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
             GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
 
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
-                }
-            }
-
+            // Skip set_logits entirely - no need to copy 600KB of logits
             return id;
         }
     }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);

@@ -1306,3 +1306,10 @@ correctness issue above.
 - Bottleneck: CPU sampling (full-vocab argmax x 8 seqs/step) + graph rebuild.
 - TP backend sampler (LLAMA_TP_BACKEND_SAMPLER=1) crashes: needs all-gather
   of AXIS_0-split logits before TOP_K; meta backend can't do this yet.
+
+### TP4 output.weight mirror attempt (2026-07-25)
+
+- Mirrored output.weight + output.bias to enable TP backend sampler.
+- Crashes: sampler graph creates input tensors not recognized by get_split_state.
+- Reverted. CPU sampling remains the path under TP4.
+- np16 MTP2 confirmed: 29.5 tok/s, 0 fail, TPOT 190ms.

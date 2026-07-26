@@ -1611,3 +1611,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Burst 1: 47.4, Burst 2: 52.1, Burst 3: 55.6 tok/s (improving, no degradation)
 - VRAM flat: ~10.1 GB/GPU across all 4 GPUs
 - D1 degradation was caused by the reshape corruption (now fixed by T1)
+
+### T4: MTP3 crash - RESOLVED (2026-07-26)
+- MTP3 runs without crash (was caused by old reshape-view bug, fixed in T1)
+- Draft acceptance 23% (6/26), generation correct
+- MTP2 remains optimal (85 0x0p+0cceptance)

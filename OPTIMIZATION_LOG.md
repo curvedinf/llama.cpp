@@ -1431,3 +1431,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - np32: 30.1 tok/s (0 fail, TPOT 203ms, TTFT 5.4s)
 - np16: 29.5 tok/s (0 fail, TPOT 191ms, TTFT 5.9s)  
 - Marginal improvement. np32 slightly better.
+
+### TP4 prefill + AR threshold tuning (2026-07-25)
+
+- pp2048 default(1MB): 400, threshold=0: 375. Copy-engine better for prefill.
+- Decode npl8 threshold=2MB: 148.9 (same as default). No change.
+- Engine at hw limit. Server bottleneck is prefill+decode interference.

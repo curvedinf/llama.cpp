@@ -1457,3 +1457,10 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
   BEFORE graph_compute runs. AR hasn't happened yet. Too late.
 - Reverted. TP backend sampler requires computing split states AFTER
   AR completes, which means restructuring when init_tensor runs.
+
+### output.weight mirror + handle_generic fix (2026-07-25)
+
+- Mirrored output.weight+bias: 27.5 tok/s (worse - extra compute from full-vocab projection on each GPU)
+- handle_generic: MIRRORED sources now broadcast (compatible with any split state) - committed
+- TP backend sampler still crashes on sampler graph ops with AXIS_1 logits
+- Reverted output mirror, kept handle_generic fix

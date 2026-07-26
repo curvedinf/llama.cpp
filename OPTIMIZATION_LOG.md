@@ -1509,3 +1509,10 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - AR buffer 2MB: no change (decode fits in 1MB)
 - f16 KV cache: no prefill change
 - Tensor split confirmed optimal for compute-bound decode.
+
+### FA profiling + GDN cache + AR count analysis (2026-07-25)
+
+- FA vec: 59.3us avg, 121ms total (2% of step). Not a bottleneck.
+- GDN state cache: correctly split on AXIS_0, per-head independent. Optimal.
+- AR count: 129 per trunk forward (65 layers x 2). Intrinsic to architecture.
+- Next: batch AR calls or reduce per-call overhead.

@@ -1606,3 +1606,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - No crash, no assert, 0 failures
 - Decode-heavy c8: 47.2 tok/s (within variance band)
 - LLAMA_PREFIX_CACHE_DISABLE removed from run_tp4_bench.sh
+
+### T3: Sustained burst degradation - RESOLVED (2026-07-26)
+- Burst 1: 47.4, Burst 2: 52.1, Burst 3: 55.6 tok/s (improving, no degradation)
+- VRAM flat: ~10.1 GB/GPU across all 4 GPUs
+- D1 degradation was caused by the reshape corruption (now fixed by T1)

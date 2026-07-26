@@ -1671,3 +1671,11 @@ Sampling is NOT the bottleneck (3.2 ms).
 - Batched varlen paged FA would save the concat nodes but FA itself is tiny.
 - int8-MFMA q8_0 KQ dot in fattn-vec is a kernel optimization on a 2 pct cost.
 - Both deferred: ROI too low (FA is not the bottleneck).
+
+### T15-T16: Dtype program (2026-07-26)
+- T15: GDN F32->bf16 MFMA. GDN is 6 pct of step (336 ms). 50 pct improvement = 3 pct step gain.
+  Requires full kernel rewrite (s_shard float->bf16, MFMA instructions, precision validation).
+  Deferred: high complexity, moderate ROI.
+- T16: hipblasLt int8 GEMM for prefill. Prefill is compute-bound at ~400 tok/s.
+  Stability unknown on gfx908. Requires spike test.
+  Deferred: needs standalone hipblasLt validation first.

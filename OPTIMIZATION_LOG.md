@@ -1443,3 +1443,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - ub2048: 30.1 tok/s, TPOT 203ms, TTFT 5.4s
 - ub512: 25.1 tok/s, TPOT 241ms, TTFT 7.9s (worse — smaller prefill chunks hurt)
 - ub2048 is optimal for TP4 prefill.
+
+### Sarathi chunked prefill under TP4 (2026-07-25)
+
+- DYNAMIC_BUDGET=1, PREFILL_CHUNK=512, MIN_CHUNK=128: 29.1 tok/s (same as default)
+- Chunked prefill doesn't help TP4 (compute-bound, GPU fully utilized during prefill).
+- Best TP4 c=8 1024x100 remains ~30 tok/s.

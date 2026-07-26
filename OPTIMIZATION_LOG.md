@@ -1632,3 +1632,11 @@ Per-step timers at c=8 MTP2:
 - t_sampl: 3.2 ms (greedy argmax only)
 Total step: ~344 ms. Decode dominates (88 pct).
 Sampling is NOT the bottleneck (3.2 ms).
+
+### T6: Batch sampling analysis (2026-07-26)
+- Sampling is 3.2 ms/step (1 pct). Batching it saves < 3 ms.
+- Decode is 303 ms/step (88 pct) = 3 forward calls for MTP2.
+- MTP orchestration (pre_decode) is 24.6 ms (7 pct).
+- Conclusion: structural cost. Cannot reduce without MTP architectural change
+  (e.g. single-call multi-token draft, which is sequential by design).
+- T6 acceptance criterion (15 ms/tok) requires eliminating MTP overhead entirely.

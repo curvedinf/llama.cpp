@@ -1449,3 +1449,11 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - DYNAMIC_BUDGET=1, PREFILL_CHUNK=512, MIN_CHUNK=128: 29.1 tok/s (same as default)
 - Chunked prefill doesn't help TP4 (compute-bound, GPU fully utilized during prefill).
 - Best TP4 c=8 1024x100 remains ~30 tok/s.
+
+### TP backend sampler attempt 3 (2026-07-25)
+
+- Global ar_reduced set populated during graph_compute.
+- Failed: split states are computed at init_tensor time (graph build),
+  BEFORE graph_compute runs. AR hasn't happened yet. Too late.
+- Reverted. TP backend sampler requires computing split states AFTER
+  AR completes, which means restructuring when init_tensor runs.

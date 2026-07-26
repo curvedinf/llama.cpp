@@ -1575,3 +1575,7 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - 8 slots x 100 tok: 110 tok/s aggregate decode
 - Per-slot: 71-86 ms/tok, draft acc 85%
 - Greedy fast-path confirmed active.
+
+### Parallel set_logits + early backend check (2026-07-25)
+- Decode-heavy c8: 46.0 tok/s (within 44-53 variance band)
+- Committed.

@@ -1679,3 +1679,13 @@ Sampling is NOT the bottleneck (3.2 ms).
 - T16: hipblasLt int8 GEMM for prefill. Prefill is compute-bound at ~400 tok/s.
   Stability unknown on gfx908. Requires spike test.
   Deferred: needs standalone hipblasLt validation first.
+
+### T17: Poisson-arrival bench (2026-07-26)
+Poisson rate=2, c=8, 1 repeat:
+- agg_out: 1.6 tok/s (low - rate=2 underutilizes server)
+- TTFT med: 2376 ms, TTFT max: 3135 ms
+- ms/step: 1262
+- busy: 4.0 (out of 8 slots)
+Rate=2 is too low for TP4 (server idle most of the time). Burst mode is the
+right benchmark for throughput; Poisson is for TTFT/QoS analysis.
+TP4 recommendation: use burst mode for throughput bench, Poisson for latency SLO.

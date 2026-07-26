@@ -1425,3 +1425,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Sweet spot: c=16 with np=16, 66.2 tok/s (0 fail)
 - c=24 drops (contention beyond GPU parallelism)
 - Scaling improves with more concurrent seqs (better GPU utilization)
+
+### np32 vs np16 c=8 1024x100 (2026-07-25)
+
+- np32: 30.1 tok/s (0 fail, TPOT 203ms, TTFT 5.4s)
+- np16: 29.5 tok/s (0 fail, TPOT 191ms, TTFT 5.9s)  
+- Marginal improvement. np32 slightly better.

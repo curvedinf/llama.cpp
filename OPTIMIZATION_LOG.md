@@ -1689,3 +1689,11 @@ Poisson rate=2, c=8, 1 repeat:
 Rate=2 is too low for TP4 (server idle most of the time). Burst mode is the
 right benchmark for throughput; Poisson is for TTFT/QoS analysis.
 TP4 recommendation: use burst mode for throughput bench, Poisson for latency SLO.
+
+### T18: Async scheduler evaluation (2026-07-26)
+- Pipeline parallelism requires SPLIT_MODE_LAYER (we use TENSOR) -> disabled.
+- Server update_slots is single-threaded: pre_decode -> decode -> post_decode -> next.
+- Overlap opportunity: pre_decode(N+1) concurrent with decode(N) = saves 24.6 ms/step (7 pct).
+- Requires server loop restructure (producer-consumer or coroutine).
+- Acceptance criterion: scheduler CPU time off GPU critical path.
+- Deferred: 7 pct gain for significant refactor complexity.

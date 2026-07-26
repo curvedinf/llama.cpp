@@ -1501,3 +1501,11 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - 1024x100 c8: 30.7 tok/s (baseline 30.1, within variance)
 - Greedy fast-path committed. Algorithmically correct, marginal impact
   at c8 (dominant cost is GPU compute, not sampling).
+
+### Layer split vs tensor split + buffer size (2026-07-25)
+
+- Layer split 4-GPU: pp512=345, tg64=10.4 (worse than tensor split)
+- Tensor split: pp512=347, tg64=10.9
+- AR buffer 2MB: no change (decode fits in 1MB)
+- f16 KV cache: no prefill change
+- Tensor split confirmed optimal for compute-bound decode.

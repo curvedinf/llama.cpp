@@ -1339,3 +1339,13 @@ correctness issue above.
 - nospec is 31% faster aggregate. MTP overhead > acceptance benefit under TP4.
 - Reason: draft model adds 2 extra decode steps per verify, each with allreduce.
 - Decision: keep MTP2 for correctness/UX but optimize draft model path.
+
+### Engine TP4 scaling + allreduce analysis (2026-07-25)
+
+- Engine npl8: 149, npl16: 253.5 tok/s (scales well)
+- Server c=1 nospec: 32 tok/s, c=8 nospec: 38.7, c=8 MTP2: 29.5
+- Bottleneck: full-vocab logits readback (15MB/step) + CPU argmax (no TP backend sampler)
+- MTP costs 30% throughput under TP4 (draft model also needs allreduce)
+- Allreduce kernel: 81.6us avg, host-mapped pinned mem path. Copy-engine path
+  via hipMemcpyPeerAsync is latency-equivalent at current tensor sizes.
+- Ring-allreduce committed but latency-neutral (6 sequential steps vs 3 parallel).

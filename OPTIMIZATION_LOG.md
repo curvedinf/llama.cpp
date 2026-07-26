@@ -1539,3 +1539,10 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - With/without GGML_CUDA_DISABLE_GRAPHS: identical performance (tg16=10.7)
 - HIP graphs not helping under TP4 (small per-subgraph graphs, AR invalidates capture)
 - AR/kernel/MMQ all at hw limit. System is optimized.
+
+### MTP draft count sweep (2026-07-25)
+
+- MTP1: 46.2 tok/s decode-heavy c8
+- MTP2: ~50 tok/s
+- MTP3: crash
+- MTP2 optimal.

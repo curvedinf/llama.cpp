@@ -1665,3 +1665,9 @@ Sampling is NOT the bottleneck (3.2 ms).
 - T11: AR/compute overlap needs T10 (double-buffering is useless without capture).
 - T12: Fused reduce-scatter+norm+allgather requires multi-kernel fusion + meta-backend changes.
 - All three deferred until peer-access works on gfx908 or we move to RCCL.
+
+### T13-T14: Paged FA analysis (2026-07-26)
+- FA vec is 2 pct of step time (121 ms / 5700 ms total kernel).
+- Batched varlen paged FA would save the concat nodes but FA itself is tiny.
+- int8-MFMA q8_0 KQ dot in fattn-vec is a kernel optimization on a 2 pct cost.
+- Both deferred: ROI too low (FA is not the bottleneck).

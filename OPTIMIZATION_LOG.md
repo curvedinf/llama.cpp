@@ -1470,3 +1470,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - 100 tok output: 30.1 tok/s, TPOT 203ms, TTFT 5.4s
 - 200 tok output: 33.1 tok/s, TPOT 168ms, TTFT 7.1s
 - Longer output amortizes prefill cost better.
+
+### TP4 decode rate analysis (2026-07-25)
+
+- 8x short prompts, 200 tok: per-slot 14.3 tok/s = 114 tok/s aggregate decode
+- Bench metric includes prefill: 33.1 tok/s (prefill is ~30% of total time)
+- Decode throughput is excellent; bench metric penalized by prefill cost.

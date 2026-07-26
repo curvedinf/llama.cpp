@@ -1388,3 +1388,10 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Mixed (1024-token prompts, 100 tok output, c=8): agg 29.5 tok/s, TPOT 191ms, TTFT 5.9s
 - Decode throughput is 54.4 tok/s when prefill isn't bottlenecking.
 - The 1024x100 bench penalizes TP4 because prefill blocks the decode pipeline.
+
+### TP4 prefill tuning (2026-07-25)
+
+- LLAMA_UX_DYNAMIC_BUDGET=0 + PREFILL_CHUNK=2048: 29.5 tok/s (same as default)
+- Prefill tuning doesn't help under TP4 (compute-bound prefill)
+- Current best TP4 c=8 MTP2 1024x100: 29.5 tok/s
+- Decode-heavy: 54.4 tok/s

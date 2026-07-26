@@ -1683,12 +1683,18 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // Multi-segment split (e.g. recurrent state): delegate to the buffer-level handler
+        // which supports multi-segment scatter/gather.
+        ggml_backend_meta_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1728,12 +1734,18 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // Multi-segment split (e.g. recurrent state): delegate to the buffer-level handler
+        // which supports multi-segment scatter/gather.
+        ggml_backend_meta_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
+        return;
+    }
+
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1821,6 +1833,41 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
+
+        // The scheduler doesn't call init_tensor for view tensors that inherit their
+        // parent's buffer. Pre-initialize any meta-buffer graph tensors that are not
+        // yet in a simple_tensor_container so the per-device copies exist at dispatch.
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (!ggml_backend_buffer_is_meta(node->buffer)) {
+                continue;
+            }
+            if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                continue;
+            }
+            // Check if the node or any of its sources are missing from all containers
+            bool needs_init = false;
+            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) node->buffer->context;
+            if (!buf_ctx->stc_static.simple_tensors.count(node) &&
+                !buf_ctx->stc_compute[0].simple_tensors.count(node) &&
+                !buf_ctx->stc_compute[1].simple_tensors.count(node)) {
+                needs_init = true;
+            }
+            if (needs_init) {
+                // Initialize sources first so split_state can be computed
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (node->src[s] && ggml_backend_buffer_is_meta(node->src[s]->buffer)) {
+                        ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) node->src[s]->buffer->context;
+                        if (!sbuf_ctx->stc_static.simple_tensors.count(node->src[s]) &&
+                            !sbuf_ctx->stc_compute[0].simple_tensors.count(node->src[s]) &&
+                            !sbuf_ctx->stc_compute[1].simple_tensors.count(node->src[s])) {
+                            ggml_backend_meta_buffer_init_tensor(node->src[s]->buffer, node->src[s]);
+                        }
+                    }
+                }
+                ggml_backend_meta_buffer_init_tensor(node->buffer, node);
+            }
+        }
 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];

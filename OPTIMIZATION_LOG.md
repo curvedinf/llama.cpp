@@ -1481,3 +1481,11 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 
 - LLAMA_GRAPH_CACHE_SIZE=32: decode-heavy c8 = 44.2 tok/s (was 52.6 with default 8)
 - Worse! Larger cache = more compile/rebuild overhead. Default 8 is optimal.
+
+### Greedy fast-path for temp=0 (2026-07-25)
+
+- Skip top_k/top_p/dist chain for temp<=0 requests, use greedy (argmax only)
+- Decode-heavy c8: 44.8 tok/s (was 52.6 without) -- WORSE!
+- The greedy sampler bypasses backend_apply, so backend sampling check fails
+  differently. Need to verify: the dist sampler was needed for the backend
+  init path. Reverting.

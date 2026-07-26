@@ -1555,3 +1555,7 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 ### TP4 stable (2026-07-25)
 - c8 1024x100: 29.1, 0 fail
 - Engine npl8: 149.3
+
+### AR arrival stride sweep (2026-07-25)
+- stride 16: 149.1, stride 64: 149.3
+- No difference. 64 kept.

@@ -1395,3 +1395,12 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Prefill tuning doesn't help under TP4 (compute-bound prefill)
 - Current best TP4 c=8 MTP2 1024x100: 29.5 tok/s
 - Decode-heavy: 54.4 tok/s
+
+### Subgraph analysis (2026-07-25)
+
+- Trunk: 129 subgraphs (65 layers × 2 AR boundaries each). Cannot combine
+  attn_output + ffn_down ARs because FFN needs the reduced attn output first.
+- MTP draft graph: 3 subgraphs (1 layer × 2 + output). Very cheap.
+- Per decode step: ~128 trunk ARs × ~86us = ~11ms AR time. Engine npl8 total
+  is 6.7ms/tok, so AR is 2x the compute. Fundamental, not fixable without
+  algorithmic change (e.g. pipeline allreduce with next layer's compute).

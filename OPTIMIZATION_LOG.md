@@ -1647,3 +1647,8 @@ Sampling is NOT the bottleneck (3.2 ms).
 - 40pct reuse is because of warmup/prefill misses, not eviction.
 - T7 acceptance (18/20 reuse) achievable only if prefill shape == decode shape.
 - No code change needed. Analysis complete.
+
+### T8: TP sampler restructure (2026-07-26)
+- T5 showed sampling is 3.2 ms/step (1 pct of total). Even full elimination saves < 1 pct.
+- Decode (3 forward calls) is 303 ms/step (88 pct) - the real target.
+- T8 deferred: ROI too low given the meta-backend restructure complexity.

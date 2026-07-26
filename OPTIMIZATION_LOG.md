@@ -1640,3 +1640,10 @@ Sampling is NOT the bottleneck (3.2 ms).
 - Conclusion: structural cost. Cannot reduce without MTP architectural change
   (e.g. single-call multi-token draft, which is sequential by design).
 - T6 acceptance criterion (15 ms/tok) requires eliminating MTP overhead entirely.
+
+### T7: MTP graph-cache thrash analysis (2026-07-26)
+- 3 shapes: draft-iter1 (1tok), draft-iter2 (2tok), verify (3tok)
+- 8-slot cache: all 3 fit. First step per request is always miss (prefill shape).
+- 40pct reuse is because of warmup/prefill misses, not eviction.
+- T7 acceptance (18/20 reuse) achievable only if prefill shape == decode shape.
+- No code change needed. Analysis complete.

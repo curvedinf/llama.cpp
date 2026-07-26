@@ -1546,3 +1546,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - MTP2: ~50 tok/s
 - MTP3: crash
 - MTP2 optimal.
+
+### AR kernel blocks sweep (2026-07-25)
+
+- 4 blocks: 147.8, 8: 149.3, 16: 146.9
+- 8 is optimal.

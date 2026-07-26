@@ -1533,3 +1533,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 
 - npl8: 149.3 tok/s, npl16: 259.8 tok/s
 - All optimizations committed and stable.
+
+### HIP graph capture analysis (2026-07-25)
+
+- With/without GGML_CUDA_DISABLE_GRAPHS: identical performance (tg16=10.7)
+- HIP graphs not helping under TP4 (small per-subgraph graphs, AR invalidates capture)
+- AR/kernel/MMQ all at hw limit. System is optimized.

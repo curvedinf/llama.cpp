@@ -1296,3 +1296,13 @@ correctness issue above.
 - Fix: assert block table src[5] is MIRRORED in handle_flash_attn_ext (meta-backend).
 - Paged on/off identical engine npl8: 149.6 tok/s.
 - TP4 c=8 server bench next (need run_tp4_bench.sh with paged on).
+
+### TP4 server tuning sweep (2026-07-25)
+
+- np8 MTP2: 23.5 tok/s (1 fail), TPOT 224ms
+- np8 nospec: 11.6 tok/s (4 fail), TPOT 4538ms (CPU sampling serialization)
+- np16 MTP2: 29.0 tok/s (0 fail), TPOT 229ms, TTFT 5.3s
+- Engine npl8: 149 tok/s. Server overhead = 5-7x engine time.
+- Bottleneck: CPU sampling (full-vocab argmax x 8 seqs/step) + graph rebuild.
+- TP backend sampler (LLAMA_TP_BACKEND_SAMPLER=1) crashes: needs all-gather
+  of AXIS_0-split logits before TOP_K; meta backend can't do this yet.

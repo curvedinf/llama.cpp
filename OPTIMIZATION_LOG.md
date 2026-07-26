@@ -1584,3 +1584,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Decode-heavy c8: 45.8 tok/s (within variance band)
 - Correct output verified.
 - Committed.
+
+### Graph reuse: rs head fix (2026-07-25)
+- Removed head/rs_z/direct from can_reuse (data inputs)
+- Graph reuse still 8/20 (draft vs verify shape alternation causes eviction)
+- Committed.

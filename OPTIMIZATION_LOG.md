@@ -1437,3 +1437,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - pp2048 default(1MB): 400, threshold=0: 375. Copy-engine better for prefill.
 - Decode npl8 threshold=2MB: 148.9 (same as default). No change.
 - Engine at hw limit. Server bottleneck is prefill+decode interference.
+
+### ub512 vs ub2048 c=8 1024x100 (2026-07-25)
+
+- ub2048: 30.1 tok/s, TPOT 203ms, TTFT 5.4s
+- ub512: 25.1 tok/s, TPOT 241ms, TTFT 7.9s (worse — smaller prefill chunks hurt)
+- ub2048 is optimal for TP4 prefill.

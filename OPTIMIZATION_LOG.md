@@ -1364,3 +1364,12 @@ Engine npl8: 149, npl16: 253.5 tok/s.
 Server overhead: 5-7x engine time. Root cause: CPU sampling (full-vocab readback + argmax, no TP backend sampler).
 Committed: in-house allreduce (host-mapped kernel + ring copy-engine), meta-backend reshape fix, paged attention under TP4.
 Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce split state updates).
+
+### Server step analysis (2026-07-25)
+
+- MTP single: 43 tok/s (23 ms/tok, 1.86 tokens/step)
+- Nospec single: 32.4 tok/s (31 ms/tok)
+- Engine npl8: 149 tok/s (6.7 ms/tok)
+- Server c=8 MTP: 29.5 tok/s (~50 ms/step, 8 seqs)
+- Overhead at c=8: ~30 ms unexplained beyond GPU+sampling
+- MTP is worth it (per-token faster despite draft overhead)

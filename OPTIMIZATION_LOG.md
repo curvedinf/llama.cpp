@@ -1559,3 +1559,6 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 ### AR arrival stride sweep (2026-07-25)
 - stride 16: 149.1, stride 64: 149.3
 - No difference. 64 kept.
+
+### Step overhead (2026-07-25)
+- Engine 6.7ms/tok, server c8 54ms/tok, overhead 47ms.

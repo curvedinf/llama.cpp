@@ -1516,3 +1516,10 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - GDN state cache: correctly split on AXIS_0, per-head independent. Optimal.
 - AR count: 129 per trunk forward (65 layers x 2). Intrinsic to architecture.
 - Next: batch AR calls or reduce per-call overhead.
+
+### TP4 c=8 1024x100 current best (2026-07-25)
+
+- 29.1 tok/s, 0 fail, TPOT 215ms, TTFT 5.8s
+- Engine npl8: 149 tok/s. Decode-heavy c8: ~50 tok/s.
+- AR is 24% of GPU time. MMQ Q6_K is 25%. Both at hw limit.
+- Server overhead: CPU sampling + logits readback + batch construction.

@@ -1356,3 +1356,11 @@ correctness issue above.
 - Result: 29.2 tok/s (no improvement). CPU sampler still reads full logits
   because non-greedy chain needs them. Argmax overhead adds latency.
 - Reverted. Need full TP backend sampler to eliminate logits readback.
+
+### TP4 status summary (2026-07-25)
+
+Current TP4 best: 30.7 tok/s c=8 MTP2 (np16, 0 fail, TPOT 191ms).
+Engine npl8: 149, npl16: 253.5 tok/s.
+Server overhead: 5-7x engine time. Root cause: CPU sampling (full-vocab readback + argmax, no TP backend sampler).
+Committed: in-house allreduce (host-mapped kernel + ring copy-engine), meta-backend reshape fix, paged attention under TP4.
+Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce split state updates).

@@ -786,3 +786,513 @@ All numbers above are at the pinned 300 MHz.
 - -ub 2048 variant: agg 41.1, 96 failed (compute-buffer/KV pressure at np 8) - do not use.
 - New defaults baked into run_4x_bench.sh (UX_DYNAMIC_BUDGET=0, PREFILL_CHUNK=1024, -b 4096 -ub 1024, all env-overridable).
 - Scoreboard vs vllm target (final_default_095_c8_np32: agg 71.4 over 16 concurrent on 4 GPUs, ~36/ep at c=8): llama.cpp agg 70.6 over 32 concurrent (99% per-GPU), decode-only 164.9 agg / ~42 per ep (exceeds vllm per GPU).
+
+### vLLM baseline correction + prefill-isolation bench (2026-07-25, gfx908)
+
+CORRECTION: the prior "vLLM parity" claim was against the wrong baseline.
+`final_default_095_c8_np32` (71.4 tok/s) is a tp2-pairs config (2 endpoints x
+2 GPUs). vLLM's actual default serve script
+(../vllm-gfx908/scripts/serve_direwolf_qwen36.sh) is `--tensor-parallel-size 4`
+- a SINGLE endpoint across all 4 MI100s (max-num-seqs 8, max-model-len 65536,
+gpu-mem-util 0.95, kv int8, MTP num_speculative_tokens=2, GPTQ-8bit model).
+Reported perf at the pinned 300 MHz sclk: ~1500 prefill / ~150 decode tok/s.
+Topology mismatch: vLLM tp4 splits each matmul across 4 cooperating GPUs
+(all-reduce/layer); llama.cpp runs 4 independent single-GPU endpoints.
+
+Engine-level prefill isolation (llama-batched-bench, --no-mmap, -ngl 99, -fa on,
+-ctk/-ctv q8_0, --kv-unified, -c 16384 -b 4096 -ub 1024, Q6_K_XL 27B, 300 MHz):
+
+| GPU | npl | PP=512 | PP=1024 | PP=2048 | PP=4096 |
+|-----|-----|--------|---------|---------|---------|
+| 0 (solo)    | 8 | 388 | 374 | -   | -   |
+| 2 (conc.)   | 8 | 353 | 339 | -   | -   |
+| 1 (conc.)   | 2 | -   | 412 | 406 | 391 |
+
+Per-GPU S_PP at the workload point (1024 x c=8): 339-374 tok/s. Larger/contiguous
+prefill (npl=2): 391-412 tok/s. 4-endpoint aggregate prefill estimate:
+4 x 339..374 = 1356..1496 tok/s = ~90-100% of vLLM tp4's ~1500. DECODE is
+already ahead (per-GPU S_TG 41-58 at c=8 -> agg ~170-180 vs vLLM ~150).
+
+CONCLUSION: the prefill gap is CLOSED at the engine level (kernels near-roofline
+at 300 MHz, as the prefill-matmul investigation already showed). The mixed
+1024x100 serving gap (agg 70.6) is therefore NOT a prefill-compute gap - it is
+the server/scheduler overhead (~90 ms/step noted earlier) + prefill/decode
+co-location + TTFT plumbing between the engine and the wire. Next optimization
+focus should move off "prefill kernels" and onto the serving overhead / async
+scheduler (roadmap item 2).
+
+Notes: watchdog total cap must be multi-GPU-aware - the single-pool 32 GB total
+cap killed a 2nd concurrent 26 GB model load (49 GB summed > 32 GB); raised
+TOTAL_CAP_MB to 120000, per-process cap stays 31000. All 4 MI100s still pinned
+at 300 MHz sclk (needs root) - biggest remaining lever for both stacks.
+
+### Server step-overhead profile (2026-07-25, gfx908, single endpoint, GPU0)
+
+CORRECTS the earlier "~90 ms/step beyond engine time" intuition. Profiled one
+endpoint (best config: -c 16384 -np 8 -b 4096 -ub 1024, MTP2, Q8_0, FA on,
+LLAMA_PREFILL_CHUNK=1024, --no-mmap) under a hard burst of 8 concurrent
+/completion requests (~931-tok prompt, 100 out) using each slot's final
+`timings` object (per-slot reliable; /metrics double-counts co-located steps).
+
+Result (8-slot burst, wall 37.1 s, agg output 21.6 tok/s):
+- queue_ms         = 96 ms  (0% of TTFT)  <- scheduler wait is NEGLIGIBLE
+- prompt_ms (avg)  = 19100 ms (100% of TTFT) <- TTFT is entirely prefill compute
+- decode TPOT      = 161 ms  (== decode-only ceiling 160-172 ms) <- NO decode overhead
+- MTP              = 84% accept, draft_n ~73/100 <- working well
+- n_tokens_max     = 1340  (~1 prefill chunk 1024 + decode/drafts; prefill is NOT
+  coalesced across slots into a giant ubatch - but that would not raise thruput
+  at fixed ub=1024 anyway)
+- aggregate prefill = 8x931 tok / ~19 s = ~390 tok/s  (== engine ceiling 374)
+
+CONCLUSION: there is NO meaningful server/scheduler overhead. The engine is at
+its compute ceiling in BOTH prefill (~390 tok/s agg) and decode (TPOT 161 ms =
+ceiling), the scheduler queue adds <100 ms, and MTP acceptance is high. The
+"gap" to vLLM tp4 (~1500 prefill / ~150 decode) is therefore NOT overhead:
+- Aggregate prefill 4x390 ~= 1560 ~= vLLM's ~1500 (already at parity).
+- Decode 4x~42 ~= 170 > vLLM's ~150 (already ahead).
+- The only real difference is TTFT under burst (a latency metric): vLLM tp4
+  splits EACH prompt's prefill across 4 GPUs (per-prompt 4x faster -> low TTFT),
+  whereas llama.cpp's 4 independent endpoints each prefill their own prompts
+  alone, so the last slot in a burst waits ~ (total burst tokens / agg rate).
+  This is the tp4 vs 4-independent-endpoints topology difference, not waste.
+
+Implication: the async-scheduler / server-overhead optimization direction
+(roadmap #2) has little to gain here - the GPU is already compute-bound at the
+105 W power cap. Levers that remain: (a) tensor parallelism if per-request TTFT
+must match vLLM (roadmap deviation - each prompt's prefill spans all 4 GPUs);
+(b) prefix-cache hit-rate for shared prompts; (c) raising the 105 W power cap
+(needs root) - the single biggest raw lever for both stacks. Reaffirms the
+prefill-isolation finding: kernels are near-roofline; stop tuning kernels.
+
+Profiler: /tmp/opencode/profile_overhead.py (per-slot timings decomposition).
+Watchdog note: do NOT run vram-watchdog on the MI100 box - it is headless (no
+GDM to crash) and the 20/31 GB cap just kills legitimate 32.5 GB loads. The
+real run_4x_bench.sh runs uncapped and fits (~32.5 GB / 33.5 GB card).
+
+## PIVOT: single-server tensor parallelism (2026-07-25, gfx908)
+
+Direction change (per user): the 4-independent-endpoints topology
+(run_4x_bench.sh) is OUT OF SCOPE - it was never desired. Goal is now ONE
+llama-server using all 4 MI100s via LLAMA_SPLIT_MODE_TENSOR, with high
+concurrency, targeting vLLM-tp4-competitive TTFT.
+
+### TP already works for this hybrid model (engine level)
+
+- `qwen35` is NOT in the `llm_arch_supports_sm_tensor` false-list
+  (`src/llama-arch.cpp:977`) - TP is permitted.
+- The meta-device (`ggml/src/ggml-backend-meta.cpp`) has dedicated sharding
+  handlers for the recurrent ops: `handle_ssm_conv` (L970),
+  `handle_gated_delta_net[_idx]` (L984-985).
+- `-sm tensor` boots, shards the 26 GB Q6_K model evenly (~7.1 GB / GPU,
+  ~25 GB headroom/card), and serves correct single requests ("...Paris").
+- AllReduce for n_devices != 2 falls back to meta-backend butterfly
+  (optimized path is 2-GPU only).
+
+### TP engine numbers (llama-batched-bench -sm tensor, 4x MI100, 105 W cap)
+
+| npl | S_PP (prefill) | S_TG (decode) |
+|-----|----------------|---------------|
+| 1   | 632            | 16            |
+| 2   | 1064           | 37            |
+| 4   | 972            | 56            |
+| 8   | 1051           | 116           |
+
+Prefill at npl 8 = 1051 tok/s (~70% of vLLM ~1500) and scales up with
+concurrency; per-prompt prefill is ~1.7x single-GPU (each prompt split across
+4 GPUs -> the TTFT win). Decode = 116 tok/s at npl 8 (~77% of vLLM ~150) and
+climbing steeply with concurrency as the per-step all-reduce amortizes -
+decode is the comm-bound weak spot (butterfly all-reduce over PCIe).
+
+### TP server blocker (continuous batching)
+
+The engine bench (clean uniform graph) works at npl 8. The SERVER crashes
+under 8-concurrent continuous batching at `ggml-backend-meta.cpp:1837`
+(`GGML_ASSERT(bcj.nodes[i])`):
+- failing node: `op=RESHAPE name='cache_r_l0 (reshaped)' ne=[30720,8,1,1]`,
+  a RESHAPE VIEW of the recurrent-state storage leaf `cache_r_l0` (op=NONE).
+- root cause: graph-built views of GGML_OP_NONE meta-buffer (recurrent-state)
+  tensors are not registered in the `simple_tensors` map, so
+  `ggml_backend_meta_buffer_simple_tensor` returns null. The FIXME special-case
+  at L1830 only covers views of GGML_OP_NONE on HOST buffers, not META buffers.
+  Non-recurrent models don't hit this because they don't reshape the recurrent
+  state in-graph; the hybrid model + continuous batching does.
+- fix area: meta-backend view/simple_tensor derivation for GGML_OP_NONE
+  meta-buffer views (derive the per-GPU slice from view_src's simple_tensor,
+  applying the reshape + split-dim stride math at L1158-1203).
+- debug print left at L1836 (`META-DEBUG:`) for the fix iteration.
+
+### Remaining TP work
+1. Fix the RESHAPE-view registration (above) -> unblocks the server.
+2. Correctness: generation-identical vs single-GPU (AGENTS.md bit-exact rule).
+3. Decode parity: optimized 4-GPU all-reduce (not just 2), and MTP under TP.
+4. Concurrency sweep (np 16/32) to amortize all-reduce + match vLLM TTFT.
+
+### TP server unblock progress (2026-07-25, gfx908)
+
+Goal: one llama-server, -sm tensor across 4 MI100s, vLLM-parity C=8. The engine
+bench works (above); the server crashes under concurrent batching. Diagnosed two
+recurrent-state-under-TP gaps in sequence:
+
+(1) RESHAPE-view registration - FIXED. `cache_r_l<N> (reshaped)` (a RESHAPE view
+of the GGML_OP_NONE recurrent-state storage leaf) was never registered in the
+meta-backend simple_tensors map (the scheduler does not init views). Fix: lazy
+`init_tensor_impl` in ggml_backend_meta.cpp graph_compute for views of
+GGML_OP_NONE meta-buffer tensors (handle_reshape already derives the split axis).
+META-DEBUG guard left at the assert site.
+
+(2) Snapshot readback nr>1 - BLOCKER. After (1), the server aborts at
+ggml-backend-meta.cpp:1736 in get_tensor_async (`GGML_ASSERT(nr[0]==1)`), called
+from llama_memory_recurrent::snapshot_prefix_state -> llama_rs_row_block_copy.
+The conv-state `cache_r_l0` (ne=[30720,8,1,1]) is sharded axis=0, n_seg=1,
+nr[0]=5 BY DESIGN (llama-model.cpp:538 segments cache_r as
+`{key_dim*(d_conv-1), 2+head_ratio}` = nr 5 here). The readback path only
+handles nr==1, so it cannot gather the recurrent state for the prefix snapshot.
+GETASYNC-DEBUG guard left at the assert site.
+
+STRATEGIC FORK (needs decision):
+- Path A (hybrid TP): mirror all recurrent-layer tensors (cache_r/s + ssm_* +
+  recurrent-layer projections) so recurrent layers run replicated; TP only the
+  attention+FFN layers. Eliminates the entire class of recurrent-state sharding
+  bugs (views, nr>1 readback, op-handler mixed-input cases). Fastest to a working
+  server + baseline. Cost: recurrent layers run at single-GPU speed (could be
+  ~half the model), may cap the C=8 TP speedup.
+- Path B (full-sharded): implement nr>1 gather in get_tensor_async/set_tensor_async
+  (stitch the 2+head_ratio repeat pattern across GPUs), keep full recurrent-layer
+  TP. More work + likely more gaps, but preserves max TP benefit.
+Recommendation: Path A first to get a working TP baseline + run the Phase 1-3
+sweeps, then Path B if recurrent-layer TP proves to be the C=8 bottleneck.
+
+### Phase 0.1 DONE (Path A) + Phase 0.2 correctness bug (2026-07-25, gfx908)
+
+Decision (user): Path A now + Path B in parallel.
+
+Path A implementation: in llama_meta_device_get_split_state (src/llama-model.cpp
+get_tensor_config), mirror (GGML_BACKEND_SPLIT_AXIS_MIRRORED) every non-FFN
+tensor of recurrent (delta-net) layers - cache_r/s, ssm_*, attn_qkv/gate, norms.
+FFN tensors stay sharded so the big FFN matmuls keep their TP benefit. The
+residual stream is MIRRORED under TP, so a mirrored delta-net block runs
+replicated with no boundary issue; its output feeds the sharded FFN.
+
+Three meta-backend gaps fixed in sequence to stop the server crashing under
+concurrent batching:
+1. RESHAPE-view registration (ggml-backend-meta.cpp graph_compute): lazily
+   init_tensor_impl views of GGML_OP_NONE meta-buffer recurrent-state tensors.
+2. get_tensor_async / set_tensor_async: relaxed the `offset == 0` asserts so the
+   recurrent-state prefix snapshot can read/write per-row (row*rb); the sharded
+   branch already handled offset via i_start=offset/chunk_size_full, and the
+   mirrored branch delegates. Kept n_segments==1 / nr[0]==1 asserts.
+Result: TP single-server survives C=8 burst (0 aborts). META-DEBUG guard kept.
+
+Phase 0.2 CORRECTNESS BUG (must fix before baselining):
+Greedy (temp 0, top_k 1) TP4 vs single-GPU token streams:
+- 12-token reasoning prompts: IDENTICAL (correct).
+- "Summarize the water cycle: evaporation," (10 tok): TP -> "cond!!!" (garbage)
+  vs single-GPU -> "condensation, precipitation, ..." (correct).
+So Path A is mostly correct but diverges on some prompts (not threshold noise).
+handle_mul_mat mirrored x mirrored -> MIRRORED is correct (L577), so projections
+are fine. Suspects: a tensor missed in the mirror set (boundary mismatch at the
+delta-net block edge), or the GDN/conv kernel mis-handling the full (un-sharded)
+recurrent state. Next: token-level divergence diff to localize; then either widen
+the mirror set or fix the kernel/gather path. Path B (nr>1 gather) remains the
+fallback if Path A's correctness cannot be closed cleanly.
+
+### PIVOT to Path B + full TP4 characterization (2026-07-26, gfx908)
+
+Path A was correct under temp sampling but ~5x too slow (mirrors ~half the
+model's compute - agg_out peaked 55.8 @ C=16 vs engine 1051/116). Pivoted to
+Path B: keep the recurrent state fully TP-sharded (don't mirror), and instead
+sidestep the nr>1 snapshot-readback gap by DISABLING the prefix cache under TP
+(`LLAMA_PREFIX_CACHE_DISABLE=1`). The nr>1 abort only fires from the prefix
+snapshot; with diverse prompts + prefix cache off it is never hit.
+
+Path B is CORRECT (greedy "Summarize the water cycle: evaporation," ->
+"condensation, precipitation, and collection..." matching single-GPU; Path A's
+garbage is gone) AND fast (engine ceiling restored).
+
+Fixes that make Path B serve (all in ggml/src/ggml-backend-meta.cpp):
+- RESHAPE-view lazy-init: graph_compute now `init_tensor_impl`s views of
+  GGML_OP_NONE meta-buffer recurrent-state tensors, tracked in a per-buffer
+  `lazy_views` set that is cleared each rebuild (avoids unbounded arena growth).
+- compute_headroom bumped 16 -> 64 (main + MTP-draft recurrent reshapes need
+  more per-rebuild arena room).
+- get/set_tensor_async `offset==0` relaxed (snapshot reads/writes per-row).
+
+XGMI confirmed in use (not the bottleneck): rocm-smi shows full XGMI mesh;
+hipMemcpyPeerAsync measures ~37 GB/s 0<->1 vs ~28 GB/s host-staged; the
+meta-backend cpy_tensor uses hipMemcpyPeerAsync (ggml-cuda.cu:832).
+GGML_CUDA_P2P is NOT needed (and made no difference) - it gates a separate
+pointer-based P2P mechanism. The all-reduce is latency-bound by the per-copy
+cudaStreamSynchronize (ggml-cuda.cu:835), not bandwidth.
+
+RCCL: wired via the existing ggml-hip/CMakeLists.txt path (-DGGML_HIP_RCCL=ON;
+find_package(rccl) + GGML_USE_NCCL + roc::rccl). Replaces the meta-backend
+butterfly for the 4-GPU all-reduce (the "AllReduce init failed n_devices!=2"
+warning is gone). Engine decode 112 -> 118 @ npl 8 (modest - decode is more
+compute- than comm-bound at this batch). NOTE: npl>=16 crashes
+("invalid configuration argument") with AND without RCCL - a separate
+recurrent-graph-at-high-batch issue, pre-existing, not RCCL-specific.
+
+MTP under TP: works (survives C=8) but the draft sampler falls back to CPU
+("backend offload failed ... using CPU sampler" - SPLIT_MODE_TENSOR disables
+backend sampling, src/llama-context.cpp:1212). MTP helps C=1 (7.8 -> 31.3, 4x)
+but HURTS C>=8 (CPU draft-sampling latency dominates). Needs the draft sampler
+to run on-GPU under TP to be a C=8 decode win.
+
+### TP4 serving numbers (Path B + RCCL, 4x MI100, 105 W cap, Q6_K_XL 27B)
+
+Engine ceiling (llama-batched-bench -sm tensor, npp 512 / ntg 64):
+prefill ~1023 tok/s @ npl 8; decode 118 tok/s @ npl 8.
+
+Server (llama-server -sm tensor, q8_0 KV, FA on, -b 4096 -ub 1024,
+LLAMA_PREFIX_CACHE_DISABLE=1, RCCL). Burst, decode-weighted (256 out, ~112-tok
+diverse prompts to avoid prefix-cache skew):
+
+| C  | agg_out | agg_tot | TTFTmed | TTFTmax |
+|----|---------|---------|---------|---------|
+| 1  | 24.8    | 31.4    | 424 ms  | 424 ms  |
+| 2  | 39.7    | 49.6    | 1080    | 1080    |
+| 4  | 55.6    | 66.1    | 1694    | 2169    |
+| 8  | 77.1    | 94.5    | 2646    | 4919    |
+| 16 | 105.9   | 131.8   | 4825    | 10648   |  <- peak
+| 32 | 91.7    | 114.8   | 8811    | 21562   |  <- oversubscribed
+
+Peak = C=16, 105.9 tok/s decode (~71% of vLLM ~150). C=8 = 77 tok/s. C>16
+declines (TTFT balloons). agg_out is burst-load-sensitive: a single delayed
+slot tanks the average (run-to-run C=8 varied 70-95).
+
+Poisson (random arrivals) - WORSE than burst, exposes prefill/decode
+co-location tension under staggered load:
+- C=8, no budget: agg_out 49.7, TTFT_med 2754, TTFT_MAX 15934 ms.
+- C=8, LLAMA_UX_DYNAMIC_BUDGET=1: agg_out 24.3, TTFT_med 1074, TTFT_MAX 3978 ms.
+The fair-share prefill admission fixes the TTFT tail but halves aggregate -
+the same trade-off seen on the Vulkan branch. A middle ground (budget tuning /
+chunked-prefill) is the lever to make Poisson match burst.
+
+### vLLM gap analysis + remaining levers
+vLLM tp4 @ C=8 ~150 decode / ~1500 prefill. llama.cpp TP4 @ C=8 = 77 decode,
+@ C=16 = 106 decode. The gap is mostly FUNDAMENTAL, not overhead:
+- Quantization: vLLM uses GPTQ-8bit (true int8 -> 2x gfx908 MFMA flops); this
+  build uses Q6_K (6-bit -> fp16 hipBLAS for big matmuls). That alone is ~the
+  decode compute gap. Closing it needs an int8/Q8_0 build of the model.
+- Server overhead: engine 118 vs server 77 @ C=8 - continuous-batching
+  graph-cache churn + prefill co-location (agg_out is slot-tail-sensitive).
+- All-reduce: RCCL done; further gains need the n=4 internal kernel
+  (allreduce.cu is n=2-only, 971 lines) - modest expected upside (engine
+  112->118 shows comm is not the dominant decode term here).
+- MTP under TP: blocked by CPU draft-sampler fallback; fix = on-GPU draft
+  sampling under SPLIT_MODE_TENSOR.
+- 105 W power cap: still the single biggest raw lever for BOTH stacks (root).
+
+Levers NOT pursued (documented for follow-up): int8/Q8_0 model re-quant,
+conv-state r_l f16 (deferred - concat dtype), GDN bf16-MFMA, the n=4 internal
+all-reduce, MTP draft-sampling under TP, nr>1 gather for prefix-cache support
+under TP (Path B proper, would lift the LLAMA_PREFIX_CACHE_DISABLE=1 workaround).
+
+### Config recipe (TP4 serving, this branch)
+```
+HIP_VISIBLE_DEVICES=0,1,2,3 ROCR_VISIBLE_DEVICES=0,1,2,3 \
+LLAMA_PREFIX_CACHE_DISABLE=1 \      # sidesteps nr>1 snapshot readback gap
+llama-server -sm tensor -c 32768 -np 32 --kv-unified -b 4096 -ub 1024 \
+  -t 48 -tb 48 --threads-http 16 -cb -ngl 99 --no-mmap -fa on \
+  -ctk q8_0 -ctv q8_0 --metrics ...
+# build: -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx908 -DGGML_HIP_GRAPHS=ON -DGGML_HIP_RCCL=ON
+#        -DCMAKE_HIP_FLAGS="-isystem /opt/rocm-7.2.0/include -L/opt/rocm-7.2.0/lib"
+```
+Bench: /tmp/opencode/tp_bench.py (burst + poisson C-sweep, per-slot timings).
+Correctness: /tmp/opencode/correctness.py (TP vs single-GPU greedy diff).
+
+### Phase 3 sweep + Phase 4 dtype verdict + remaining-lever exhaustion (2026-07-26)
+
+ignore_eos control: with `ignore_eos=true` (batch stays full at C, no EOS thinning)
+C=8 decode-dominated agg_out = 91.1 (vs 77 with sampling EOS). So ~14 tok/s of the
+earlier C=8 number was EOS early-exit thinning the batch; the real full-batch decode
+is ~91 (decode-phase rate ~102). Engine ceiling is 118; the residual ~13% is
+continuous-batching graph-cache/scheduling overhead.
+
+Phase 3 config sweep @ C=8 (ignore_eos, decode-dominated, 1 var at a time):
+| config            | agg_out |
+|-------------------|---------|
+| default (ub1024/chunk1024/q8_0/t48) | 91.4 |
+| -ub 512           | 89.6 |
+| -ub 2048          | 89.9 |
+| chunk 512         | 88.8 |
+| chunk 2048        | 88.9 |
+| KV f16            | 91.6 |
+| -t 24             | 90.4 |
+ALL within noise (+-2). Default is already optimal. KV f16 == q8_0 (attention is
+NOT bandwidth-bound at TP C=8 - KV is split across 4 GPUs). No config wins exist.
+
+Phase 4 dtype verdict (gfx908 prefers int8 > fp8/fp16 >> fp32):
+- int8 MMQ for Q6_K/Q8_0 decode matmuls: ALREADY done (mmq-vec-dot.cuh uses
+  __builtin_amdgcn_mfma_i32_16x16x16i8; fp16-MFMA MMQ was tried+reverted).
+- GDN state s_l: ALREADY f16 (recr_type_s, +4.7% TG, default ON).
+- conv-state r_l f16: REJECTED - estimated ~0.3% (conv state is ~86 KB/seq/layer,
+  ~10 MB/step total, 0.27 ms vs 87 ms step at XGMI 37 GB/s). Not worth the kernel
+  + concat-dtype work. The big recurrent state (GDN s_l) is already f16.
+- fattn-vec q8_0 KQ dot -> int8 MFMA: REJECTED - the vec dot is a single 128-dim
+  scalar reduction per thread; MFMA needs 16x16x16 tiles so it requires batching K
+  positions (full kernel rewrite) for ~5-10% on a comm/bandwidth-bound decode.
+- hipBLAS int8 GEMM for prefill: BLOCKED - hipblasLt unstable on gfx908 (mmq.cu).
+
+Attempted + reverted this session:
+- LLAMA_TP_BACKEND_SAMPLER (on-device sampling under TP to unblock MTP): aborts at
+  ggml-backend-meta.cpp:546 (a sampler-op broadcast has an unsupported AXIS_0 src).
+  The sampler ops need real meta-backend sharding support before MTP-on-TP can help
+  at C>=8. Kept the CPU-fallback (src/llama-context.cpp:1205) with an explanatory
+  comment; MTP-on-TP currently helps only C=1.
+
+CONCLUSION: every achievable lever has been exercised. TP4 single-server peaks at
+~106 tok/s @ C=16 / ~91 @ C=8 (ignore_eos); engine ceiling 118 @ npl8. vLLM tp4
+~150. The remaining gap is FUNDAMENTAL: vLLM uses GPTQ-8bit (true int8 GEMM, ~2x
+gfx908 MFMA flops) while this build uses Q6_K (-> fp16 hipBLAS for big matmuls);
+llama.cpp has no stable int8 GEMM path on gfx908. Closing it needs either a stable
+hipBLAS int8 path, an int8/GPTQ model build, the MTP sampler-op sharding work, or
+the n=4 internal all-reduce kernel (all multi-day efforts). The 105 W power cap
+(root) remains the single biggest raw lever for BOTH stacks.
+
+### Late findings: engine npl12=144, server sustained-burst degradation (2026-07-26)
+
+Engine sweep refined: decode scales with npl up to the crash threshold.
+| npl | S_TG (decode) |
+|-----|---------------|
+| 8   | 118           |
+| 12  | **144**       |  <- near vLLM ~150
+| 16  | CRASH         |  ("invalid configuration argument", ggml-cuda.cu:106 /
+|     |               |   common.cuh:1650 - a kernel launch config goes invalid at
+|     |               |   npl>=16. NOT the GDN kernel (its grid/block are fine at 16).
+|     |               |   Pre-existing, with+without RCCL. Needs the exact failing
+|     |               |   op isolated.)
+
+So the ENGINE can reach ~144 tok/s @ npl12 (~96% of vLLM) - the compute is there.
+The npl>=16 crash is worth fixing (would let the engine/server go higher).
+
+SERVER sustained-burst DEGRADATION (newly found): back-to-back burst runs degrade.
+First run after a fresh server start: C=8=86, C=16=96 (good). Runs 2,3: C=8 drops
+to 61-63, C=16 to 75-78, with queue_ms median growing 59->2105 ms and TTFT_max
+12-27s. So the continuous-batching state accumulates across runs (graph-cache
+thrash, or the lazy-init views / KV pool not releasing between bursts) and tanks
+sustained throughput. The first-run peak (~96 @ C=16) is the real capability;
+the degradation is a state-management bug to chase. LLAMA_UX_DYNAMIC_BUDGET=1 +
+LLAMA_PREFILL_CHUNK=2048 + -b 8192 did NOT fix it (same degradation pattern).
+
+MTP-on-TP final verdict: with the CPU draft sampler (speculative.cpp uses
+common_sampler, not the context backend sampler) MTP accepts drafts (2 tok/decode)
+but the CPU sampling latency (~125 ms/step at C=8) makes it a NET LOSS at C>=8
+(C=8: 78 with MTP vs 86 without). Mirroring output.weight to enable on-device
+sampling was tested + reverted: it makes the backend sampler not-assert, but the
+MTP draft sampling still goes through common_sampler (CPU), and forcing
+LLAMA_TP_BACKEND_SAMPLER=1 yields 1 tok/decode (drafts rejected - TP numerical
+drift between GPU draft sampling and target verification). So MTP-on-TP needs a
+common_sampler -> backend integration in speculative.cpp + deterministic verify.
+
+FINAL ACHIEVABLE STATE: TP4 single-server, correct, ~86-96 tok/s peak (first-run
+C=8/16, decode-dominated), degrading under sustained burst. Engine ceiling 144
+@ npl12 (near vLLM 150). The path to full vLLM parity = (1) fix the server
+sustained-burst state degradation (biggest serving-side win), (2) fix the
+npl>=16 engine crash (lets both go higher), (3) MTP-on-TP via common_sampler
+backend integration, (4) int8 compute (hipBLAS int8 or GPTQ model).
+
+### Sustained-degradation fix attempt + final numbers (2026-07-26)
+
+Added a size bound (65536) to the meta-backend split_state_cache
+(ggml-backend-meta.cpp, keyed by tensor pointer so it grew unbounded under TP
+graph rebuilds). This bounds host memory + keeps lookups fast, but did NOT fix
+the sustained-burst degradation - so the VRAM growth (7.1 -> 9.6 GB/GPU) and
+throughput collapse across runs is the GPU-side graph cache / KV pool under TP,
+not the host split_state_cache. Kept the bound (good hygiene).
+
+Reproducible fresh-server first-run peaks (decode-dominated, ignore_eos, 256 out):
+C=8 = ~87 tok/s, C=12 = ~80, C=16 = ~103. (An earlier 136.7 @ C=16 was an
+outlier.) Runs 2-N degrade to ~77-80 with queue_ms growing to 2-4s. Engine
+ceiling for reference: npl8=118, npl12=144, npl>=16 crash.
+
+The GPU graph-cache growth under TP (each distinct ubatch shape caches 4
+subgraphs; sustained burst with shape churn grows it without reclaim) is the
+remaining serving-side lever - needs the meta-backend graph-cache lifecycle
+bounded/cleared, which is the next concrete fix.
+
+### CORRECTNESS BLOCKER (2026-07-26) - TP4 recurrent-state reshape view
+
+A correctness gate (TP4 vs single-GPU greedy, fixed prompts) revealed that the
+TP4 recurrent path is fundamentally broken for sustained use:
+
+- ORIGINAL ggml-backend-meta.cpp: the FIRST request is CORRECT
+  ("Water boils at sea level at" -> " 100°C.", matching single-GPU). The SECOND
+  request crashes the server (ggml-backend-meta.cpp:1837 GGML_ASSERT - the
+  recurrent-state 'cache_r_l<N> (reshaped)' RESHAPE view of the GGML_OP_NONE
+  storage leaf is not in the simple_tensors map once prior recurrent state
+  exists). So: correct for 1 request, crash on the 2nd.
+
+- My two attempted fixes both PREVENT THE CRASH but CORRUPT OUTPUT:
+  * lazy-init via init_tensor_impl (compute_headroom 64 + lazy_views cleanup):
+    "Water boils" -> "!!!!!" (garbage). handle_reshape mis-maps the nr=2+head_ratio
+    recurrent-state split for the reshape view, so the per-GPU slice is wrong.
+  * alias to view_src's simple_tensor (bcj.nodes[i] = simple_tensor(view_src, j)):
+    "Water boils" -> " 100°C." (correct) BUT "The primary colors are red," ->
+    "!!!!!" (garbage). A RESHAPE is not transparent for head-sharded data.
+
+So the meta-backend cannot correctly shard the RESHAPE view of the recurrent
+state (cache_r_l / cache_s_l) under TP. The reshape appears once the recurrent
+state has been updated (2nd+ request), and neither registering it via
+init_tensor_impl (wrong split) nor aliasing to the source (wrong shape) yields
+correct output. The original code simply doesn't register it (crash).
+
+This means NONE of {original, lazy-init, alias} gives a correct sustained TP4
+server. The worktree has been reverted to the ORIGINAL ggml-backend-meta.cpp
+(correct single-request, crashes on 2nd). The RCCL CMake wiring
+(ggml-cuda/CMakeLists.txt HIP/RCCL branch) and the llama-context.cpp sampler
+comment are kept (benign).
+
+REQUIRED FOR A CORRECT FIX (not achieved this session):
+1. Either fix handle_reshape (ggml-backend-meta.cpp:597) to correctly map the
+   nr=2+head_ratio recurrent-state split through the reshape, AND verify the
+   per-GPU reshape view's ne/nb/data match what the GDN kernel reads; OR
+2. Eliminate the reshape view by storing cache_r/cache_s in the layout the GDN
+   consumes directly (change src/llama-memory-recurrent.cpp / the graph builder
+   so no in-graph RESHAPE of the recurrent state is emitted); OR
+3. Make the recurrent state MIRRORED under TP (replicated) so no sharded reshape
+   is needed - but that is the Path-A design measured at ~5x slower (and even
+   then had its own greedy-divergence on some prompts).
+
+Until one of these is implemented correctly, the TP4 single-server is NOT usable
+for sustained serving. All serving-side perf numbers earlier in this log
+(C=1-32 burst, Poisson, etc.) were measured on the lazy-init build WHICH
+PRODUCES CORRUPT OUTPUT for some prompts and must not be relied on.
+
+Net session deliverable (correct, usable): TP4 engine path (llama-batched-bench
+-sm tensor) works and is correct for the uniform single-shape bench (engine
+144 tok/s @ npl12, near vLLM 150); RCCL all-reduce wired; XGMI confirmed. The
+TP4 *server* (continuous batching) is blocked on the recurrent-state reshape
+correctness issue above.
+
+### TP4 (tensor parallel) fix + benchmark (2026-07-25)
+
+- CRITICAL FIX: meta-backend lazy-init for view/reshape tensors during graph rebuild
+  (ggml-backend-meta.cpp). The scheduler doesn't call init_tensor for view tensors
+  that inherit their parent's buffer, so the meta-backend's per-device simple_tensor
+  copies were missing on the 2nd+ decode step -> crash. Fix: pre-initialize all
+  meta-buffer graph nodes before dispatch. Also fixed get/set_tensor_async to delegate
+  multi-segment tensors to the buffer-level handler (supports nr>1 scatter/gather).
+- TP4 engine (llama-batched-bench): pp512=347, pp2048=400, tg64=8.5, npl8 decode=125.8 tok/s.
+- TP4 server c=8: agg 28.3 tok/s, 0 failures, TPOT 208ms, TTFT 6.2s.
+- 4x independent servers (layer split off): agg 65-70 tok/s, per-GPU 17-20, TPOT 300-340ms.
+- Conclusion: at 4xMI100 with 300 MHz sclk pin, independent single-GPU servers beat TP4
+  by ~2.4x for this workload (decode-bound, all-reduce latency dominates).
+- Paged attention: tested under -sm tensor; works for single-GPU but needs the per-device
+  block-table plumbing fixed for multi-GPU (crashes at get_k_paged under layer split).
+  Paged is gated off by default; under layer split it must stay off.
+
+### TP4 allreduce + profiling (2026-07-25)
+
+- In-house allreduce committed (N-GPU, XGMI peer-to-peer, host-mapped kernel path).
+- TP4 engine npl8: 125.8 -> 148.9 tok/s (+18%).
+- Profile: ar_kernel 81.6us avg x 16896 calls = 1378ms (24% of step).
+  Ring-allreduce attempted but produced wrong results (chunk indexing bug), reverted.
+  N*(N-1) copy approach works correctly.
+- TP4 server c=8: 28.3 tok/s (allreduce enabled).
+
+### Paged attention works under TP4 (2026-07-25)
+
+- Fix: assert block table src[5] is MIRRORED in handle_flash_attn_ext (meta-backend).
+- Paged on/off identical engine npl8: 149.6 tok/s.
+- TP4 c=8 server bench next (need run_tp4_bench.sh with paged on).

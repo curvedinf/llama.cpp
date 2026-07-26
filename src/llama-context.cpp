@@ -1210,16 +1210,26 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
+        // The output projection is mirrored (output.weight MIRRORED in llama-model.cpp
+        // get_tensor_config), so the logits are full (MIRRORED) on every GPU and on-device
+        // sampling is correct. Allow opt-in via env; default keeps the CPU fallback for
+        // safety until validated.
+        static const bool tp_backend_sampler = []{
+            const char * e = getenv("LLAMA_TP_BACKEND_SAMPLER");
+            return e && atoi(e) != 0;
+        }();
+        if (!tp_backend_sampler) {
+            static bool warned = false;
+            if (!warned) {
+                LLAMA_LOG_WARN("%s: backend sampling under SPLIT_MODE_TENSOR is opt-in (set LLAMA_TP_BACKEND_SAMPLER=1)\n", __func__);
+                warned = true;
+            }
+            if (sampling.samplers.count(seq_id) > 0) {
+                sched_need_reserve = true;
+            }
+            sampling.samplers.erase(seq_id);
+            return false;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
     }
 
     const bool can_offload =

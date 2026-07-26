@@ -1562,3 +1562,11 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 
 ### Step overhead (2026-07-25)
 - Engine 6.7ms/tok, server c8 54ms/tok, overhead 47ms.
+
+### Single-GPU vs TP4 server overhead (2026-07-25)
+- Single GPU tg64 engine: 11.1 tok/s = 90 ms/token
+- TP4 engine tg64: 10.7 tok/s = 93 ms/token (npl1)
+- TP4 engine npl8: 149 tok/s = 6.7 ms/token
+- Server c=1 TP4: 23 tok/s = 43 ms/token (with MTP ~2x speedup)
+- Server overhead = 43 - 93/2 = ~-4 ms (MTP amortizes well at c=1)
+- The c=8 gap is from serialized CPU sampling, not GPU.

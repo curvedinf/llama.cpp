@@ -1489,3 +1489,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - The greedy sampler bypasses backend_apply, so backend sampling check fails
   differently. Need to verify: the dist sampler was needed for the backend
   init path. Reverting.
+
+### Baseline variance check (2026-07-25)
+
+- Baseline rerun: 45.6 tok/s (was 52.6 earlier, 44.8 with greedy)
+- High run-to-run variance (~15%) under TP4 decode-heavy c8
+- All measurements in 44-53 range. Greedy fast-path was within variance.

@@ -316,6 +316,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     if (params.mirostat == 0) {
 
+        // Fast path: greedy (temp <= 0) skips top_k/top_p/dist chain
+        if (params.temp <= 0.0f && !params.has_logit_bias()) {
+            samplers.push_back(llama_sampler_init_greedy());
+        } else {
+
         bool use_adaptive_p = false; // see below
 
         for (const auto & cnstr : params.samplers) {
@@ -375,6 +380,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
             // default: sample from distribution
             samplers.push_back(llama_sampler_init_dist(params.seed));
         }
+        } // end else (non-greedy)
     } else if (params.mirostat == 1) {
         samplers.push_back(llama_sampler_init_temp(params.temp));
         samplers.push_back(llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), params.seed, params.mirostat_tau, params.mirostat_eta, 100));

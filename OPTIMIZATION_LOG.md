@@ -1313,3 +1313,10 @@ correctness issue above.
 - Crashes: sampler graph creates input tensors not recognized by get_split_state.
 - Reverted. CPU sampling remains the path under TP4.
 - np16 MTP2 confirmed: 29.5 tok/s, 0 fail, TPOT 190ms.
+
+### TP4 scaling analysis (2026-07-25)
+
+- c=1: 43.3 tok/s, c=4: 27.4, c=8: 29.5. Poor scaling (8x conc -> 1.07x throughput).
+- Bottleneck: serialized CPU sampling (full-vocab argmax x N seqs per step).
+- Ring-allreduce committed (bandwidth-optimal, latency-neutral at current sizes).
+- Next: reduce sampling overhead or implement TP backend sampler properly.

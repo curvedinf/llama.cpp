@@ -1381,3 +1381,10 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Host-mapped memory read latency is the hw bottleneck (~1us/uncached load)
 - HIP graph capture of allreduce blocked by in-kernel busy-wait on host flags
 - np48 worse than np16 (more contention). Best remains np16: 29.5 tok/s c=8.
+
+### Decode-heavy vs mixed workload (2026-07-25)
+
+- Decode-heavy (32-token prompts, 100 tok output, c=8): agg 54.4 tok/s, TPOT 118ms, TTFT 1.9s
+- Mixed (1024-token prompts, 100 tok output, c=8): agg 29.5 tok/s, TPOT 191ms, TTFT 5.9s
+- Decode throughput is 54.4 tok/s when prefill isn't bottlenecking.
+- The 1024x100 bench penalizes TP4 because prefill blocks the decode pipeline.

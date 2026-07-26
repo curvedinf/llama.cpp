@@ -71,10 +71,13 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
 }
 
 // Portable low-power busy-wait yield.  __nanosleep is CUDA-only (sm70+);
-// HIP uses the AMDGCN s_sleep intrinsic.
+// HIP uses the AMDGCN s_sleep intrinsic.  A short sleep (a few cycles)
+// reduces memory bus contention from tight polling while still detecting
+// peer arrival within nanoseconds.  The previous value (0x3FFF = 16383
+// cycles ≈ 16us) added up to ~48us of wasted latency per AR call (3 peers).
 static __device__ __forceinline__ void ggml_cuda_ar_sleep() {
 #if defined(GGML_USE_HIP)
-    __builtin_amdgcn_s_sleep(0x3FFF);
+    __builtin_amdgcn_s_sleep(3);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     __nanosleep(100);
 #else

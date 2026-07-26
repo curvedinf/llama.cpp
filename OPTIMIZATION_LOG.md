@@ -1495,3 +1495,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Baseline rerun: 45.6 tok/s (was 52.6 earlier, 44.8 with greedy)
 - High run-to-run variance (~15%) under TP4 decode-heavy c8
 - All measurements in 44-53 range. Greedy fast-path was within variance.
+
+### Greedy fast-path end-to-end (2026-07-25)
+
+- 1024x100 c8: 30.7 tok/s (baseline 30.1, within variance)
+- Greedy fast-path committed. Algorithmically correct, marginal impact
+  at c8 (dominant cost is GPU compute, not sampling).

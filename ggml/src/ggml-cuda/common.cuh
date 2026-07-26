@@ -1646,13 +1646,7 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     }
 #endif //defined(GGML_CUDA_USE_PDL)
 
-    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
-    cudaError_t _err = cudaGetLastError();
-    if (_err != cudaSuccess) {
-        fprintf(stderr, "LAUNCHFAIL: grid=(%zu,%zu,%zu) block=(%zu,%zu,%zu) shmem=%zu err=%d %s\n",
-                (size_t)launch_params.block_nums.x, (size_t)launch_params.block_nums.y, (size_t)launch_params.block_nums.z,
-                (size_t)launch_params.block_dims.x, (size_t)launch_params.block_dims.y, (size_t)launch_params.block_dims.z,
-                (size_t)launch_params.shmem, (int)_err, cudaGetErrorString(_err));
-    }
+    kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)...);
+    CUDA_CHECK(cudaGetLastError());
 }
 

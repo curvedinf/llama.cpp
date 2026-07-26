@@ -1404,3 +1404,11 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Per decode step: ~128 trunk ARs × ~86us = ~11ms AR time. Engine npl8 total
   is 6.7ms/tok, so AR is 2x the compute. Fundamental, not fixable without
   algorithmic change (e.g. pipeline allreduce with next layer's compute).
+
+### AR/compute overlap attempt (2026-07-25)
+
+- Dedicated ar_stream + ar_done_event for non-blocking AR kernel launch.
+- Correct output achieved but no speedup (144 vs 149 tok/s).
+- Root cause: data dependency forces sequential execution — next subgraph
+  reads the tensor that AR just wrote. True overlap needs double-buffering.
+- Reverted. AR stays synchronous on compute stream.

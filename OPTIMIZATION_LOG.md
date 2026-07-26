@@ -1551,3 +1551,7 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 
 - 4 blocks: 147.8, 8: 149.3, 16: 146.9
 - 8 is optimal.
+
+### TP4 stable (2026-07-25)
+- c8 1024x100: 29.1, 0 fail
+- Engine npl8: 149.3

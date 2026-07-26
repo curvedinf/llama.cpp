@@ -1589,3 +1589,9 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Removed head/rs_z/direct from can_reuse (data inputs)
 - Graph reuse still 8/20 (draft vs verify shape alternation causes eviction)
 - Committed.
+
+### Graph reuse analysis (2026-07-25)
+- MTP draft alternates n_tok 1/2/3 per iteration (growing KV)
+- Verify uses n_tok=3, n_seq varies
+- Shape alternation causes cache misses. Intrinsic to MTP design.
+- Committed rs head fix. Debug print reverted.

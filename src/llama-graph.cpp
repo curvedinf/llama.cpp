@@ -1345,10 +1345,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params, debug)) {
-        if (debug > 1) {
-            LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
-        }
-
         return false;
     }
 

@@ -25,7 +25,7 @@ SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
 # Prefix cache: was disabled for TP due to D4 (nr>1 gather in get/set_tensor_async).
 # T1 fix may have resolved this. Test enabled.
-#export LLAMA_PREFIX_CACHE_DISABLE=1
+export LLAMA_PREFIX_CACHE_DISABLE=1
 
 mkdir -p "${LOG_DIR}"
 

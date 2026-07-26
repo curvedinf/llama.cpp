@@ -1331,3 +1331,11 @@ correctness issue above.
 - Conclusion: TP backend sampler requires meta-backend architecture changes
   to support post-allreduce split state updates. Deferred.
 - Current best TP4: 29.5 tok/s (np16, MTP2, CPU sampling).
+
+### TP4 nospec vs MTP comparison (2026-07-25)
+
+- nospec np16 c8: 38.7 tok/s (3 fail), per-slot TPOT 51ms
+- MTP2 np16 c8: 29.5 tok/s (0 fail), per-slot TPOT 87ms
+- nospec is 31% faster aggregate. MTP overhead > acceptance benefit under TP4.
+- Reason: draft model adds 2 extra decode steps per verify, each with allreduce.
+- Decision: keep MTP2 for correctness/UX but optimize draft model path.

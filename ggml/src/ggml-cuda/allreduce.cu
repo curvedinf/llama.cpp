@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // Internal AllReduce for tensor-parallel inference across N GPUs.
@@ -244,6 +245,20 @@ static __global__ void ggml_cuda_ar_add_kernel(
     }
 }
 
+// Type-convert kernel: dst[i] = (T_dst)(float)src[i].  Used by the ring path
+// to convert the BF16-reduced result into the F32 destination tensor.
+template <typename T_dst, typename T_src>
+static __global__ void ggml_cuda_ar_cvt_kernel(
+        T_dst       * __restrict__ dst,
+        const T_src * __restrict__ src,
+        int count) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nt  = gridDim.x * blockDim.x;
+    for (int i = tid; i < count; i += nt) {
+        dst[i] = ggml_cuda_cast<T_dst>(ggml_cuda_cast<float>(src[i]));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipeline structure
 // ---------------------------------------------------------------------------
@@ -319,6 +334,10 @@ struct ggml_cuda_ar_pipeline {
     // overwriting dev_tmp.  Single-buffered dev_tmp is safe because of this.
     cudaEvent_t              dev_tmp_kernel_done[GGML_CUDA_MAX_DEVICES];
     bool                     dev_tmp_kernel_done_valid;
+
+    // Ring-allreduce step events: double-buffered [slot][buf][device].
+    // buf = step%2 for the current step's recording, (step-1)%2 for waiting.
+    cudaEvent_t ring_ev[GGML_CUDA_AR_POOL_SIZE][2][GGML_CUDA_MAX_DEVICES];
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
     // memory; CPU never reads/writes -- only the kernel.
@@ -443,6 +462,21 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // Ring-allreduce step events: double-buffered per-slot per-device.
+    for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+        for (int b = 0; b < 2; ++b) {
+            for (size_t i = 0; i < n_devices; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                if (cudaEventCreateWithFlags(&p->ring_ev[s][b][i], cudaEventDisableTiming) != cudaSuccess) {
+                    GGML_LOG_ERROR("%s: cudaEventCreate for ring_ev failed (slot %d buf %d dev %d)\n",
+                                   __func__, s, b, p->devices[i]);
+                    ggml_cuda_ar_pipeline_free(p);
+                    return nullptr;
+                }
+            }
+        }
+    }
+
     // Arrival ring: cache-line padded so each GPU/block's int is on its own line.
     const size_t arrival_bytes =
         (size_t)GGML_CUDA_AR_POOL_SIZE * n_devices *
@@ -514,23 +548,45 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
             ggml_cuda_set_device(p->devices[i]);
             cudaEventDestroy(p->dev_tmp_kernel_done[i]);
         }
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            for (int b = 0; b < 2; ++b) {
+                if (p->ring_ev[s][b][i]) {
+                    ggml_cuda_set_device(p->devices[i]);
+                    cudaEventDestroy(p->ring_ev[s][b][i]);
+                }
+            }
+        }
     }
     p->arrival.free();
     delete p;
 }
 
 // ---------------------------------------------------------------------------
-// Copy-engine path: N-GPU peer-to-peer allreduce
+// Copy-engine path: N-GPU ring allreduce
 //
-// For each GPU i, pulls data from every peer j via hipMemcpyPeerAsync into
-// dev_tmp[i], then runs an add kernel to accumulate the peer's contribution
-// into dst_buf[i].  All work for GPU i runs on its compute stream so stream
-// ordering guarantees correctness without cross-stream events for the
-// sequential per-peer pipeline.
+// Implements a bandwidth-optimal ring allreduce in two phases:
 //
-// Data moved per GPU: (N-1) * nbytes.  On XGMI this goes over the ~37 GB/s
-// peer fabric directly, avoiding the D2H+H2D host-staging round-trip that
-// the meta-backend butterfly uses.
+//   Scatter-reduce (n-1 steps):
+//     GPU i sends chunk[(i-s)%n] to GPU (i+1)%n, and GPU (i+1)%n adds it to
+//     its local copy of chunk[(i-s)%n].  After n-1 steps, GPU i holds the
+//     full sum for chunk[(i+1)%n].
+//
+//   Allgather (n-1 steps):
+//     GPU i sends its fully-reduced chunk to GPU (i+1)%n.  After n-1 steps,
+//     all GPUs have all chunks.
+//
+// Ring topology: GPU i sends to GPU (i+1)%n, receives from GPU (i-1+n)%n.
+//
+// Data moved per GPU: 2*(n-1)/n * nbytes  (vs (n-1)*nbytes for the old
+// N*(N-1) approach).  For 4 GPUs: 1.5*nbytes vs 3*nbytes — 2x less traffic.
+//
+// Synchronization: step s of GPU i waits on step s-1 of GPU (i-1+n)%n via
+// double-buffered ring events.  dev_tmp[i] serves as the receive scratch
+// for the scatter-reduce phase (copy peer chunk, then add into local buf).
+// The allgather phase copies directly peer-to-peer (no add needed).
+//
+// The ring operates entirely in T_src.  If T_dst != T_src (BF16 ring, F32
+// output), a final conversion kernel writes src_buf -> dst_buf.
 // ---------------------------------------------------------------------------
 
 template <typename T_src, typename T_dst>
@@ -550,9 +606,8 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
 
     ggml_backend_cuda_context * cuda_ctx[GGML_CUDA_MAX_DEVICES] = {};
 
-    // Record compute-done events for all GPUs.  These are needed so that GPU
-    // i's copy from peer j waits for j's upstream compute to have produced
-    // valid data.
+    // Record compute-done events for all GPUs.  GPU i needs to wait on its
+    // left neighbor's upstream compute before reading from it in step 0.
     for (int i = 0; i < n; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
@@ -560,49 +615,132 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].app, cuda_ctx[i]->stream()));
     }
 
+    // Per-GPU setup: protect dev_tmp from prior AR, zero inactive shards.
     for (int i = 0; i < n; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         cudaStream_t stream = cuda_ctx[i]->stream();
 
-        // Wait for prior AR's add_kernel to finish reading dev_tmp before
-        // we overwrite it.  No-op on the first call.
         if (p->dev_tmp_kernel_done_valid) {
             CUDA_CHECK(cudaStreamWaitEvent(stream, p->dev_tmp_kernel_done[i]));
         }
-
-        // Zero inactive shards so they contribute nothing.
         if (!compute[i]) {
             CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, stream));
         }
+    }
 
-        // Pull from each peer and add sequentially.  Stream ordering
-        // guarantees dev_tmp is not overwritten before the prior add finishes.
-        for (int peer = 0; peer < n; ++peer) {
-            if (peer == i) continue;
+    // Chunk layout: n equal chunks; the last absorbs the remainder so every
+    // GPU agrees on offsets without extra communication.
+    const int64_t  chunk_base = ne / n;
+    const int64_t  chunk_rem  = ne - chunk_base * n;
+    const size_t   elem_bytes = sizeof(T_src);
+    const int      block_size = 256;
 
-            // Wait for peer's upstream compute to be done.
-            CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[peer][slot].app));
+    // total_step indexes the double-buffered ring events (total_step % 2).
+    int total_step = 0;
 
-            // Peer-to-peer copy: peer's data -> my dev_tmp.
+    // ---- Phase 1: Scatter-reduce (n-1 steps) ----
+    // Step s: GPU i receives chunk c_recv = (i-s-1+n)%n from left = (i-1+n)%n,
+    // copies it into dev_tmp[i], and adds dev_tmp[i] into src_buf[i][c_recv].
+    // After n-1 steps, GPU i holds the full sum for chunk (i+1)%n.
+    //
+    // We use the copy engine (hipMemcpyPeerAsync) for the data transfer and a
+    // separate add kernel, rather than a single P2P-read kernel.  On MI100/XGMI
+    // the SDMA copy engine runs in parallel with compute and is more efficient
+    // for small transfers than uncached loads from a compute kernel.
+    //
+    // Loop order is step-outer so all GPUs issue their work for a given step
+    // before advancing — this keeps the ring pipeline balanced.
+    for (int s = 0; s < n - 1; ++s, ++total_step) {
+        const int b_cur = total_step % 2;
+
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStream_t stream = cuda_ctx[i]->stream();
+            const int left = (i - 1 + n) % n;
+
+            // Wait for left neighbor's data to be ready.
+            if (total_step == 0) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, p->ev_pool[left][slot].app));
+            } else {
+                const int b_prev = (total_step - 1) % 2;
+                CUDA_CHECK(cudaStreamWaitEvent(stream, p->ring_ev[slot][b_prev][left]));
+            }
+
+            // Chunk to receive and accumulate this step.
+            const int     c_recv = (((i - s - 1) % n) + n) % n;
+            const int64_t off    = (int64_t)c_recv * chunk_base;
+            const int64_t cn     = (c_recv == n - 1) ? (chunk_base + chunk_rem) : chunk_base;
+            const size_t  cbytes = (size_t)cn * elem_bytes;
+
+            // Copy left neighbor's chunk into dev_tmp (receive scratch).
             CUDA_CHECK(cudaMemcpyPeerAsync(
                 p->dev_tmp[i], p->devices[i],
-                src_buf[peer], p->devices[peer],
-                nbytes, stream));
+                src_buf[left] + off, p->devices[left],
+                cbytes, stream));
 
-            // Add peer's contribution into local accumulator.
-            const int block_size = 256;
-            int n_blocks = (int) ((ne + block_size - 1) / block_size);
-            if (n_blocks > 1024) {
-                n_blocks = 1024;
+            // Add dev_tmp into local chunk.
+            int n_blocks = (int)((cn + block_size - 1) / block_size);
+            if (n_blocks > 1024) n_blocks = 1024;
+            if (n_blocks > 0) {
+                ggml_cuda_ar_add_kernel<T_src, T_src><<<n_blocks, block_size, 0, stream>>>(
+                    src_buf[i] + off,
+                    reinterpret_cast<const T_src *>(p->dev_tmp[i]),
+                    (int)cn);
+                CUDA_CHECK(cudaGetLastError());
             }
-            ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
-                dst_buf[i],
-                reinterpret_cast<const T_src *>(p->dev_tmp[i]),
-                (int) ne);
-            CUDA_CHECK(cudaGetLastError());
-        }
 
-        // Record events for pool-wraparound and dev_tmp safety.
+            CUDA_CHECK(cudaEventRecord(p->ring_ev[slot][b_cur][i], stream));
+        }
+    }
+
+    // ---- Phase 2: Allgather (n-1 steps) ----
+    // Step s: GPU i receives chunk c_recv = (i-s+n)%n from left = (i-1+n)%n.
+    // This is a direct copy (overwrite, no add): left neighbor's fully-reduced
+    // chunk replaces the local copy.  After n-1 steps, all GPUs have all chunks.
+    for (int s = 0; s < n - 1; ++s, ++total_step) {
+        const int b_cur  = total_step % 2;
+        const int b_prev = (total_step - 1) % 2;
+
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStream_t stream = cuda_ctx[i]->stream();
+            const int left = (i - 1 + n) % n;
+
+            CUDA_CHECK(cudaStreamWaitEvent(stream, p->ring_ev[slot][b_prev][left]));
+
+            const int     c_recv = (((i - s) % n) + n) % n;
+            const int64_t off    = (int64_t)c_recv * chunk_base;
+            const int64_t cn     = (c_recv == n - 1) ? (chunk_base + chunk_rem) : chunk_base;
+            const size_t  cbytes = (size_t)cn * elem_bytes;
+
+            CUDA_CHECK(cudaMemcpyPeerAsync(
+                src_buf[i] + off, p->devices[i],
+                src_buf[left] + off, p->devices[left],
+                cbytes, stream));
+
+            CUDA_CHECK(cudaEventRecord(p->ring_ev[slot][b_cur][i], stream));
+        }
+    }
+
+    // If T_dst != T_src (BF16 ring → F32 output), convert the result.
+    if (!std::is_same_v<T_src, T_dst>) {
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            cudaStream_t stream = cuda_ctx[i]->stream();
+            int n_blocks = (int)((ne + block_size - 1) / block_size);
+            if (n_blocks > 1024) n_blocks = 1024;
+            if (n_blocks > 0) {
+                ggml_cuda_ar_cvt_kernel<T_dst, T_src><<<n_blocks, block_size, 0, stream>>>(
+                    dst_buf[i], src_buf[i], (int)ne);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+    }
+
+    // Record final events for pool-wraparound and dev_tmp safety.
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        cudaStream_t stream = cuda_ctx[i]->stream();
         CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], stream));
         CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
     }

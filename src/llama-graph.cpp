@@ -363,11 +363,16 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
 
-    // head, rs_z, and direct are data inputs (set_input), not shape parameters.
-    // They should not prevent graph reuse.
-    //res &= head == mctx->get_head();
-    //res &= rs_z == mctx->get_rs_z();
-    //res &= direct == mctx->get_direct();
+    // head, rs_z, and direct affect the recurrent state store layout.
+    // Under TP (tensor split), the per-device simple_tensor dimensions for
+    // get_rows depend on which rows of the store are accessed (determined
+    // by head). When head changes between requests (after prefix cache
+    // restore or slot reuse), the CUDA graph's get_rows kernel launch
+    // params become stale -> "invalid configuration argument" crash.
+    // Force graph cache miss when head changes.
+    res &= head == mctx->get_head();
+    res &= rs_z == mctx->get_rs_z();
+    res &= direct == mctx->get_direct();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",

@@ -139,6 +139,12 @@ static void get_rows_cuda_q(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
+    // Under TP (tensor split), some devices may receive a zero-sized shard.
+    // ne00=0 means the per-device slice has no elements per row, causing
+    // block_num_y=0 -> grid.y=0 -> "invalid configuration argument" on HIP.
+    if (ne00 <= 0 || ne10 <= 0 || ne11*ne12 <= 0) {
+        return;
+    }
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
     const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
@@ -176,6 +182,12 @@ static void get_rows_cuda_float(
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
+    // Under TP (tensor split), some devices may receive a zero-sized shard.
+    // ne00=0 means the per-device slice has no elements per row, causing
+    // block_num_y=0 -> grid.y=0 -> "invalid configuration argument" on HIP.
+    if (ne00 <= 0 || ne10 <= 0 || ne11*ne12 <= 0) {
+        return;
+    }
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
     const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));

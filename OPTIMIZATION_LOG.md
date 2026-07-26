@@ -1349,3 +1349,10 @@ correctness issue above.
 - Allreduce kernel: 81.6us avg, host-mapped pinned mem path. Copy-engine path
   via hipMemcpyPeerAsync is latency-equivalent at current tensor sizes.
 - Ring-allreduce committed but latency-neutral (6 sequential steps vs 3 parallel).
+
+### GPU argmax attempt (2026-07-25)
+
+- Added GPU argmax post-compute to populate sampling.sampled under TP4.
+- Result: 29.2 tok/s (no improvement). CPU sampler still reads full logits
+  because non-greedy chain needs them. Argmax overhead adds latency.
+- Reverted. Need full TP backend sampler to eliminate logits readback.

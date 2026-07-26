@@ -363,9 +363,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
 
-    res &= head == mctx->get_head();
-    res &= rs_z == mctx->get_rs_z();
-    res &= direct == mctx->get_direct();
+    // head, rs_z, and direct are data inputs (set_input), not shape parameters.
+    // They should not prevent graph reuse.
+    //res &= head == mctx->get_head();
+    //res &= rs_z == mctx->get_rs_z();
+    //res &= direct == mctx->get_direct();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",

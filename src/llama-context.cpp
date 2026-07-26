@@ -1997,6 +1997,51 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
+        } else if (t_logits && n_outputs > 0 && sampling.samplers.empty()) {
+            // TP4 without backend samplers: run GPU argmax to populate
+            // sampling.sampled directly, avoiding the full logits readback.
+            // CPU samplers using greedy (temp=0) will find the token via
+            // get_sampled_token_ith() and skip set_logits entirely.
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_active, t_logits);
+            GGML_ASSERT(backend_res != nullptr);
+
+            // Ensure sampled buffer is large enough
+            if ((int64_t) sampling.sampled.size < n_outputs_all) {
+                sampling.sampled.data = (llama_token *) realloc(sampling.sampled.data, n_outputs_all * sizeof(llama_token));
+                sampling.sampled.size = n_outputs_all;
+            }
+
+            ggml_init_params iparams = {
+                /*.mem_size   =*/ 4*ggml_tensor_overhead() + ggml_graph_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx_am { ggml_init(iparams) };
+            if (ctx_am) {
+                ggml_tensor * am = ggml_argmax(ctx_am.get(), t_logits);
+                ggml_cgraph * gf_am = ggml_new_graph(ctx_am.get());
+                ggml_build_forward_expand(gf_am, am);
+                ggml_backend_buffer_ptr buf_am {
+                    ggml_backend_alloc_ctx_tensors_from_buft(ctx_am.get(),
+                        ggml_backend_dev_buffer_type(ggml_backend_get_device(backend_res)))
+                };
+                if (buf_am) {
+                    ggml_backend_graph_compute(backend_res, gf_am);
+                    // Sync to ensure argmax result is ready before CPU reads it
+                    ggml_backend_synchronize(backend_res);
+                    ggml_backend_tensor_get(am, sampling.sampled.data + n_outputs_prev,
+                        0, n_outputs * sizeof(llama_token));
+
+                    // Still read logits for non-greedy samplers
+                    if (logits.data) {
+                        float * logits_out = logits.data + n_outputs_prev*n_vocab;
+                        if (n_outputs) {
+                            ggml_backend_tensor_get_async(backend_res, t_logits, logits_out,
+                                0, n_outputs*n_vocab*sizeof(float));
+                        }
+                    }
+                }
+            }
         }
 
         // extract embeddings

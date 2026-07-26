@@ -1601,3 +1601,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - npl24: 188 tok/s, no crash
 - npl8: 149 tok/s
 - Fix was the lazy-init in graph rebuild (commit 143c57dd3)
+
+### T2: Prefix cache under TP - ENABLED (2026-07-26)
+- No crash, no assert, 0 failures
+- Decode-heavy c8: 47.2 tok/s (within variance band)
+- LLAMA_PREFIX_CACHE_DISABLE removed from run_tp4_bench.sh

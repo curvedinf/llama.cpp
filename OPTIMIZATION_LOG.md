@@ -1570,3 +1570,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - Server c=1 TP4: 23 tok/s = 43 ms/token (with MTP ~2x speedup)
 - Server overhead = 43 - 93/2 = ~-4 ms (MTP amortizes well at c=1)
 - The c=8 gap is from serialized CPU sampling, not GPU.
+
+### c=8 decode aggregate (2026-07-25)
+- 8 slots x 100 tok: 110 tok/s aggregate decode
+- Per-slot: 71-86 ms/tok, draft acc 85%
+- Greedy fast-path confirmed active.

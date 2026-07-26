@@ -1418,3 +1418,10 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 Total: 5700ms. Top: Q6_K MMQ 1424ms(25%), AR 1386ms(24%), Q8_0 MMQ 449ms(8%),
 mmvf 354ms(6%), GDN 336ms(6%), FA 121ms(2%). AR is 82.1us avg x 16896 calls.
 AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev).
+
+### TP4 concurrency sweep (32-token prompts, decode-dominant) (2026-07-25)
+
+- c=1: 43.2, c=2: 41.7, c=4: 47.2, c=8: 52.6, c=16: 66.2, c=24: 52.8
+- Sweet spot: c=16 with np=16, 66.2 tok/s (0 fail)
+- c=24 drops (contention beyond GPU parallelism)
+- Scaling improves with more concurrent seqs (better GPU utilization)

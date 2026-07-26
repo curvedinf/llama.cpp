@@ -1476,3 +1476,8 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - 8x short prompts, 200 tok: per-slot 14.3 tok/s = 114 tok/s aggregate decode
 - Bench metric includes prefill: 33.1 tok/s (prefill is ~30% of total time)
 - Decode throughput is excellent; bench metric penalized by prefill cost.
+
+### Graph cache 32 (2026-07-25)
+
+- LLAMA_GRAPH_CACHE_SIZE=32: decode-heavy c8 = 44.2 tok/s (was 52.6 with default 8)
+- Worse! Larger cache = more compile/rebuild overhead. Default 8 is optimal.

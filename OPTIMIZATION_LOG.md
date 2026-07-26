@@ -1616,3 +1616,19 @@ AR/compute overlap needs double-buffering (AR writes shadow, compute reads prev)
 - MTP3 runs without crash (was caused by old reshape-view bug, fixed in T1)
 - Draft acceptance 23% (6/26), generation correct
 - MTP2 remains optimal (85 0x0p+0cceptance)
+
+### T5: Server step instrumentation (2026-07-26)
+Per-step timers at c=8 MTP2 (8 concurrent requests):
+- t_pre_decode: 24.6 ms (batch construction + MTP draft prep)
+- t_decode: 303.5 ms (3 llama_decode calls: 2 draft + 1 verify)
+- t_post_decode: 15.9 ms (sampling + streaming)
+- t_sampl: 3.2 ms (greedy argmax only)
+Total step: ~344 ms. Decode dominates (88
+### T5: Server step instrumentation (2026-07-26)
+Per-step timers at c=8 MTP2:
+- t_pre_decode: 24.6 ms (batch construction + MTP draft prep)
+- t_decode: 303.5 ms (3 llama_decode calls: 2 draft + 1 verify)
+- t_post_decode: 15.9 ms (sampling + streaming)
+- t_sampl: 3.2 ms (greedy argmax only)
+Total step: ~344 ms. Decode dominates (88 pct).
+Sampling is NOT the bottleneck (3.2 ms).

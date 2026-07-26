@@ -1373,3 +1373,11 @@ Deferred: TP backend sampler (needs meta-backend arch changes for post-allreduce
 - Server c=8 MTP: 29.5 tok/s (~50 ms/step, 8 seqs)
 - Overhead at c=8: ~30 ms unexplained beyond GPU+sampling
 - MTP is worth it (per-token faster despite draft overhead)
+
+### Allreduce optimization results (2026-07-25)
+
+- s_sleep 0x3FFF->3: kernel 95->86us, engine 147.4->148.6 tok/s (committed)
+- P2P copy approaches all slower (hipMemcpyPeerAsync per-call overhead ~17us)
+- Host-mapped memory read latency is the hw bottleneck (~1us/uncached load)
+- HIP graph capture of allreduce blocked by in-kernel busy-wait on host flags
+- np48 worse than np16 (more contention). Best remains np16: 29.5 tok/s c=8.

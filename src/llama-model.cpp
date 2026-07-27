@@ -535,10 +535,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{n_k_heads, head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
-                    return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
+                    // Flat single-segment layout: the ssm_conv_idx and gated_delta_net_idx
+                    // kernels access the store as a flat array of contiguous channels
+                    // (channel r at offset r*(d_conv-1)). The previous multi-segment layout
+                    // {key_dim*(d_conv-1), 2+head_ratio} interleaved channel groups,
+                    // corrupting output under TP tensor-split on the 2nd+ request.
+                    // A single segment ensures each device's store slice has contiguous
+                    // channels that match the kernel's flat indexing.
+                    const int64_t total = (2*key_dim + value_dim) * (hparams.ssm_d_conv - 1);
+                    return {{total, 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_s_cache)) {
-                    return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
+                    const int64_t total = n_k_heads * head_v_dim * head_v_dim * head_ratio;
+                    return {{total, 1}};
                 }
             }
 

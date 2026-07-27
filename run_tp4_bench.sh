@@ -42,7 +42,7 @@ COMMON_ARGS=(
   -fa on -ctk "${CACHE_TYPE}" -ctv "${CACHE_TYPE}"
   --no-warmup
   --metrics
-  -sm tensor -ts 1,1,1,1
+  -sm layer -ts 1,1,1,1
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 )
 

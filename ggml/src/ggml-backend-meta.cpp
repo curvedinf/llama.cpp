@@ -1169,6 +1169,14 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             for (size_t s = 0; s < split_state.n_segments; s++) {
                 ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
             }
+            // T1 fix: if the per-device split dimension is 0 but the tensor has
+            // elements, the split state is stale or wrong. Fall back to even split.
+            if (ne[split_dim] == 0 && ggml_nelements(tensor) > 0 && n_simple_bufs > 0) {
+                GGML_LOG_ERROR("META_WARN: zero split_dim for %s op=%s axis=%d ne={%ld,%ld,%ld,%ld} - falling back to even split\n",
+                    tensor->name, ggml_op_name(tensor->op), split_dim,
+                    (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3]);
+                ne[split_dim] = tensor->ne[split_dim] / n_simple_bufs;
+            }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 if (tensor->nb[i] > tensor->nb[split_dim]) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];

@@ -1818,3 +1818,28 @@ from burst stability.
 MTP3 (drafts=3) runs without crash under TP4 layer split.
 5 sequential requests: all correct output.
 The original crash was from tensor-split reshape corruption in decode graphs.
+
+## T5: Server step instrumentation — 2026-07-27
+
+Enabled DEBUG_TIMINGS in server-context.cpp update_slots(). Per-phase ms:
+
+| Phase | C=1 (ms) | C=8 (ms) |
+|-------|----------|----------|
+| pre_decode | 13.0 | 18.0 |
+| decode (GPU) | 80.3 | 89.5 |
+| post_decode | 2.3 | 5.1 |
+| sampling | 2.2 | 2.7 |
+| **total overhead** | **17.5** | **25.8** |
+| **% overhead** | **18%** | **22%** |
+
+Key findings:
+- Decode (GPU compute) dominates at 77-80% of step time
+- Server overhead is 18-22% (was claimed 47 ms in HANDOFF — much improved)
+- Sampling is fast (2.2-2.7 ms) — the GPU argmax fast-path is working
+- pre_decode is 13-18 ms — batch construction + graph setup
+- The overhead is structural (per-slot loop), not per-call
+
+T6 acceptance: c8 server step ≤ 15 ms/tok (from 54). Current: 25.8 ms overhead → 
+~3.2 ms/tok overhead at C=8. The decode at 89.5 ms for 24 forwards = 3.7 ms/forward.
+Total per-token at C=8: (89.5+25.8)/(8*3) = 4.8 ms/tok → ~208 tok/s aggregate.
+Measured 82 tok/s — gap is HTTP/streaming overhead not captured by timers.

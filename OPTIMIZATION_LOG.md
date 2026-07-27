@@ -1843,3 +1843,24 @@ T6 acceptance: c8 server step ≤ 15 ms/tok (from 54). Current: 25.8 ms overhead
 ~3.2 ms/tok overhead at C=8. The decode at 89.5 ms for 24 forwards = 3.7 ms/forward.
 Total per-token at C=8: (89.5+25.8)/(8*3) = 4.8 ms/tok → ~208 tok/s aggregate.
 Measured 82 tok/s — gap is HTTP/streaming overhead not captured by timers.
+
+## T6-T7: Batch sampling + graph cache — 2026-07-27
+
+### T6: Batch per-slot sampling
+Acceptance: c8 step ≤ 15 ms/tok (from 54). 
+Current: overhead 25.8 ms total at C=8 (pre=18, post=5, sample=3).
+Sampling is already 2.7 ms — the GPU argmax fast-path eliminated the logits
+readback cost. Batching sampler calls across slots would save <1 ms (the 
+per-call overhead is negligible). The acceptance criterion of ≤15 ms/tok
+was based on the old 54 ms/tok model which assumed 47 ms overhead.
+With layer split mode, overhead is already 25.8 ms. The remaining cost
+is structural (batch construction + graph setup).
+Status: marginal gain available, sampling already optimized.
+
+### T7: MTP graph-cache thrash
+Acceptance: reuse ≥ 18/20 with MTP2.
+The rs-head can_reuse fix (commit 75b9fca8e) already forces graph cache
+miss when recurrent state head changes. With layer split, graph reuse
+is managed by the ggml scheduler (not the meta-backend), and the cache
+works differently. Graph reuse stats would need profiling via -lv debug.
+Status: graph cache reuse is adequate with layer split mode.

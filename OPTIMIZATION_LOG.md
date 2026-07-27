@@ -1924,3 +1924,39 @@ TP4 layer split is the correct topology for this model+hardware:
 - Prefix cache works
 - Concurrent C=8 has some corruption (multi-seq recurrent state issue)
 - Independent servers per GPU would avoid corruption but lose AR benefit
+
+## Performance Optimization Continuation — 2026-07-27
+
+### Pipeline parallelism investigation
+Pipeline parallelism is NOT enabled with TP4 layer split. The graph_reserve
+with pipeline parallelism fails (compute buffer allocation failure at
+src/llama-context.cpp:650). This is due to the extra memory required for
+double-buffered pipeline stages. Reducing context to 4096 didn't help.
+
+Impact: without pipeline parallelism, layers execute sequentially across
+GPUs with synchronous copies between them. This adds latency proportional
+to the number of GPU boundaries (3 for 4 GPUs).
+
+### Prefill scaling
+| Prompt tokens | TTFT (s) | Prefill (tok/s) |
+|--------------|----------|-----------------|
+| 100 | 2.17 | 46 |
+| 500 | 1.19 | 420 |
+| 1000 | 1.32 | 755 |
+| 2000 | 1.85 | 1083 |
+
+Prefill scales well with prompt length. Short prompts have high fixed overhead.
+
+### MTP comparison (single GPU)
+| Drafts | tok/s | ms/tok | Acceptance |
+|--------|-------|--------|------------|
+| 0 | 23.0 | 44 | N/A |
+| 1 | 28.1 | 36 | 70% |
+| 2 | 34.1 | 29 | 65% |
+
+MTP2 is optimal.
+
+### Concurrent corruption (pre-existing, not TP-specific)
+The C>=3 concurrent corruption pattern ("1.1.1.1...") exists on single GPU too
+(1/5 at C=5 without MTP/TP). This is a multi-sequence recurrent state bug in
+the Qwen3.6 model implementation, separate from TP optimization.

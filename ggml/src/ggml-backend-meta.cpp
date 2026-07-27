@@ -1832,6 +1832,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
             buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+            // Clear split_state_cache on rebuild: stc_compute tensors are freed by
+            // ggml_reset below, and new tensors may reuse the same addresses, causing
+            // the cache to return stale split states from the previous graph.
+            buf_ctx->split_state_cache.clear();
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());

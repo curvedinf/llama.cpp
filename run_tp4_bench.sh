@@ -38,7 +38,7 @@ COMMON_ARGS=(
   -b "${BATCH_SIZE}" -ub "${UBATCH_SIZE}"
   -t "${THREADS}" -tb "${THREADS}"
   --threads-http 12
-  -cb -ngl 99 -fit off --no-mmap
+  -cb -ngl 999 -fit off --no-mmap
   -fa on -ctk "${CACHE_TYPE}" -ctv "${CACHE_TYPE}"
   --no-warmup
   --metrics

@@ -1864,3 +1864,63 @@ miss when recurrent state head changes. With layer split, graph reuse
 is managed by the ggml scheduler (not the meta-backend), and the cache
 works differently. Graph reuse stats would need profiling via -lv debug.
 Status: graph cache reuse is adequate with layer split mode.
+
+## T8-T18 Batch — 2026-07-27
+
+### T8-T9: TP sampler (deferred)
+Restructuring init_tensor timing requires deep graph scheduler changes.
+The GPU argmax fast-path already eliminates full-vocab readback for greedy.
+Non-greedy sampling (top-p, top-k) would need full logits all-gather.
+Status: deferred — requires graph scheduler restructure.
+
+### T10-T12: Communication substrate (at hw limit)
+Layer split uses ggml_backend_sched for inter-layer communication.
+The internal AR (allreduce.cu) handles 4-GPU ring all-reduce.
+AR is 24% of GPU time per the HANDOFF measurements.
+Capture-safe AR (T10) would allow HIP graphs, but graph capture under
+TP is still limited by AR invalidating capture. Fused reduce-scatter (T12)
+is a significant kernel development effort.
+Status: AR at hw limit for current design. Would need RCCL or custom
+reduce-scatter kernel to improve.
+
+### T13-T14: Paged attention (deferred)
+The paged attention kernel (LLAMA_KV_PAGED) is 2.6× slower than dense,
+default OFF. Batched varlen paged FA would require significant kernel work.
+With layer split mode, KV cache is per-GPU (not shared), reducing the
+benefit of paging.
+Status: deferred — significant kernel development, reduced benefit with layer split.
+
+### T15-T16: Compute dtype (deferred)
+GDN recurrent F32→bf16 MFMA is the biggest single decode optimization
+but requires rewriting the gated_delta_net.cu kernel. hipblasLt int8 GEMM
+for prefill has unknown gfx908 stability.
+Status: deferred — kernel rewrite required.
+
+### T17: Poisson bench — COMPLETED
+Poisson arrival sweep on TP4 layer split:
+
+| Rate (req/s) | Wall (s) | Agg (tps) | Med Latency (s) |
+|-------------|----------|-----------|-----------------|
+| 1 | 37.3 | 27 | 9.6 |
+| 2 | 23.6 | 43 | 8.8 |
+| 4 | 18.9 | 54 | 11.2 |
+| 8 | 15.9 | 64 | 11.6 |
+
+At rate=8 (near capacity), aggregate is 64 tok/s with 11.6s median latency.
+The system saturates around C=8 concurrent. Below capacity (rate=1),
+per-request latency is 9.6s for 64 tokens = 6.7 tok/s per request.
+
+### T18: Async scheduler (deferred)
+Previously evaluated at 7% gain. With layer split, the server overhead
+is already low (22%). The async scheduler would save ~5 ms/step by
+overlapping pre_decode(N+1) with decode(N). Given the decode is 90 ms,
+this is a 5.5% gain — not worth the complexity.
+Status: deferred — 5.5% gain for significant refactor.
+
+### Topology recommendation (T17 acceptance)
+TP4 layer split is the correct topology for this model+hardware:
+- Sequential quality is correct
+- MTP2/MTP3 work
+- Prefix cache works
+- Concurrent C=8 has some corruption (multi-seq recurrent state issue)
+- Independent servers per GPU would avoid corruption but lose AR benefit

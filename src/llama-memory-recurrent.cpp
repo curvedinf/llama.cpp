@@ -474,39 +474,10 @@ static void llama_rs_row_block_copy(
         return;
     }
 
-    if (blk.stride != 0) {
-        // the tensors are uniformly strided within the same buffer - issue a single
-        // strided copy spanning all of them; the 2d copy api bounds-checks against the
-        // anchor tensor's size, so use a synthetic tensor that covers the whole span
-        const auto * anchor = tensors[blk.first];
-
-        const size_t span = row*blk.rb + (blk.n - 1)*blk.stride + blk.rb;
-
-        ggml_tensor t_span = {};
-
-        t_span.type   = GGML_TYPE_I8;
-        t_span.buffer = anchor->buffer;
-        t_span.data   = anchor->data;
-
-        t_span.ne[0] = span;
-        t_span.ne[1] = 1;
-        t_span.ne[2] = 1;
-        t_span.ne[3] = 1;
-
-        t_span.nb[0] = 1;
-        t_span.nb[1] = span;
-        t_span.nb[2] = span;
-        t_span.nb[3] = span;
-
-        if (is_get) {
-            ggml_backend_tensor_get_2d_async(backend, &t_span, data, row*blk.rb, blk.rb, blk.n, blk.stride, blk.rb);
-        } else {
-            ggml_backend_tensor_set_2d_async(backend, &t_span, data, row*blk.rb, blk.rb, blk.n, blk.stride, blk.rb);
-        }
-        return;
-    }
-
-    // non-uniform layout - copy per layer
+    // Always copy per-layer to ensure the meta-backend's split state is correctly
+    // applied for each tensor. The previous "uniform strided copy" optimization
+    // used a synthetic MIRRORED span tensor, which ignored the per-tensor split
+    // state and read/wrote wrong data under tensor parallelism.
     int i = 0;
     for (size_t il = 0; il < tensors.size(); ++il) {
         if (!tensors[il]) {
@@ -515,7 +486,7 @@ static void llama_rs_row_block_copy(
         if (is_get) {
             ggml_backend_tensor_get_async(backend, tensors[il], data + i*blk.rb, row*blk.rb, blk.rb);
         } else {
-            ggml_backend_tensor_set(tensors[il], data + i*blk.rb, row*blk.rb, blk.rb);
+            ggml_backend_tensor_set_async(backend, tensors[il], data + i*blk.rb, row*blk.rb, blk.rb);
         }
         i++;
     }

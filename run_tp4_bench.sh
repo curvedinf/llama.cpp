@@ -23,9 +23,9 @@ PREFILL_CHUNK="${PREFILL_CHUNK:-1024}"
 SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 
 export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
-# Prefix cache: was disabled for TP due to D4 (nr>1 gather in get/set_tensor_async).
-# T1 fix may have resolved this. Test enabled.
-export LLAMA_PREFIX_CACHE_DISABLE=1
+# Prefix cache: re-enabled with -sm layer (tensor split's meta-backend had
+# split state bugs in handle_reshape; layer split keeps tensors whole).
+export LLAMA_PREFIX_CACHE_DISABLE=0
 
 mkdir -p "${LOG_DIR}"
 

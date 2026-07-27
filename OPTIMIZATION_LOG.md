@@ -1960,3 +1960,29 @@ MTP2 is optimal.
 The C>=3 concurrent corruption pattern ("1.1.1.1...") exists on single GPU too
 (1/5 at C=5 without MTP/TP). This is a multi-sequence recurrent state bug in
 the Qwen3.6 model implementation, separate from TP optimization.
+
+## Final Performance Summary — 2026-07-27
+
+### Production config: TP4 layer split, c=16384, np=8, MTP2
+
+| Metric | llama.cpp TP4 | vLLM TP4 (105W) | Gap |
+|--------|--------------|-----------------|-----|
+| C=1 decode | 33.7 tok/s | ~150 tok/s | 4.5× |
+| C=8 aggregate | ~82 tok/s | ~150 tok/s | 1.8× |
+| Prefill (500 tok) | 304 tok/s | ~1500 tok/s | 4.9× |
+| Sequential quality | Correct | Correct | ✓ |
+
+### Key findings:
+1. Layer split (`-sm layer`) avoids the meta-backend tensor split corruption
+2. Pipeline parallelism can be enabled with smaller context but doesn't improve C=1
+3. The decode gap is compute-bound (GPU limited at 105W power cap)
+4. The prefill gap requires int8 GEMM (T16) or larger batch sizes
+5. Sequential quality is correct; concurrent C>=3 has pre-existing multi-seq corruption
+
+### Commits (all functional code):
+- `0ead8e11c` Flat segments + ssm_conv_idx for prefill
+- `49f9c78ed` Per-layer snapshot/restore copy
+- `ab4f3cf40` split_state_cache clear on rebuild
+- `271195667` Layer split + zero-split fallback
+- `8b0d2ebef` Prefix cache re-enabled
+- `2d6a42082` ngl=999 for pipeline parallelism

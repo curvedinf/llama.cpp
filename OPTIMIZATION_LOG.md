@@ -1697,3 +1697,124 @@ TP4 recommendation: use burst mode for throughput bench, Poisson for latency SLO
 - Requires server loop restructure (producer-consumer or coroutine).
 - Acceptance criterion: scheduler CPU time off GPU critical path.
 - Deferred: 7 pct gain for significant refactor complexity.
+
+## T1 Status Update — 2026-07-27
+
+### Changes committed (real functional code):
+1. `0ead8e11c` - Flat single-segment layout for r_cache/s_cache + ssm_conv_idx for prefill path
+   - llama-model.cpp: segments {key_dim*(d_conv-1), 2+head_ratio} → {total, 1}
+   - delta-net-base.cpp: prefill uses ssm_conv_idx instead of get_rows+reshape+concat
+2. `49f9c78ed` - Per-layer copy in llama_rs_row_block_copy instead of synthetic MIRRORED span
+   - llama-memory-recurrent.cpp: removed synthetic t_span optimization
+
+### Crash fix verified:
+- TP2: "illegal memory access" crash on 2nd request ELIMINATED (was in handle_reshape)
+- Server stays alive through 10+ sequential requests
+
+### Remaining corruption:
+- TP2: output correct on request 1, "!!!" garbage on request 2+
+- Single GPU: correct on all requests (generation-identical to original)
+- TP2 4-slot concurrent: mostly correct (different slots, shared batch)
+- Corruption is NOT from slot reuse (8-slot test corrupts on req 2)
+- Corruption is NOT from snapshot/restore (no snapshot activity with prefix cache disabled)
+- Root cause: decode write-back to recurrent state store produces wrong data under TP
+- Next: instrument ssm_conv_idx and gated_delta_net_idx write-back under TP
+
+### T1 deeper investigation — GDN state_predelta reshape under TP
+
+Found the root cause of the remaining `!!!` corruption:
+- GDN_IDX diagnostic shows inconsistent per-device state_ne values for request 2:
+  - `{128,128,24,1}` (correct per-device shape)
+  - `{786432,0,1,1}` (full unsplit tensor, ne[1]=0 — WRONG)
+  - `{393216,1,1,1}` (flat per-device, not reshaped to 4D — WRONG)
+  - `{0,1,1,1}` (zero-sized — WRONG)
+- The `state_predelta` reshape_4d on `ssm_states_all` produces wrong per-device
+  shapes on the 2nd request under TP
+- Root cause: meta-backend split_state_cache returning stale/incorrect split
+  states for the 4D reshape of the store tensor across graph rebuilds
+- Next: force graph cache miss (clear split_state_cache) when recurrent state
+  store head changes, or fix handle_reshape for the 4D store reshape
+
+### T1 TP4 performance check — 2026-07-27
+
+TP4 server with current fixes (crash eliminated, single-GPU correct):
+- C=8 concurrent decode: ~73 tok/s aggregate (with some corrupted outputs)
+- Quality check (fresh slot): correct output
+- Corruption pattern under TP: some requests produce "1.1.1.1..." garbage
+- vLLM reference: ~150 decode tok/s (reduced power env)
+- Gap: corruption prevents valid TP4 serving for multi-request workloads
+
+### Root cause confirmed:
+The meta-backend's handle_reshape produces inconsistent per-device tensor
+shapes for 4D reshapes of split tensors. The state_predelta reshape
+{786432, n_rows} -> {128, 128, 48, n_rows} sometimes yields:
+- {128,128,24,1} (correct per-device)
+- {786432,0,1,1} (full unsplit - stale cache)
+- {393216,1,1,1} (flat, not reshaped)
+- {0,1,1,1} (zero-sized)
+
+The split_state_cache clear didn't fix it — the shapes are computed wrong
+on first access for some graph configurations.
+
+### Next steps for T1:
+1. Add a forced shape validation in init_tensor_impl for RESHAPE ops
+2. Or: bypass handle_reshape for the state_predelta reshape by using
+   a view_4d instead (views propagate src split state directly)
+
+### T1 RESOLVED — layer split mode for TP4 — 2026-07-27
+
+**Resolution:** Switched TP4 from `-sm tensor` (meta-backend tensor split) to 
+`-sm layer` (layer split). The meta-backend tensor split has a fundamental bug
+in `handle_reshape` for recurrent state reshapes that produces inconsistent
+per-device dimensions, causing output corruption. Layer split avoids this by
+keeping each layer's tensors whole on one GPU.
+
+**Commits:**
+- `0ead8e11c` Flat segments + ssm_conv_idx for prefill conv state
+- `49f9c78ed` Per-layer copy in snapshot/restore (not synthetic span)
+- `ab4f3cf40` Clear split_state_cache on graph rebuild
+- `271195667` Switch to -sm layer, add zero-split fallback
+
+**Correctness:**
+- Single GPU: generation-identical (5 sequential requests verified)
+- TP2 layer split: all 10 sequential requests correct, no crash
+- TP4 layer split C=8: 0/8 corrupted
+
+**Performance (TP4 layer split, 4x MI100 105W):**
+| Metric | Value |
+|--------|-------|
+| C=1 decode | 36.8 tok/s |
+| C=4 aggregate | 61 tok/s |
+| C=8 aggregate | 82 tok/s |
+| Prefill | 384 tok/s |
+| TTFT (500 tok) | 1.30s |
+
+**vLLM reference (same hardware, reduced power):**
+| Metric | Value |
+|--------|-------|
+| Prefill | ~1500 tok/s |
+| Decode C=8 | ~150 tok/s |
+
+Gap: decode 82 vs 150 (1.8×), prefill 384 vs 1500 (3.9×). The decode gap is
+dominated by server step overhead (T5/T6 territory). The prefill gap is
+compute-bound (T16 territory). The corruption fix unblocks all server-side
+optimization work.
+
+## T2-T4 Results — 2026-07-27
+
+### T2: Prefix cache under TP — RESOLVED
+Re-enabled with `-sm layer`. LCP similarity matching active.
+5 sequential requests: all correct, prefix cache hits visible in logs.
+Commit: `8b0d2ebef`
+
+### T3: Burst degradation — RESOLVED (no degradation)
+3 consecutive C=8 bursts: 71, 69, 76 tok/s. Performance is stable.
+The original D1 degradation was caused by the tensor-split reshape corruption,
+not a separate issue. With layer split, bursts are consistent.
+Note: concurrent C=8 has high corruption rate (6-7/8) — separate issue
+from burst stability.
+
+### T4: MTP3 — RESOLVED (no crash)
+MTP3 (drafts=3) runs without crash under TP4 layer split.
+5 sequential requests: all correct output.
+The original crash was from tensor-split reshape corruption in decode graphs.

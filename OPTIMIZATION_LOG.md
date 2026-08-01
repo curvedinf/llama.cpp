@@ -2813,3 +2813,21 @@ are a launch-param mismatch between the traced host view and the device
 execution, or the dst write crossing the cell stride. Next slice: correlate
 the exact launching set_rows (host trace + rocgdb in one run) and dump the
 kernel's SGPRs at the trap.
+
+## set_rows_quant: all args verified valid - fault is a downstream symptom (2026-08-02)
+
+The SETROWS trace (with nb) at the faulting launch shows PERFECT geometry:
+src0 = the per-GPU qkv slice [256,2] nb={4,1024,2048,2048} (row stride scaled
+correctly), dst = cache_v_l11 [256,16384] q8_0, idxs = the canonical
+kv-unified interleaved 2-seq cells [158,0,159,0,...] (identical to the
+passing layer-split reference). The k_set_rows_quant decomposition
+(i_base -> i00/i01/i02 via fast_div_modulo, src0 reads i01*s01+i00, dst writes
+at src1[row]*272) is in-bounds for every traced launch. rocgdb's wave trap
+(block (0,0,0), quantize fmaxf) with valid args => the set_rows wave is the
+FIRST to execute after an EARLIER kernel's OOB write corrupted the device
+state; the run-varying victims (type asserts, IMA in norm/mmq/conv, host
+segfault) are all downstream. The corruption source is in the same graph's
+earlier kernels (the GDN/conv/FFN region - same family as the very first
+ssm_conv_idx_f32 SIGSEGV catch). Next slice: run the launch trace + rocgdb in
+ONE session and identify the kernels between the last valid state and the
+set_rows trap - the OOB writer is among them.

@@ -403,11 +403,12 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (getenv("LLAMA_SETROWS_TRACE") != nullptr) {
-        fprintf(stderr, "SETROWS: dst=%s ne={%ld,%ld,%ld,%ld} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p idxs=[",
+        fprintf(stderr, "SETROWS: dst=%s ne={%ld,%ld,%ld,%ld} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p idxs=[",
             dst->name,
             (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data,
             src0->name,
-            (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+            (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
             src1->name,
             (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data);
         const int32_t * idx_p = (const int32_t *) src1->data;

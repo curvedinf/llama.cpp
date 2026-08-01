@@ -482,12 +482,21 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
         const ggml_meta_tensor_key key = ggml_meta_tensor_key_of(tensor);
         if (stc_static.simple_tensors.find(key) != stc_static.simple_tensors.end()) {
+            if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
+                fprintf(stderr, "STC_LOOKUP: %s p=%p -> STATIC\n", tensor->name, (void *) tensor);
+            }
             return stc_static;
         }
         for (auto & kv : stc_compute) {
             if (kv.second.simple_tensors.find(key) != kv.second.simple_tensors.end()) {
+                if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
+                    fprintf(stderr, "STC_LOOKUP: %s p=%p -> UID=%llu\n", tensor->name, (void *) tensor, (unsigned long long) kv.first);
+                }
                 return kv.second;
             }
+        }
+        if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
+            fprintf(stderr, "STC_LOOKUP: %s p=%p -> CURRENT(staging)\n", tensor->name, (void *) tensor);
         }
         return stc_compute_current;
     }
@@ -1357,10 +1366,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+
+    // Mirrored input leafs (k_idxs, masks, block tables) are written from the host
+    // between computes and read by the cached per-GPU subgraphs. Their copies must
+    // live in the never-reset static container: the staging container is reset and
+    // its memory recycled at every rebuild of any graph, and a graph whose leaf
+    // copies were re-created there reads recycled memory on its next compute
+    // (observed as garbage k_idxs and HSA MEMORY_APERTURE_VIOLATION under
+    // concurrent load). Routing alloc-time init here guarantees the copies exist
+    // before the first host write, so set_tensor and the subgraph src links
+    // (resolved static-first) always agree.
+    if (tensor->op == GGML_OP_NONE) {
+        const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ true);
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_static, tensor);
+        }
+    }
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     if (getenv("LLAMA_META_TRACE") != nullptr) {
@@ -1371,6 +1397,18 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
             (int) split_state.axis, split_state.n_segments, split_state.nr[0], offset, size);
     }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    // Host writes to graph input leafs (KV indices, the recurrent-state store,
+    // masks) can run before this graph's first compute or between computes. The
+    // copies must exist in the never-reset static container: alloc-time copies
+    // land in the staging container, which is reset (memory recycled) at every
+    // rebuild of ANY graph, and cached per-GPU subgraphs keep referencing the
+    // freed copies - the next compute reads recycled memory (observed as garbage
+    // k_idxs, HSA MEMORY_APERTURE_VIOLATION, and hipBLAS internal errors under
+    // concurrent load).
+    if (ggml_backend_meta_buffer_simple_tensor(tensor, 0) == nullptr) {
+        ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_static, tensor);
+    }
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
@@ -1462,11 +1500,21 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 if (simple_tensor == nullptr) {
                     // The scheduler's input copies can run before this graph's first
                     // rebuild, so the input tensors' per-GPU copies may not exist
-                    // yet - create them on demand (they land in the staging
-                    // container and are adopted into the graph's uid container at
-                    // the first rebuild).
-                    ggml_backend_meta_buffer_init_tensor(buffer, tensor);
+                    // yet. They MUST NOT be created in the staging container: the
+                    // staging container is reset and its memory recycled at every
+                    // rebuild of any graph, while the cached per-GPU subgraphs keep
+                    // referencing the copies - the next compute then reads recycled
+                    // memory (observed as garbage k_idxs and HSA aperture faults).
+                    // The static container is never reset, so mirrored input leafs
+                    // (k_idxs, masks, block tables) get stable copies there and the
+                    // subgraph src links (resolved static-first) always see the
+                    // content written here.
+                    ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_static, tensor);
                     simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                }
+                if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
+                    fprintf(stderr, "SETTENSOR_MIRROR: %s j=%zu simple=%p data=%p (%.6f)\n", tensor->name, j, (void *) simple_tensor,
+                        (void *) simple_tensor->data, simple_tensor->data != nullptr ? ((const float *) simple_tensor->data)[0] : 0.0f);
                 }
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
@@ -1692,7 +1740,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    ggml_backend_meta_simple_tensor_container stc_static;
+    ggml_backend_meta_simple_tensor_container stc_static(params, n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_current(params, n_simple_bufts);
 
     size_t max_size = 0;
@@ -2073,14 +2121,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 for (auto & kv : buf_ctx->stc_compute) {
                     if (kv.second.simple_tensors.count(t_key) != 0) {
                         in_compute = true;
+                        if (getenv("LLAMA_META_TRACE") != nullptr && kv.first != cgraph->uid &&
+                                (strstr(t->name, "leaf_61") != nullptr || strstr(t->name, "leaf_63") != nullptr)) {
+                            fprintf(stderr, "CROSS_UID_SHARE: %s p=%p this_uid=%llu other_uid=%llu\n", t->name,
+                                (void *) t, (unsigned long long) cgraph->uid, (unsigned long long) kv.first);
+                        }
                         break;
                     }
                 }
                 needs_init = !in_compute;
             }
             if (needs_init) {
-                if (getenv("LLAMA_META_TRACE") != nullptr && strstr(t->name, "pregate") != nullptr) {
-                    fprintf(stderr, "PREINIT_PREGATE: %s needs_init=1\n", t->name);
+                if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(t->name, "leaf_61") != nullptr || strstr(t->name, "leaf_63") != nullptr)) {
+                    fprintf(stderr, "PREINIT: %s p=%p uid=%llu needs_init=1\n", t->name, (void *) t, (unsigned long long) cgraph->uid);
                 }
                 // Initialize sources first so split_state can be computed. Tensors are
                 // created in THIS graph's uid container: the dispatch-based init would
@@ -2531,7 +2584,63 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
+        if (getenv("LLAMA_META_TRACE") != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                ggml_tensor * last = cgraph_ij->nodes[cgraph_ij->n_nodes-1];
+                if (!ggml_backend_buffer_is_meta(last->buffer) || ggml_backend_meta_buffer_simple_tensor(last, j) == nullptr) {
+                    // graph outputs may live outside the per-GPU containers - read the
+                    // raw slice from the simple buffer directly
+                    if (ggml_backend_buffer_is_meta(last->buffer)) {
+                        ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(last->buffer, j);
+                        const size_t nchk = std::min<size_t>(ggml_nelements(last), 1024);
+                        std::vector<float> chk(nchk);
+                        simple_buf->iface.get_tensor(simple_buf, last, chk.data(), 0, nchk*sizeof(float));
+                        double s = 0.0;
+                        for (size_t k = 0; k < nchk; k++) {
+                            s += chk[k];
+                        }
+                        fprintf(stderr, "OUT_IN: i=%zu j=%zu node=%s ne=%lld,%lld,%lld,%lld s=%.6f v0=%.6f v1=%.6f RAW\n",
+                            i, j, last->name, (long long) last->ne[0], (long long) last->ne[1],
+                            (long long) last->ne[2], (long long) last->ne[3], s, chk[0], chk[1]);
+                    } else {
+                        fprintf(stderr, "OUT_IN: i=%zu j=%zu node=%s NO_SIMPLE\n", i, j, last->name);
+                    }
+                    continue;
+                }
+                const size_t nchk = std::min<size_t>(ggml_nelements(last), 1024);
+                std::vector<float> chk(nchk);
+                ggml_backend_tensor_get(last, chk.data(), 0, nchk*sizeof(float));
+                double s = 0.0;
+                for (size_t k = 0; k < nchk; k++) {
+                    s += chk[k];
+                }
+                fprintf(stderr, "OUT_IN: i=%zu j=%zu node=%s ne=%lld,%lld,%lld,%lld s=%.6f v0=%.6f v1=%.6f\n",
+                    i, j, last->name, (long long) last->ne[0], (long long) last->ne[1],
+                    (long long) last->ne[2], (long long) last->ne[3], s, chk[0], chk[1]);
+            }
+        }
+
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    ggml_tensor * last = cgraph_ij->nodes[cgraph_ij->n_nodes-1];
+                    const size_t nchk = std::min<size_t>(ggml_nelements(last), 1024);
+                    std::vector<float> chk(nchk);
+                    ggml_backend_tensor_get(last, chk.data(), 0, nchk*sizeof(float));
+                    double s = 0.0;
+                    for (size_t k = 0; k < nchk; k++) {
+                        s += chk[k];
+                    }
+                    fprintf(stderr, "AR_IN: i=%zu j=%zu node=%s ne=%lld,%lld,%lld,%lld s=%.6f v0=%.6f v1=%.6f flags=%x data=%p\n",
+                        i, j, last->name, (long long) last->ne[0], (long long) last->ne[1],
+                        (long long) last->ne[2], (long long) last->ne[3], s, chk[0], chk[1],
+                        (unsigned) last->flags, last->data);
+                }
+            }
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;

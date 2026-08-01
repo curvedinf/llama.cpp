@@ -771,28 +771,43 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// The per-device compute context, registered by ggml_backend_cuda_init. Buffer
+// get/set/memset must run on (and sync) the device's main compute stream so they
+// are ordered against the kernels enqueued by graph compute. The previous
+// cudaStreamPerThread copies raced the compute stream: a get could read the
+// pre-compute contents of a tensor (the sampler sampled stale, pre-allreduce
+// logits; the MTP readbacks returned half-written recurrent state) and a set
+// could land after the kernels that consume it.
+static ggml_backend_cuda_context * g_cuda_ctx_by_device[GGML_CUDA_MAX_DEVICES] = { nullptr };
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
+    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -800,9 +815,11 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
     CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -810,9 +827,11 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
     CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -823,16 +842,27 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
-        if (src_physical == dst_physical) {
+        ggml_backend_cuda_context * cuda_ctx_dst = g_cuda_ctx_by_device[dst_ctx->device];
+        if (cuda_ctx_dst != nullptr) {
+            // the src data must be ready (sync the src device's stream) and the copy
+            // must be ordered before anything the dst device runs next
+            ggml_backend_cuda_context * cuda_ctx_src = g_cuda_ctx_by_device[src_ctx->device];
+            if (cuda_ctx_src != nullptr) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx_src->stream()));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cuda_ctx_dst->stream()));
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx_dst->stream()));
+        } else if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 #endif
         }
-        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return true;
     }
     return false;
@@ -844,8 +874,10 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
+    cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
+    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -5401,6 +5433,7 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+    g_cuda_ctx_by_device[device] = ctx;
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),

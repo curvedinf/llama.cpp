@@ -2622,3 +2622,52 @@ large fixed size (no re-init) as the fix.
 Also noted: the previous run showed a different garbage address (0x19a891540),
 so the corruption is content/timing dependent, consistent with recycled pool
 memory.
+
+## TP4 concurrent IMA: staging-container root cause found + fixed; C-boundary characterized (2026-08-01)
+
+### Root cause of the garbage-k_idxs crash class (FIXED)
+The first C=8 burst of this session crashed (set-rows.cu:391 type assert, then HSA
+MEMORY_APERTURE_VIOLATION, then hipBLAS internal errors). LLAMA_SETROWS_TRACE
+showed the per-GPU k_idxs mirrors (leaf_61/63) holding garbage
+(idxs=[1060622222,-1077968025]) on GPUs 1-3 while GPU 0 stayed correct.
+
+Mechanism (ggml-backend-meta.cpp):
+- Mirrored input leafs (k_idxs, masks) were created in the STAGING container
+  (stc_compute_current) at graph alloc / on-demand at set_tensor time, and the
+  per-GPU subgraph nodes' src links resolved static-first -> uids -> staging, so
+  they referenced the staging copies.
+- The staging container is RESET (ggml_reset + map clear) at the start of every
+  rebuild of ANY graph (line ~2041). With the main + MTP contexts alternating
+  through one shared meta backend, every decode step rebuilds -> the staging
+  arena is recycled -> cached subgraphs read freed memory. First-compute graphs
+  read freshly-created uninitialized uid copies (the [0,0] cell pattern), later
+  computes read recycled staging memory (the garbage idxs) -> KV writes to
+  garbage cells -> HSA aperture violation.
+
+FIX (3 parts):
+1. alloc-time init of mirrored GGML_OP_NONE tensors routes to the never-reset
+   static container (ggml_backend_meta_buffer_init_tensor).
+2. set_tensor MIRRORED case creates missing copies in the static container
+   instead of the staging container.
+3. set_tensor now ensures copies exist (static) for ALL split branches before
+   writing (the recurrent-state store, axis-0 split, had the same first-compute
+   write-loss).
+
+Result: garbage idxs GONE from the trace (verified across runs); the first
+burst's [0,0] also became the canonical kv-unified [c,0,c+1,0,...] pattern
+(verified IDENTICAL on the layer-split reference, which passes 8/8 - the
+"cell-0 anomaly" from the 2026-08-01 morning analysis was a misread of the
+stale staging copies).
+
+### Remaining: tensor-split concurrent IMA (NOT fixed)
+C8 burst still crashes on -sm tensor (no MTP needed): "an illegal memory access
+was encountered" (hipGetLastError at next launch). Fault family per
+LLAMA_LAUNCH_TRACE: the unnamed grid={160,1,1} block={128,1,1} / grid={8,1,1}
+block={1024,1,1} kernels (Q6_K mmq FFN projections) right after swiglu, ~6s into
+the first concurrent prefill. Same class as the open "4-GPU CONCURRENT load"
+crash (conv args verified valid; recycled-memory suspects).
+
+Concurrency boundary measured (burst_c8, 48 tok, short prompts):
+- C=1: 11.6 agg tok/s OK; C=2: 26.9 OK; C=4: 34.6 OK; C=6: CRASH; C=8: CRASH.
+Next: rocgdb wavefront PC at the fault (batch = 160 tokens = 8x20, so the
+boundary may be the 160-token ubatch graph, not the concurrency).

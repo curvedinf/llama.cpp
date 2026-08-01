@@ -81,6 +81,11 @@ static void set_rows_cuda_quant(
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
 
+    if (ne00 % qk != 0) {
+        fprintf(stderr, "SETROWS_QK_BAD: ne00=%lld ne01=%lld ne02=%lld ne03=%lld qk=%d src0_d=%p src1_d=%p dst_d=%p nb01=%zu nb02=%zu nb03=%zu\n",
+            (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03, qk, (void *) src0_d, (void *) src1_d,
+            (void *) dst_d, nb01, nb02, nb03);
+    }
     GGML_ASSERT(ne00 % qk == 0);
     const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / qk;
     const int num_blocks = (ne_total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;

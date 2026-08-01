@@ -3969,9 +3969,9 @@ struct test_ssm_conv_idx : public test_case {
         ggml_set_name(c,      "c");
         ggml_set_name(store,  "store");
         ggml_set_name(s_idxs, "s_idxs");
-        ggml_tensor * out1 = ggml_ssm_conv_idx(ctx, sx,  c, store, s_idxs);
+        ggml_tensor * out1 = ggml_ssm_conv_idx(ctx, sx,  c, store, s_idxs, 0);
         // second pass reads the state written in place by the first, so the write-back is verified too
-        ggml_tensor * out2 = ggml_ssm_conv_idx(ctx, sx2, c, store, s_idxs);
+        ggml_tensor * out2 = ggml_ssm_conv_idx(ctx, sx2, c, store, s_idxs, 0);
         return ggml_add(ctx, out1, out2);
     }
 
@@ -4268,7 +4268,7 @@ struct test_gated_delta_net_idx : public test_case {
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
-        ggml_tensor * out = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state, s_idxs, K, state_ip);
+        ggml_tensor * out = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state, s_idxs, K, state_ip, 0);
         if (!state_ip) {
             return out;
         }

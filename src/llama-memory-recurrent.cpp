@@ -1021,6 +1021,32 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 }
             }
 
+            // Zero the state rows assigned to fresh sequences here instead of relying
+            // solely on the graph-based zeroing in build_rs_store_zero: that zeroing is
+            // baked into the graph at build time with the fresh-row set seen then, and
+            // when the graph is later reused for a different fresh-row set (e.g. a new
+            // request taking a different free row) the stale baked views zero the wrong
+            // rows, leaving the fresh sequence to read a previous occupant's state.
+            if (n_rs_seq == 0) {
+                for (int32_t row : fresh_rows) {
+                    if (row < 0) {
+                        continue;
+                    }
+                    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                        if (r_l[il] != nullptr) {
+                            const size_t row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
+                            std::vector<uint8_t> zeros(row_size, 0);
+                            ggml_backend_tensor_set(r_l[il], zeros.data(), (size_t) row*row_size, row_size);
+                        }
+                        if (s_l[il] != nullptr) {
+                            const size_t row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
+                            std::vector<uint8_t> zeros(row_size, 0);
+                            ggml_backend_tensor_set(s_l[il], zeros.data(), (size_t) row*row_size, row_size);
+                        }
+                    }
+                }
+            }
+
         if (getenv("LLAMA_RS_DEBUG") != nullptr) {
             fprintf(stderr, "RS_CELLS: min=%d max=%d head=%d n=%u rs_z=%d n_seqs=%u |", min, max, head, n, rs_z, n_seqs);
             fprintf(stderr, " seqs=[");

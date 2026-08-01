@@ -62,7 +62,7 @@ static bool run_case(ggml_backend_t backend, const test_cfg & cfg) {
 
     // indexed path
     ggml_tensor * state_i = ggml_reshape_4d(ctx, store, cfg.S_v, cfg.S_v, cfg.H_v, cfg.n_rows);
-    ggml_tensor * out_i   = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state_i, idx, cfg.K, false);
+    ggml_tensor * out_i   = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state_i, idx, cfg.K, false, 0);
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -187,7 +187,7 @@ static bool run_case_inplace(ggml_backend_t backend, const test_cfg & cfg) {
 
     // indexed in-place path
     ggml_tensor * state_i = ggml_reshape_4d(ctx, store, cfg.S_v, cfg.S_v, cfg.H_v, cfg.n_rows);
-    ggml_tensor * out_i   = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state_i, idx, 1, true);
+    ggml_tensor * out_i   = ggml_gated_delta_net_idx(ctx, q, k, v, g, beta, state_i, idx, 1, true, 0);
 
     ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -323,7 +323,7 @@ static bool run_case_conv_inplace(ggml_backend_t backend, const test_conv_cfg & 
     ggml_tensor * ref       = ggml_ssm_conv(ctx, conv_in, weight);
 
     // indexed in-place path
-    ggml_tensor * out_i = ggml_ssm_conv_idx(ctx, tokens, weight, store, idx);
+    ggml_tensor * out_i = ggml_ssm_conv_idx(ctx, tokens, weight, store, idx, 0);
 
     // this test computes the graph directly, bypassing the scheduler's supports_op fallback;
     // skip shapes the backend does not claim (e.g. the HIP ssm-conv kernels require nr % 128 == 0)

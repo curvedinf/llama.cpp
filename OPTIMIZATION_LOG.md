@@ -2885,3 +2885,43 @@ tell.
 ### Committed this turn
 - fattn-vec.cuh padded-column write guard.
 - llama-kv-cache.cpp Meta() buft gate.
+
+## TP4 C8 crash hunt: rocgdb wave forensics - set_rows_quant device args mismatch (2026-08-02, continued)
+
+### What was ruled out (all with the current HEAD+slack+fattn-guard build, burst_c8 C=8)
+- The staged old-container design: reintroduces the fingerprint-key stale-copy class
+  (host assert on garbage-geometry state copy) - discarded, HEAD design confirmed.
+- Async input copies: LLAMA_META_SYNC_COPIES=1 (sync scatter/gather) - crash persists.
+- RCCL allreduce: LLAMA_DISABLE_COMM=1 - crash persists (fallback butterfly too).
+- HIP graphs: GGML_CUDA_DISABLE_GRAPHS=1 - crash persists (one run hit a different,
+  one-off rocBLAS Tensile lazy-init race instead - "unordered_map::at").
+- C=4 also crashes now (~100% first-burst repro, old boundary was C<=4 OK).
+
+### The trap (rocgdb batch catch, no blocking, register dump)
+Faulting kernel: `k_set_rows_quant<long, block_q8_0, 32, quantize_f32_q8_0_block>` at
+set-rows.cu:65 (the quantize) - the KV write of the 2-seq MTP verify ubatch
+(nt=8 ns=2, the layer-3 K write, idxs=[0,0], src0 = the qkv slice {256,2,1,1}
+nb={4,1024,2048,2048}). Trap PC = s_waitcnt vmcnt(0) after the src0 block loads.
+The wave's VGPRs (block 0,0,0; queue 1 = GPU 1):
+- src0 load base = 0x7ff0cd270680 (+80..+112 dwordx4 loads) - MATCHES the SETROWS
+  trace src0 data for the trapping launch (cache_k_l3, line 499 of the catch log).
+- dst write base = 0x7ff36ea0a7e0 = the traced cache_k_l3 pool base (0x7ff36ea00000)
+  + 0xa7e0 (43,488 B) - the cell-0 write should sit at +0. 43,488 is NOT a multiple
+  of the q8_0 cell stride (272 B; 43,488 = 272*159 + 240) - the device-side dst
+  pointer does NOT correspond to any valid cell offset of the traced pool.
+- a second dst region at 0x7ff1263de040 (q8 block addresses, 4-B steps) - matches no
+  traced tensor address of the last SETROWS lines.
+Conclusion: the DEVICE executed with a dst pointer that differs from the dispatch-time
+tensor pointer by +0xa7e0 - the "valid host args, wrong device execution" class the
+previous session suspected ("the remaining possibility: a launch-param mismatch
+between the traced host view and the device execution"). NOT explained by HIP-graph
+replay (disabled - crash persists), not by the async copies, not by the allreduce.
+
+### Next slice
+Identify what lives at 0x7ff36ea00000+0xa7e0 and 0x7ff1263de040 in the per-GPU buffer
+map: extend the SETROWS trace to print src0/dst buffer base+size (the CONV trace
+already does this for its tensors) and dump the meta's per-device buffer map at
+alloc; rerun the catch and match the register addresses against the map. The +0xa7e0
+offset likely identifies a layer/kv-unified slice boundary (the kv-unified pools are
+layer-sliced) - the stale pointer may be a VIEW_OFFS-miscalculated per-GPU copy
+(same family as the state-view strided copies) rather than a kernel index bug.

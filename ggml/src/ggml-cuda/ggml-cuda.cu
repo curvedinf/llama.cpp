@@ -2500,7 +2500,14 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         ggml_tensor * node = cgraph->nodes[i];
 
         if (getenv("LLAMA_GRAPH_CHECK_TRACE") != nullptr && ((uintptr_t) node < 0x10000 || ((uintptr_t) node & 1) != 0)) {
-            fprintf(stderr, "GRAPH_CHECK_BAD: node[%d]=%p\n", i, (void *) node);
+            fprintf(stderr, "GRAPH_CHECK_BAD: node[%d]=%p n_nodes=%d |", i, (void *) node, cgraph->n_nodes);
+            for (int k = i - 4; k <= i + 4; k++) {
+                if (k < 0 || k >= cgraph->n_nodes) continue;
+                ggml_tensor * nk = cgraph->nodes[k];
+                fprintf(stderr, " [%d]=%p%s", k, (void *) nk,
+                    (nk != nullptr && (uintptr_t) nk > 0x10000 && ((uintptr_t) nk & 1) == 0) ? "" : "?");
+            }
+            fprintf(stderr, "\n");
         }
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;

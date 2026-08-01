@@ -2576,3 +2576,49 @@ wavefront to trap; the traced args are from the same call sequence), or
 (b) an access beyond the GPU aperture from a vectorized read at the region
 edge. Next: capture the exact faulting address from the wavefront trap state
 (rocgdb "info waves" / wave status) on the crashing call.
+
+## MTP-on-TP readback chain fixed; first-request subgraph garbage remains (2026-08-01)
+
+### Fixed and committed (d3e551547)
+- Meta get/set_tensor: non-contiguous (permuted) axis-2 split tensors now have a
+  strided gather/scatter path (per-axis-element slab rows via the buffer iface,
+  bypassing the row-major nbytes assert); slab size uses ggml_row_size (the
+  nb[0]*ne[0] formula was wrong for q8_0).
+- Per-GPU view creation: stride scaling by INDEX (i > split_dim) instead of the
+  nb-ordering test (nb[i] > nb[split_dim]) - the ordering test wrongly scaled
+  dims below the split axis for non-contiguous tensors.
+- Mirrored set/get: lazy init of missing per-GPU copies (the scheduler's input
+  copies run before this graph's first rebuild, so input tensors like the MTP
+  pre-gate had no per-GPU copies yet -> NULL deref).
+- Pre-init now covers graph LEAFS (inputs) as well as nodes.
+- MTP server now starts cleanly on TP4 tensor split (was: assert at startup).
+
+### Still open: first MTP request dies
+Silent SIGSEGV (or GRAPH_CHECK_BAD with the address 0x555500000001) in
+ggml_cuda_graph_evaluate_and_capture / ggml_cuda_is_view_or_noop: a per-GPU
+subgraph node is a recycled/freed tensor object. The bcj.nodes were verified
+good at build time (BCJ_BAD trace found nothing), so the node list is
+mutated/recycled between the rebuild and the CUDA compute - suspect the
+backend ctx's re-init on growth (max_nnodes/subgraphs) freeing the cached
+per-GPU subgraph objects while the meta still references them. Next: check
+the backend-ctx re-init vs the cached cgraph_ij lifetimes, and the node_aux
+pool overlap.
+
+## MTP first-request crash: per-GPU subgraph node array holds recycled memory (2026-08-01)
+
+The CUDA compat check crashes on a per-GPU subgraph node whose pointer value is
+0x555500000001 (odd/garbage) or a plausible-but-freed heap address. The
+bcj.nodes were verified correct at build time (BCJ_BAD trace: nothing), so the
+corruption is in the per-GPU subgraph object (cgraph_ij->nodes array) between
+the rebuild and the CUDA compute. Prime suspect: backend_ctx->ctx (the meta
+backend's own ggml context holding the per-GPU cgraph objects and the node_aux
+pool) is RE-INITIALIZED on growth (max_nnodes_raised || n_subgraphs >
+max_subgraphs), freeing the previously built per-GPU subgraph objects while
+they may still be referenced; the node_aux pool (memset 0 per compute) also
+shares that context. Next: (a) verify the growth re-init ordering vs the
+cached subgraph lifetimes, (b) try allocating the backend ctx once with a
+large fixed size (no re-init) as the fix.
+
+Also noted: the previous run showed a different garbage address (0x19a891540),
+so the corruption is content/timing dependent, consistent with recycled pool
+memory.

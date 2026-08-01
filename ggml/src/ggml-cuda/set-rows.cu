@@ -393,6 +393,13 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3]);
     }
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
+    if (src1->type != GGML_TYPE_I64 && src1->type != GGML_TYPE_I32) {
+        fprintf(stderr, "SETROWS_SRC1_BAD: dst=%s ne={%ld,%ld,%ld,%ld} data=%p | src1=%s type=%d ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s\n",
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data,
+            src1->name, (int) src1->type, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3], src1->data,
+            src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "none");
+    }
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (getenv("LLAMA_SETROWS_TRACE") != nullptr) {

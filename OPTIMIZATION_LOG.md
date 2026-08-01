@@ -2750,3 +2750,25 @@ subgraph build and dispatch.
 - 83e0bcf0c: staging-container fix + fresh_mask tests (earlier).
 - 76706edfc: conv/norm/getrows/extent/ptrcheck diagnostics (earlier).
 - buffer slack + zero-row extra-copy skip + draft-f16 note (this slice, next commit).
+
+## 4-GPU recycled-metadata class: audits clean, crash persists (2026-08-01, late night)
+
+Added and ran:
+- LLAMA_STALE_AUDIT: every per-GPU subgraph node vs the container's current
+  copy at dispatch - ZERO stale nodes across the failing runs.
+- NODE_EXTENT (ggml_row_size-based): all per-GPU tensor extents fit their
+  buffers.
+- SETROWS_SRC1_BAD / SETROWS_QK_BAD prints at the type/qk asserts.
+- LLAMA_DISABLE_COMM=1 env gate for the RCCL/butterfly all-reduce: still
+  crashes with the comm disabled - not the all-reduce.
+
+The 4-GPU C8 crash persists with run-varying manifestations (src0/src1 type
+asserts at set-rows, IMA in the fused/vec/norm kernel family, host
+SIGSEGV/SIGABRT at the first burst) while every dispatch-time audit is clean.
+The garbage type fields can only come from tensor OBJECTS whose container
+arena was recycled (the copies' own types are set once at init) - the
+remaining suspect is a cross-uid dangling reference NOT visible to the audit
+(e.g. src links of cached nodes resolved at a rebuild into a container that a
+LATER rebuild of the same uid resets - the audit compares bcj.nodes, not the
+node->src links). Next slice: extend the audit to the node->src links, and/or
+rocgdb with HIP_LAUNCH_BLOCKING catching the faulting kernel's SGPRs.

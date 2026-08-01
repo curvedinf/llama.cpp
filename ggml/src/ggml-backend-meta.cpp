@@ -1746,8 +1746,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
     bufs.reserve(n_simple_bufts);
+    // The kernels read the last tensor of a graph vectorized (float4 tails); a
+    // zero-slack buffer makes the final vectorized load cross the allocation
+    // boundary by up to 16 bytes, which faults on HIP (HSA aperture violation -
+    // the batch-size-dependent C>=6 concurrent crash: whichever graph layout
+    // places the tail at the buffer end faults). Pad every per-device buffer.
+    const size_t alloc_size = size + 128;
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
+        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), alloc_size));
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
@@ -1869,7 +1875,7 @@ struct ggml_backend_meta_context {
         }
         name += ")";
 
-        if (n_devs > 1) {
+        if (n_devs > 1 && getenv("LLAMA_DISABLE_COMM") == nullptr) {
             ggml_backend_comm_init_t comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_init");
             if (comm_init != nullptr) {
@@ -2578,8 +2584,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     j, i, (void *) bcj.cgraphs[i].cgraph_main,
                     (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes);
             }
-            if (getenv("LLAMA_NODE_PTRCHECK") != nullptr) {
+            if (getenv("LLAMA_NODE_PTRCHECK") != nullptr || getenv("LLAMA_STALE_AUDIT") != nullptr) {
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                // stale-copy audit: every per-GPU subgraph node must still be the
+                // container's current copy of the original graph node. A container
+                // reset/eviction between the subgraph build and this dispatch leaves
+                // the cached copy dangling (recycled metadata) - the multi-GPU C8
+                // crash class.
+                if (getenv("LLAMA_STALE_AUDIT") != nullptr) {
+                    const size_t i_node_start = bcj.cgraphs[i].offset;
+                    const size_t i_node_stop = i + 1 < backend_ctx->n_subgraphs ? bcj.cgraphs[i + 1].offset : cgraph->n_nodes;
+                    for (size_t k2 = i_node_start; k2 < i_node_stop; k2++) {
+                        ggml_tensor * orig = cgraph->nodes[k2];
+                        if (orig == nullptr || !ggml_backend_buffer_is_meta(orig->buffer)) {
+                            continue;
+                        }
+                        ggml_tensor * cur = ggml_backend_meta_buffer_simple_tensor(orig, j);
+                        ggml_tensor * cached = bcj.nodes[k2];
+                        if (cur != cached) {
+                            fprintf(stderr, "STALE_AUDIT: j=%zu i=%zu k=%zu orig=%s cur=%p cached=%p cached_type=%d cached_ne={%ld,%ld,%ld,%ld}\n",
+                                j, i, k2, orig->name, (void *) cur, (void *) cached,
+                                cached ? (int) cached->type : -1,
+                                cached ? (long) cached->ne[0] : 0, cached ? (long) cached->ne[1] : 0,
+                                cached ? (long) cached->ne[2] : 0, cached ? (long) cached->ne[3] : 0);
+                        }
+                    }
+                }
                 for (int k = 0; k < cgraph_ij->n_nodes; k++) {
                     ggml_tensor * node = cgraph_ij->nodes[k];
                     if (node == nullptr) {
@@ -2588,8 +2618,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     if (getenv("LLAMA_NODE_GEOM") != nullptr) {
                         if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_NORM || node->op == GGML_OP_L2_NORM ||
-                            node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_GLU) {
-                            fprintf(stderr, "NODE_GEOM: j=%zu i=%zu k=%d node=%s op=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+                            node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_GLU ||
+                            node->op == GGML_OP_GET_ROWS) {
+                            fprintf(stderr, "NODE_GEOM: j=%zu i=%zu k=%d node=%s op=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p\n",
                                 j, i, k, node->name, ggml_op_name(node->op),
                                 (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3],
                                 node->nb[0], node->nb[1], node->nb[2], node->nb[3], node->data,
@@ -2600,7 +2631,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 node->src[0] ? node->src[0]->nb[2] : 0, node->src[0] ? node->src[0]->nb[3] : 0, node->src[0] ? node->src[0]->data : nullptr,
                                 node->src[1] ? node->src[1]->name : "-", node->src[1] ? (long) node->src[1]->ne[0] : 0,
                                 node->src[1] ? (long) node->src[1]->ne[1] : 0, node->src[1] ? (long) node->src[1]->ne[2] : 0,
-                                node->src[1] ? (long) node->src[1]->ne[3] : 0, node->src[1] ? node->src[1]->data : nullptr);
+                                node->src[1] ? (long) node->src[1]->ne[3] : 0,
+                                node->src[1] ? node->src[1]->nb[0] : 0, node->src[1] ? node->src[1]->nb[1] : 0,
+                                node->src[1] ? node->src[1]->nb[2] : 0, node->src[1] ? node->src[1]->nb[3] : 0,
+                                node->src[1] ? node->src[1]->data : nullptr);
                         }
                     }
                     if (node->buffer != nullptr && node->data != nullptr) {
@@ -2622,6 +2656,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             if (data < base || data >= base + size) {
                                 fprintf(stderr, "NODE_PTRCHECK: j=%zu i=%zu k=%d node=%s src%d=%s data=%p OUTSIDE buf=%s base=%p size=%zu\n",
                                     j, i, k, node->name, s, src->name, (void *) data, ggml_backend_buffer_name(src->buffer), (void *) base, size);
+                            }
+                            // stride-consistency: the last element address must fit in the
+                            // buffer - catches per-GPU copies whose row strides were not
+                            // scaled for the split (the data pointer alone looks valid).
+                            if (src->ne[0] > 0) {
+                                size_t extent = ggml_row_size(src->type, src->ne[0]);
+                                for (int d = 1; d < GGML_MAX_DIMS; d++) {
+                                    if (src->ne[d] > 1) {
+                                        extent += (src->ne[d] - 1) * src->nb[d];
+                                    }
+                                }
+                                if ((size_t) (data - base) + extent > size) {
+                                    fprintf(stderr, "NODE_EXTENT: j=%zu i=%zu k=%d node=%s src%d=%s data=%p ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} extent=%zu buf=%s base=%p size=%zu\n",
+                                        j, i, k, node->name, s, src->name, (void *) data,
+                                        (long) src->ne[0], (long) src->ne[1], (long) src->ne[2], (long) src->ne[3],
+                                        src->nb[0], src->nb[1], src->nb[2], src->nb[3], extent,
+                                        ggml_backend_buffer_name(src->buffer), (void *) base, size);
+                                }
                             }
                         }
                     }

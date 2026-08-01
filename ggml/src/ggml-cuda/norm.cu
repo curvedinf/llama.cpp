@@ -434,6 +434,12 @@ static void l2_norm_f32_cuda(
 
 void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (getenv("LLAMA_NORM_TRACE") != nullptr) {
+        fprintf(stderr, "NORM: src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+    }
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;
     cudaStream_t stream = ctx.stream();
@@ -477,6 +483,12 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (getenv("LLAMA_NORM_TRACE") != nullptr) {
+        fprintf(stderr, "RMSNORM: src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+    }
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;
     cudaStream_t stream = ctx.stream();
@@ -501,6 +513,12 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
+    if (getenv("LLAMA_NORM_TRACE") != nullptr) {
+        fprintf(stderr, "RMSNORM_FUSED: src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            rms_norm_src->name, (long) rms_norm_src->ne[0], (long) rms_norm_src->ne[1], (long) rms_norm_src->ne[2], (long) rms_norm_src->ne[3],
+            rms_norm_src->nb[0], rms_norm_src->nb[1], rms_norm_src->nb[2], rms_norm_src->nb[3], rms_norm_src->data,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+    }
     float eps = 0.0f;
 
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -675,6 +693,12 @@ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+    if (getenv("LLAMA_NORM_TRACE") != nullptr) {
+        fprintf(stderr, "L2NORM: src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+    }
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;
     cudaStream_t stream = ctx.stream();

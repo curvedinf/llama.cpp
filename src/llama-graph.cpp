@@ -3453,6 +3453,13 @@ void llm_graph_context::build_rs_store_extra(
     const uint32_t n_rs    = kv_state->get_n_rs();
     const uint32_t rs_head = kv_state->get_head();
 
+    // When the batch fills every state row (n_seqs == n_rs) there are no extra
+    // rows to stage: the copy would be a zero-row CPY whose dst view points one
+    // past the end of the state store ((rs_head + n_seqs) rows) - skip it.
+    if (n_rs <= (uint32_t) n_seqs) {
+        return;
+    }
+
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)

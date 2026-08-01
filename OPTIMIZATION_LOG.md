@@ -2718,3 +2718,35 @@ kernel. Also queued: skip the build_rs_store_extra CPY when n_rs == n_seqs
 ### Cumulative committed this session
 - 83e0bcf0c: staging-container fix (mirrored/split input leaf copies -> static
   container), fresh_mask test call sites, conv/ptrcheck diagnostics.
+
+## TP4 IMA: buffer slack fix makes 1-GPU C8 pass; 4-GPU recycled-metadata class remains (2026-08-01, night)
+
+### Fixed: 1-GPU tensor-split C8 burst now PASSES (was 100% crash)
+Three changes together:
+1. Meta per-device buffers now get +128 bytes slack (ggml-backend-meta.cpp
+   alloc_buffer): the kernels' vectorized float4 tail reads crossed the
+   exactly-sized allocation end (HSA aperture violation) - the batch-layout-
+   dependent C>=6 crash. With the slack, the 1-GPU C8 burst passes 8/8
+   (previously crashed in every run: norm/get_rows/conv family, varying).
+2. build_rs_store_extra skips the CPY when n_rs == n_seqs (the dst view landed
+   one-past-the-end of the state store; the zero-row CPY was a grid-0 no-op but
+   the one-past-end pointer polluted the ptrcheck).
+3. MTP draft KV must be f16 (48-dim draft heads are not q8_0-aligned:
+   set-rows.cu:89 ne00=12 % 32 != 0 assert). run_tp4_bench.sh should use
+   SPEC_DRAFT_*_TYPE=f16.
+
+### Remaining: 4-GPU C8 still crashes - recycled-metadata class, run-varying
+manifestations (type assert at set-rows.cu:396, IMA in the fused/vec kernels,
+host SIGSEGV/SIGABRT at the first burst) - all consistent with per-GPU tensor
+objects holding recycled metadata. The fingerprint-keyed map + per-uid
+containers + static routing eliminated the earlier classes (garbage idxs) but
+one path still returns recycled objects on 4 GPUs (1 GPU is clean - the split
+state is trivial there). Next slice: dump the offending node's container
+origin at the set-rows type assert (which container the src1 came from), and
+audit every per-GPU-copy creation path for containers that get reset between
+subgraph build and dispatch.
+
+### Committed this turn
+- 83e0bcf0c: staging-container fix + fresh_mask tests (earlier).
+- 76706edfc: conv/norm/getrows/extent/ptrcheck diagnostics (earlier).
+- buffer slack + zero-row extra-copy skip + draft-f16 note (this slice, next commit).

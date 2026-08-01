@@ -308,7 +308,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         const int32_t   fresh_mask = ggml_get_op_params_i32(dst, 0);
 
         if (getenv("LLAMA_CONV_TRACE") != nullptr) {
-            fprintf(stderr, "CONV_IDX: nr=%ld n_t=%ld n_s=%ld nc=%ld grid=(%ld,%ld) fresh=%x | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p | sidx[0]=%d\n",
+            const int32_t * sidx_p = (const int32_t *) src3->data;
+            fprintf(stderr, "CONV_IDX: nr=%ld n_t=%ld n_s=%ld nc=%ld grid=(%ld,%ld) fresh=%x | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | sidx=[",
                 (long) nr, (long) n_t, (long) n_s, (long) nc, (long) n_s, (long) ((nr + 127) / 128), fresh_mask,
                 src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
@@ -316,7 +317,14 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                 src0->buffer ? ggml_backend_buffer_get_base(src0->buffer) : nullptr,
                 src0->buffer ? ggml_backend_buffer_get_size(src0->buffer) : 0,
                 src2->name, (long) src2->ne[0], (long) src2->ne[1], (long) src2->ne[2], (long) src2->ne[3], src2->data,
-                ((const int32_t *) src3->data)[0]);
+                src2->buffer ? ggml_backend_buffer_name(src2->buffer) : "none",
+                src2->buffer ? ggml_backend_buffer_get_base(src2->buffer) : nullptr,
+                src2->buffer ? ggml_backend_buffer_get_size(src2->buffer) : 0);
+            const int64_t n_sidx = std::min<int64_t>(src3->ne[0], 32);
+            for (int64_t i = 0; i < n_sidx; ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", sidx_p[i]);
+            }
+            fprintf(stderr, "]\n");
         }
 
         if (fuse_silu) {

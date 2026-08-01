@@ -2671,3 +2671,50 @@ Concurrency boundary measured (burst_c8, 48 tok, short prompts):
 - C=1: 11.6 agg tok/s OK; C=2: 26.9 OK; C=4: 34.6 OK; C=6: CRASH; C=8: CRASH.
 Next: rocgdb wavefront PC at the fault (batch = 160 tokens = 8x20, so the
 boundary may be the 160-token ubatch graph, not the concurrency).
+
+## TP4 IMA hunt continuation (2026-08-01, evening): verify-graph zero-row state views + launch-trace correlation
+
+### New evidence
+1. IMA reproduces on 1-GPU tensor split (HIP_VISIBLE_DEVICES=0 -sm tensor): the
+   bug is NOT multi-GPU split math. Boundary: C<=4 OK (84-tok first ubatch),
+   C>=6 CRASH (126/160-tok); C=8 with 7-token prompts (56-tok ubatch) PASSES -
+   the trigger is the ubatch token count / n_seqs==n_rs full-state case, not
+   the concurrency per se.
+2. rocgdb catch (batch mode): faulting kernel = ssm_conv_idx_f32 (SIGSEGV/SIGBUS
+   at the st[j] state read, ssm-conv.cu:193/213); the wave trap PC is at the
+   state-row load - consistent with a garbage sidx state-row index on the
+   device side. LLAMA_CONV_TRACE with the full sidx dump shows HOST-side sidx
+   ALWAYS valid ([1,2,3,4,5,6,7,0], src0/src2 in-bounds) - so either the fault
+   is run-dependent (different kernel per run: one run faults in ssm_conv,
+   another in the Q6_K mmq / norm family right after swiglu or GDN), or the
+   device copy of an input differs from the host copy.
+3. LLAMA_NODE_PTRCHECK (all node+src data pointers vs buffer bounds at every
+   dispatch): ALL in-bounds EXCEPT the zero-row state views - benign in
+   principle, but they expose a structural anomaly: build_rs_store_extra
+   (llama-graph.cpp:3446) builds a CPY with ne={state_size, n_rs-n_seqs} and a
+   dst view at row (rs_head + n_seqs) - when n_seqs == n_rs (the C=8 verify
+   batch fills all state rows) the CPY is 0-row with dst data == one-past-the-
+   end of the state store (the PTRCHECK OUTSIDE hits). The cpy kernel is a
+   grid-0 no-op there (verified), so this is latent, not the fault itself.
+4. LLAMA_NODE_GEOM (op/ne/nb dump per dispatch): the crashing graph is the MTP
+   VERIFY graph (all tensors ne[1]=8, n_t=4) - its zero-row CPY aliases the
+   qkv mul_mat output (both at 0x...7280) - normal for 0-byte tensors.
+5. Launch-trace correlation: the fault surfaces right after the last launch,
+   which is the post-GDN unnamed kernel ? grid={48,1,8} block={256} (and in
+   other runs the swiglu / gate-up mmq family of the same verify graph). The
+   GDN itself (grid {48,8,32}) is the launch before it - either could be the
+   faulting kernel (hipGetLastError surfaces at the next launch).
+
+### Working hypothesis (next slice)
+The verify graph's recurrent-state path (GDN/conv/get_rows of the state store,
+plus the zero-row extra-copy) is the fault region; the fault is content/timing
+dependent (recycled-memory signature). Next: dump the GDN kernel's full launch
+args + state-store row pointers at the crash round (extend the existing
+LLAMA_GDN_* traces to print sidx[] and src2 row bounds), and/or rocgdb the
+faulting wave's SGPRs to get the exact faulting address for the ?(48,1,8)
+kernel. Also queued: skip the build_rs_store_extra CPY when n_rs == n_seqs
+(avoids the one-past-end view entirely - clean regardless of the fault).
+
+### Cumulative committed this session
+- 83e0bcf0c: staging-container fix (mirrored/split input leaf copies -> static
+  container), fresh_mask test call sites, conv/ptrcheck diagnostics.

@@ -2578,6 +2578,55 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     j, i, (void *) bcj.cgraphs[i].cgraph_main,
                     (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes);
             }
+            if (getenv("LLAMA_NODE_PTRCHECK") != nullptr) {
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                for (int k = 0; k < cgraph_ij->n_nodes; k++) {
+                    ggml_tensor * node = cgraph_ij->nodes[k];
+                    if (node == nullptr) {
+                        fprintf(stderr, "NODE_PTRCHECK: j=%zu i=%zu k=%d NULL NODE\n", j, i, k);
+                        break;
+                    }
+                    if (getenv("LLAMA_NODE_GEOM") != nullptr) {
+                        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_NORM || node->op == GGML_OP_L2_NORM ||
+                            node->op == GGML_OP_CPY || node->op == GGML_OP_CONT || node->op == GGML_OP_GLU) {
+                            fprintf(stderr, "NODE_GEOM: j=%zu i=%zu k=%d node=%s op=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+                                j, i, k, node->name, ggml_op_name(node->op),
+                                (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3],
+                                node->nb[0], node->nb[1], node->nb[2], node->nb[3], node->data,
+                                node->src[0] ? node->src[0]->name : "-", node->src[0] ? (long) node->src[0]->ne[0] : 0,
+                                node->src[0] ? (long) node->src[0]->ne[1] : 0, node->src[0] ? (long) node->src[0]->ne[2] : 0,
+                                node->src[0] ? (long) node->src[0]->ne[3] : 0,
+                                node->src[0] ? node->src[0]->nb[0] : 0, node->src[0] ? node->src[0]->nb[1] : 0,
+                                node->src[0] ? node->src[0]->nb[2] : 0, node->src[0] ? node->src[0]->nb[3] : 0, node->src[0] ? node->src[0]->data : nullptr,
+                                node->src[1] ? node->src[1]->name : "-", node->src[1] ? (long) node->src[1]->ne[0] : 0,
+                                node->src[1] ? (long) node->src[1]->ne[1] : 0, node->src[1] ? (long) node->src[1]->ne[2] : 0,
+                                node->src[1] ? (long) node->src[1]->ne[3] : 0, node->src[1] ? node->src[1]->data : nullptr);
+                        }
+                    }
+                    if (node->buffer != nullptr && node->data != nullptr) {
+                        const char * base = (const char *) ggml_backend_buffer_get_base(node->buffer);
+                        const size_t size = ggml_backend_buffer_get_size(node->buffer);
+                        const char * data = (const char *) node->data;
+                        if (data < base || data >= base + size) {
+                            fprintf(stderr, "NODE_PTRCHECK: j=%zu i=%zu k=%d node=%s data=%p OUTSIDE buf=%s base=%p size=%zu ne={%ld,%ld,%ld,%ld} type=%d\n",
+                                j, i, k, node->name, (void *) data, ggml_backend_buffer_name(node->buffer), (void *) base, size,
+                                (long) node->ne[0], (long) node->ne[1], (long) node->ne[2], (long) node->ne[3], (int) node->type);
+                        }
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        ggml_tensor * src = node->src[s];
+                        if (src != nullptr && src->buffer != nullptr && src->data != nullptr) {
+                            const char * base = (const char *) ggml_backend_buffer_get_base(src->buffer);
+                            const size_t size = ggml_backend_buffer_get_size(src->buffer);
+                            const char * data = (const char *) src->data;
+                            if (data < base || data >= base + size) {
+                                fprintf(stderr, "NODE_PTRCHECK: j=%zu i=%zu k=%d node=%s src%d=%s data=%p OUTSIDE buf=%s base=%p size=%zu\n",
+                                    j, i, k, node->name, s, src->name, (void *) data, ggml_backend_buffer_name(src->buffer), (void *) base, size);
+                            }
+                        }
+                    }
+                }
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;

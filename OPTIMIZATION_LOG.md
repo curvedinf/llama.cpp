@@ -2831,3 +2831,57 @@ earlier kernels (the GDN/conv/FFN region - same family as the very first
 ssm_conv_idx_f32 SIGSEGV catch). Next slice: run the launch trace + rocgdb in
 ONE session and identify the kernels between the last valid state and the
 set_rows trap - the OOB writer is among them.
+
+## Session: staged-revert A/B resolved; TP4 C8 crash re-confirmed on HEAD; two paged-gap fixes (2026-08-02, late)
+
+### 1. Staged container-revert experiment = regression, discarded
+The index held a staged revert of the T1 fixes (per-uid containers + fingerprint-keyed
+simple-tensor map back to the old rotating 2-container + bare-address-key map). Built and
+tested as-is (old design + slack): bursts 1-2 pass, burst 3 crashes with a HOST-side
+`GGML_ASSERT(ggml_is_contiguous(src_state))` in gated_delta_net.cu:416, with the
+GDN_STATE_NONCONTIG dump showing a GARBAGE-geometry per-GPU copy
+`cache_s_l58 (view) ne={196608,3,3,1}` - exactly the documented stale-copy class the
+fingerprint keys fixed (address reuse under the graph-cache arena recycling). Restored
+HEAD's design (per-uid containers + fingerprint keys + src-scoping) and re-applied the
+buffer slack (already in HEAD). A/B verdict: both designs crash at 4-GPU C8; the crash is
+NOT container-design-specific; the staged experiment is a dead end.
+
+### 2. TP4 C8 crash re-confirmed on HEAD+slack (still the open blocker)
+HEAD build (per-uid + fingerprint + slack + all src-scoping fixes): first C=8 burst dies
+within ~1-2 s with "an illegal memory access was encountered" (device-side, surfacing at
+the next launch). Run-varying victims persist (set_rows_quant / ssm_conv / SCALE /
+mmq families), all with valid-looking host args - consistent with the log's
+"downstream symptom of an earlier OOB writer" conclusion. New evidence this session:
+LLAMA_GDN_PTRS at the crash shows the per-GPU GDN state copies are geometrically CORRECT
+(`state_ne={128,128,12,24} nb={2,256,32768,393216}` - head axis split 48->12, contiguous,
+rows of H_local*S_v^2 = 196608 elems, kernel row-stride math matches) - so the OOB
+writer is a genuine kernel indexing bug, not a stale-metadata class. The last launches
+before the fault (trace): get_rows {2,8} (state gather) -> 3x unnamed {240,1,1}
+(swiglu/gate-up family, 240 = 20 tok x 12 heads) -> unnamed {768,1,1} -> fault at SCALE.
+rocgdb + HIP_LAUNCH_BLOCKING boot crawled (model load stuck >20 min under gdb) - abandoned
+for now. rocgdb without blocking (previous sessions' mode) + faulting-ADDRESS capture is
+the next trap experiment; or a C=6/C=8 token-count bisect.
+
+### 3. fattn-vec.cuh:548 - unguarded padded-column dst write (the ncols>=2 IMA mechanism)
+The vec FA kernel guards every padded-column access (Q load :182, KQ :233/:254, mask
+:316, dst_meta :558) EXCEPT the main dst write at :548. For n_tps=3 (MTP verify) with
+ncols=2 the last block's second column writes token index 3 = one head-block beyond the
+dst allocation end (intermittent IMA depending on the buffer adjacency - the documented
+"ncols=2 intermittent illegal memory access" on gfx908). Fixed with the same guard style:
+`if (ncols == 1 || ic0 + j_VKQ < int(ne01.z))`. Also fixes the same latent OOB in the
+dense path for odd batch sizes. NOT the 4-GPU C8 crash writer (crash reproduces with the
+guard; the first prefill ubatch is 160 = 5x32 tokens, no padding) - but it is the fix
+that unblocks paged under MTP2. Unvalidated so far (the n_tps>1 paged path is still gated
+off in paged_ubatch).
+
+### 4. LLAMA_KV_PAGED Meta() buft gate relaxed
+llama-kv-cache.cpp: accept "Meta" buft names (the meta buft wraps per-device ROCm bufts
+under -sm tensor; the per-GPU paged FA nodes dispatch to those). The GPU-side
+ggml_cuda_fattn_paged_supported check remains the backstop. Env-gated (LLAMA_KV_PAGED=1),
+so default behavior unchanged. UNVALIDATED: the per-GPU pool view shapes under the meta
+backend may still fail the support check (K->ne[1] % 32) - the next TP4 measurement will
+tell.
+
+### Committed this turn
+- fattn-vec.cuh padded-column write guard.
+- llama-kv-cache.cpp Meta() buft gate.

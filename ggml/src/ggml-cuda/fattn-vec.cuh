@@ -545,7 +545,12 @@ static __device__ __forceinline__ void flash_attn_ext_vec_impl(
                 if (gridDim.y == 1) {
                     dst_val /= KQ_sum[j_VKQ];
                 }
-                dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                // the last block's columns can be past the real token count (ne01.z is not
+                // padded to a multiple of ncols); write them nowhere - the reads above are
+                // guarded the same way and the mask zeroes the padded KQ sums
+                if (ncols == 1 || ic0 + j_VKQ < int(ne01.z)) {
+                    dst[(((sequence*int(ne01.z) + ic0 + j_VKQ)*ne02 + head)*gridDim.y + blockIdx.y)*D + i0 + tid] = dst_val;
+                }
             }
         }
 

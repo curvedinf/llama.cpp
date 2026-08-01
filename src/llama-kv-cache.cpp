@@ -425,7 +425,13 @@ llama_kv_cache::llama_kv_cache(
             for (const auto & [buft, ctx] : ctx_map) {
                 const char * buft_name = ggml_backend_buft_name(buft);
 
-                if (strncmp(buft_name, "ROCm", 4) != 0 && strncmp(buft_name, "CUDA", 4) != 0) {
+                // "Meta" wraps per-device (simple) buffers of the compute backend, e.g.
+                // the ROCm bufts under -sm tensor. The per-GPU paged FA nodes dispatch to
+                // those simple backends, so the meta buft is as safe as the direct one -
+                // the final say is the GPU-side support check at dispatch. Anything else
+                // (the CPU backend in particular) asserts on a block table, so refuse.
+                if (strncmp(buft_name, "ROCm", 4) != 0 && strncmp(buft_name, "CUDA", 4) != 0 &&
+                        strncmp(buft_name, "Meta", 4) != 0) {
                     LLAMA_LOG_WARN("%s: LLAMA_KV_PAGED is only supported on the HIP/CUDA backend (got buffer type '%s') - falling back to the legacy path\n",
                             __func__, buft_name);
                     ok = false;

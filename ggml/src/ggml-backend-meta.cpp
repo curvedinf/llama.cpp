@@ -2308,8 +2308,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
+            const size_t mem_size = n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux);
+            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                fprintf(stderr, "META_RESET: n_nodes=%d n_subgraphs=%zu max_nnodes=%d max_subgraphs=%zu mem=%zu\n",
+                    cgraph->n_nodes, n_subgraphs, backend_ctx->max_nnodes, backend_ctx->max_subgraphs, mem_size);
+            }
             const ggml_init_params params = {
-                /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
+                /*.mem_size   =*/ mem_size,
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -2317,7 +2322,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 for (size_t i = 0; i < n_subgraphs; i++) {
-                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), cgraph->n_nodes, /*grads =*/ false);
+                    // capacity must cover the largest graph seen so far: a later call
+                    // with more nodes than the current cgraph fills these graphs again
+                    bcj.cgraphs[i].cgraph_main = ggml_new_graph_custom(backend_ctx->ctx.get(), backend_ctx->max_nnodes, /*grads =*/ false);
+                    if (getenv("LLAMA_META_TRACE") != nullptr) {
+                        fprintf(stderr, "META_CGRAPH_NEW: j=%zu i=%zu ptr=%p size=%d\n",
+                            j, i, (void *) bcj.cgraphs[i].cgraph_main, (int) bcj.cgraphs[i].cgraph_main->size);
+                    }
                 }
             }
             backend_ctx->cgraphs_aux.resize(n_backends*n_cgraphs_per_device*backend_ctx->max_subgraphs);
@@ -2337,6 +2348,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
                 cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                if (getenv("LLAMA_META_TRACE") != nullptr) {
+                    fprintf(stderr, "META_FILL: j=%zu i_graph=%zu ptr=%p size=%d n_nodes=%d\n",
+                        j, i_graph, (void *) cgraph_ij, (int) cgraph_ij->size, (int) cgraph_ij->n_nodes);
+                }
+                GGML_ASSERT(cgraph_ij->size >= cgraph_ij->n_nodes);
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
                     ggml_tensor * node_ij = bcj.nodes[i_node];
@@ -2503,6 +2519,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            GGML_ASSERT(bcj.cgraphs[i].cgraph_main->size >= bcj.cgraphs[i].cgraph_main->n_nodes);
+            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                fprintf(stderr, "META_DISPATCH: j=%zu i=%zu ptr=%p size=%d n_nodes=%d\n",
+                    j, i, (void *) bcj.cgraphs[i].cgraph_main,
+                    (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes);
+            }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;

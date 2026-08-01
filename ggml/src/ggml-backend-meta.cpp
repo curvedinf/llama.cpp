@@ -394,9 +394,42 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 //
 
 // Container to hold the tensor slices per simple ggml backend buffer.
+// Key for the per-GPU tensor map. The llama graph cache recycles its context
+// arenas, so a tensor address can be reused by a different tensor (same pointer,
+// different content). Keying by address alone returns stale per-GPU copies with
+// the wrong shape/type (the "src0 type garbage" crashes). The fingerprint makes
+// a reused address with different content look like a different tensor.
+struct ggml_meta_tensor_key {
+    const ggml_tensor * tensor;
+    ggml_type           type;
+    int64_t             ne[4];
+    size_t              view_offs;
+
+    bool operator<(const ggml_meta_tensor_key & o) const {
+        if (tensor != o.tensor) return tensor < o.tensor;
+        if (type != o.type) return type < o.type;
+        for (int i = 0; i < 4; i++) {
+            if (ne[i] != o.ne[i]) return ne[i] < o.ne[i];
+        }
+        return view_offs < o.view_offs;
+    }
+};
+
+static ggml_meta_tensor_key ggml_meta_tensor_key_of(const ggml_tensor * t) {
+    ggml_meta_tensor_key key;
+    key.tensor    = t;
+    key.type      = t->type;
+    key.ne[0]     = t->ne[0];
+    key.ne[1]     = t->ne[1];
+    key.ne[2]     = t->ne[2];
+    key.ne[3]     = t->ne[3];
+    key.view_offs = t->view_offs;
+    return key;
+}
+
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::map<ggml_meta_tensor_key, std::vector<ggml_tensor *>> simple_tensors;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -412,13 +445,16 @@ struct ggml_backend_meta_buffer_context {
     // Most tensors can simply be stored statically in their own buffer.
     // Externally created views however also need a mapping to simple tensors but they use the buffer of the view source.
     // If external views are simply using that buffer they will slowly deplete its memory.
-    // Current solution: rotating set of 2 "compute" containers to hold external views, works correctly for llama.cpp.
-    // Long-term: tie the lifetime of external views to the meta backend executing the graph instead,
-    //     currently not possible due to graph-external operations in the backend scheduler.
+    // Solution: one "current" container receives the tensors at graph alloc, which is adopted into a
+    //     per-graph-uid container at the graph's first compute. Per-uid containers survive across
+    //     computes, so the llama graph cache (several graphs alive at once) keeps valid per-GPU
+    //     tensors for every cached graph - the old rotating double-buffer reset other graphs'
+    //     tensors on every rebuild, leaving cached sub-graphs with dangling metadata.
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute[2];
-    int stc_compute_index      = 0;
-    int stc_compute_index_next = 0;
+    ggml_backend_meta_simple_tensor_container stc_compute_current;
+    std::map<uint64_t, ggml_backend_meta_simple_tensor_container> stc_compute;
+    ggml_init_params stc_params;
+    size_t n_simple_bufts = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -431,10 +467,10 @@ struct ggml_backend_meta_buffer_context {
 
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
-            ggml_backend_meta_simple_tensor_container & stc_compute_0,
-            ggml_backend_meta_simple_tensor_container & stc_compute_1,
+            const ggml_init_params & stc_params,
+            const size_t n_simple_bufts,
             const std::vector<ggml_backend_buffer_t> & bufs)
-            : stc_static(std::move(stc_static)), stc_compute{std::move(stc_compute_0), std::move(stc_compute_1)} {
+            : stc_static(std::move(stc_static)), stc_compute_current(stc_params, n_simple_bufts), stc_params(stc_params), n_simple_bufts(n_simple_bufts) {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
@@ -444,10 +480,16 @@ struct ggml_backend_meta_buffer_context {
     }
 
     ggml_backend_meta_simple_tensor_container & get_simple_tensor_container(const ggml_tensor * tensor) {
-        if (stc_static.simple_tensors.find(tensor) != stc_static.simple_tensors.end()) {
+        const ggml_meta_tensor_key key = ggml_meta_tensor_key_of(tensor);
+        if (stc_static.simple_tensors.find(key) != stc_static.simple_tensors.end()) {
             return stc_static;
         }
-        return stc_compute[stc_compute_index];
+        for (auto & kv : stc_compute) {
+            if (kv.second.simple_tensors.find(key) != kv.second.simple_tensors.end()) {
+                return kv.second;
+            }
+        }
+        return stc_compute_current;
     }
 };
 
@@ -476,7 +518,7 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     GGML_ASSERT(index < buf_ctx->bufs.size());
 
     ggml_backend_meta_simple_tensor_container & stc = buf_ctx->get_simple_tensor_container(tensor);
-    auto it = stc.simple_tensors.find(tensor);
+    auto it = stc.simple_tensors.find(ggml_meta_tensor_key_of(tensor));
     if (it == stc.simple_tensors.end()) {
         return nullptr;
     }
@@ -1108,6 +1150,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    // T1 diagnostic: print split state on cache hits too, for the recurrent-state
+    // tensors only, so request 1 vs request 2 can be compared.
+    if (buf_ctx->debug > 0 && (strstr(tensor->name, "state_predelta") != nullptr ||
+            tensor->op == GGML_OP_GATED_DELTA_NET || tensor->op == GGML_OP_GATED_DELTA_NET_IDX)) {
+        std::string ne_info;
+        for (size_t j = 0; j < n_bufs; j++) {
+            ne_info += " " + std::to_string(ret.ne[j]) + "x" + std::to_string(ret.nr[0]);
+        }
+        fprintf(stderr, "SPLIT_STATE_HIT: %s[%s, %s, {%s}] hit=%d tensor_ne={%ld,%ld,%ld,%ld}\n",
+            tensor->name, ggml_op_name(tensor->op),
+            ggml_backend_meta_split_axis_name(ret.axis), ne_info.c_str(), it != buf_ctx->split_state_cache.end(),
+            (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3]);
+    }
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
@@ -1139,6 +1194,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
 
+    // The tensor's per-GPU copies never change (its shape, split state and data
+    // placement are fixed once allocated), so re-initializing it would only leak
+    // the previous per-GPU tensor objects in the container's ggml context. The
+    // graph-cache scheduler calls init_tensor on every graph alloc, including the
+    // model's static tensors - without this guard the static container's pool
+    // fills up over time ("ggml_new_object: failed to allocate").
+    if (stc.simple_tensors.count(ggml_meta_tensor_key_of(tensor)) != 0) {
+        return GGML_STATUS_SUCCESS;
+    }
+
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
@@ -1153,6 +1218,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
+    if (getenv("LLAMA_META_INIT_TRACE") != nullptr && strstr(tensor->name, "state_predelta") != nullptr) {
+        fprintf(stderr, "META_INIT: %s op=%s p=%p ne={%ld,%ld,%ld,%ld} split(axis=%d ne=[", tensor->name, ggml_op_name(tensor->op), (void*) tensor,
+            (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3], split_state.axis);
+        for (size_t j = 0; j < n_simple_bufs; j++) fprintf(stderr, "%s%ldx%u", j ? "," : "", (long)split_state.ne[j], split_state.nr[0]);
+        fprintf(stderr, "]) view_src=%p view_offs=%zu stc=%s\n", (void*) tensor->view_src, tensor->view_offs,
+            (&stc == &buf_ctx->stc_static) ? "static" : "compute");
+    }
     for (size_t j = 0; j < n_simple_bufs; j++) {
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
@@ -1177,14 +1249,34 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     (long)tensor->ne[0], (long)tensor->ne[1], (long)tensor->ne[2], (long)tensor->ne[3]);
                 ne[split_dim] = tensor->ne[split_dim] / n_simple_bufs;
             }
+            // R2: catch stale split states where per-device size exceeds the tensor dimension
+            if (ne[split_dim] > tensor->ne[split_dim] && tensor->ne[split_dim] > 0) {
+                GGML_LOG_ERROR("META_WARN: per-device ne[%d]=%ld > tensor ne[%d]=%ld for %s op=%s - falling back to even split\n",
+                    split_dim, (long)ne[split_dim], split_dim, (long)tensor->ne[split_dim],
+                    tensor->name, ggml_op_name(tensor->op));
+                ne[split_dim] = tensor->ne[split_dim] / n_simple_bufs;
+            }
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
+                // scale the strides of the dims ABOVE the split axis (their stride is
+                // proportional to the split dimension's size). The nb-ordering test
+                // (nb[i] > nb[split_dim]) is wrong for non-contiguous tensors (e.g.
+                // permuted MTP logits) where the strides are unordered - it would
+                // scale dims below the split axis and produce broken per-GPU views.
+                if (i > split_dim) {
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        if (getenv("LLAMA_META_TRACE") != nullptr && tensor->op == GGML_OP_RESHAPE && tensor->ne[0] == 786432) {
+            fprintf(stderr, "META_CREATE: %s p=%p -> t_ij=%p data=%p ne={%ld,%ld,%ld,%ld} src_ne={%ld,%ld,%ld,%ld} split(axis=%d ne=[", tensor->name, (void*) tensor, (void*) t_ij, (void*) t_ij->data,
+                (long) ne[0], (long) ne[1], (long) ne[2], (long) ne[3],
+                (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3], split_state.axis);
+            for (size_t k = 0; k < n_simple_bufs; k++) fprintf(stderr, "%s%ldx%u", k ? "," : "", (long) split_state.ne[k], split_state.nr[0]);
+            fprintf(stderr, "]) stc=%s vsrc=%p voffs=%zu\n", (&stc == &buf_ctx->stc_static) ? "static" : "compute",
+                (void*) tensor->view_src, tensor->view_offs);
+        }
         t_ij->op = tensor->op;
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             t_ij->nb[i] = nb[i];
@@ -1257,7 +1349,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
     }
 
-    stc.simple_tensors[tensor] = simple_tensors;
+    stc.simple_tensors[ggml_meta_tensor_key_of(tensor)] = simple_tensors;
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1265,13 +1357,19 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
-    buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
     return ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->get_simple_tensor_container(tensor), tensor);
 }
 
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+    if (getenv("LLAMA_META_TRACE") != nullptr) {
+        fprintf(stderr, "SETTENSOR: %s op=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} axis=%d segs=%zu nr=%u off=%zu size=%zu\n",
+            tensor->name, ggml_op_name(tensor->op),
+            (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+            (int) split_state.axis, split_state.n_segments, split_state.nr[0], offset, size);
+    }
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -1361,6 +1459,15 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                if (simple_tensor == nullptr) {
+                    // The scheduler's input copies can run before this graph's first
+                    // rebuild, so the input tensors' per-GPU copies may not exist
+                    // yet - create them on demand (they land in the staging
+                    // container and are adopted into the graph's uid container at
+                    // the first rebuild).
+                    ggml_backend_meta_buffer_init_tensor(buffer, tensor);
+                    simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                }
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
         } break;
@@ -1386,12 +1493,41 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    // the axis-2 readback below handles non-contiguous (e.g. permuted) tensors
+    GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || split_state.axis == GGML_BACKEND_SPLIT_AXIS_2);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
         GGML_ASSERT(tensor->ne[3] == 1);
+
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            // strided gather along axis 2 (the per-GPU slices share the tensor's
+            // strides): each axis element's slab rows are copied strided
+            const size_t slab_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+            int64_t h_base = 0;
+            for (size_t s = 0; s < split_state.n_segments; s++) {
+                for (size_t r = 0; r < split_state.nr[s]; r++) {
+                    for (size_t j = 0; j < n_bufs; j++) {
+                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        const int64_t n_axis = split_state.ne[s*n_bufs + j];
+                        for (int64_t c = 0; c < n_axis; c++) {
+                            // src offset is the LOCAL head (the per-GPU slice starts at
+                            // its own head base); dst offset is the global head. Use the
+                            // buffer iface directly: the generic wrapper's bounds check
+                            // uses the row-major nbytes which cannot express strided
+                            // (permuted) views.
+                            simple_tensor->buffer->iface.get_tensor_2d(simple_tensor->buffer, simple_tensor, (char *) data + (h_base + c)*tensor->nb[2],
+                                c*simple_tensor->nb[2], slab_bytes,
+                                tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                        }
+                        h_base += n_axis;
+                    }
+                }
+            }
+            GGML_ASSERT(h_base == tensor->ne[2]);
+            return;
+        }
 
         size_t offset_data = 0;
         std::vector<size_t> simple_offsets(n_bufs, 0);
@@ -1453,6 +1589,31 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         case GGML_BACKEND_SPLIT_AXIS_0:
         case GGML_BACKEND_SPLIT_AXIS_1:
         case GGML_BACKEND_SPLIT_AXIS_2: {
+            if (!ggml_is_contiguous(tensor) && split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                // strided full readback (single segment, n_bufs devices): the
+                // per-GPU slices share the tensor's strides, so each axis
+                // element's slab rows are copied strided from its owning device.
+                // Full-range only: the strided views' logical extent is not
+                // representable as a byte range, so partial reads are not split.
+                GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor));
+                const size_t slab_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+                int64_t h_base = 0;
+                for (size_t j = 0; j < n_bufs; j++) {
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const int64_t n_axis = split_state.ne[j];
+                    for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+                        for (int64_t c = 0; c < n_axis; c++) {
+                            simple_tensor->buffer->iface.get_tensor_2d(simple_tensor->buffer, simple_tensor,
+                                (char *) data + i3*tensor->nb[3] + (h_base + c)*tensor->nb[2],
+                                i3*simple_tensor->nb[3] + c*simple_tensor->nb[2],
+                                slab_bytes, tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                        }
+                    }
+                    h_base += n_axis;
+                }
+                GGML_ASSERT(h_base == tensor->ne[2]);
+                break;
+            }
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
             GGML_ASSERT(offset % chunk_size_full == 0);
@@ -1474,7 +1635,11 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             // TODO other simple backend may be better
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            ggml_tensor * simple_tensor = (ggml_tensor *) ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            if (simple_tensor == nullptr) {
+                ggml_backend_meta_buffer_init_tensor(buffer, (ggml_tensor *) tensor);
+                simple_tensor = (ggml_tensor *) ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+            }
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
         } break;
         default: {
@@ -1519,14 +1684,16 @@ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
+    // One graph's per-GPU tensor metadata fits in a small pool (the graph has a few
+    // thousand nodes); the old 1M-tensor pool multiplied by the per-uid containers
+    // exhausted host memory. 1<<18 tensor slots covers the largest graphs.
     const ggml_init_params params = {
-        /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+        /*.mem_size   =*/ (1 << 18)*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static;
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_current(params, n_simple_bufts);
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -1536,7 +1703,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params, n_simple_bufts, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -1551,16 +1718,15 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         /*.no_alloc   =*/ true,
     };
     const ggml_init_params params_compute = {
-        /*.mem_size   =*/ compute_headroom*ggml_get_mem_size(ctx),
+        /*.mem_size   =*/ std::max(compute_headroom*ggml_get_mem_size(ctx), (1 << 18)*ggml_tensor_overhead()),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
     ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_0(params_compute, n_simple_bufts);
-    ggml_backend_meta_simple_tensor_container stc_compute_1(params_compute, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_current(params_compute, n_simple_bufts);
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params_compute, n_simple_bufts, bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
@@ -1811,7 +1977,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    const bool needs_rebuild = getenv("LLAMA_META_ALWAYS_REBUILD") != nullptr || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -1839,16 +2005,45 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
             // Clear split_state_cache on rebuild: stc_compute tensors are freed by
             // ggml_reset below, and new tensors may reuse the same addresses, causing
             // the cache to return stale split states from the previous graph.
             buf_ctx->split_state_cache.clear();
-            ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
-            for (ggml_context_ptr & ctx : stc.ctxs) {
+            // Reset this graph's own container (if it was computed before) and adopt the
+            // alloc-time tensors from the current container on first compute. Other
+            // graphs' containers are left untouched - the llama graph cache keeps
+            // several graphs alive at once, and resetting them here would leave the
+            // cached sub-graphs of the other graphs with dangling per-GPU tensors.
+            auto it_stc = buf_ctx->stc_compute.find(cgraph->uid);
+            if (it_stc == buf_ctx->stc_compute.end()) {
+                if (buf_ctx->stc_compute.size() >= 32) {
+                    // cap the container map: evict the oldest uid. Safe because every
+                    // graph's per-GPU tensors live in its own uid container - nothing
+                    // else references them - and the evicted graph rebuilds on its next
+                    // compute.
+                    buf_ctx->stc_compute.erase(buf_ctx->stc_compute.begin());
+                }
+                // Fresh container sized for this graph's per-GPU tensor metadata (one
+                // copy per device per node/leaf). The alloc-time copies in the current
+                // container are discarded - the pre-init below re-creates them here -
+                // so no other graph can end up referencing this graph's memory and the
+                // pools stay proportional to the graphs, not to the eager init params.
+                ggml_init_params p = buf_ctx->stc_params;
+                p.mem_size = (cgraph->n_nodes + cgraph->n_leafs + 4096) * buf_ctx->n_simple_bufts * ggml_tensor_overhead();
+                buf_ctx->stc_compute.emplace(cgraph->uid, ggml_backend_meta_simple_tensor_container(p, buf_ctx->n_simple_bufts));
+            } else {
+                ggml_backend_meta_simple_tensor_container & stc = it_stc->second;
+                for (ggml_context_ptr & ctx : stc.ctxs) {
+                    ggml_reset(ctx.get());
+                }
+                stc.simple_tensors.clear();
+            }
+            // Discard the alloc-time staging copies; the pre-init re-creates the
+            // graph's tensors in its own uid container.
+            for (ggml_context_ptr & ctx : buf_ctx->stc_compute_current.ctxs) {
                 ggml_reset(ctx.get());
             }
-            stc.simple_tensors.clear();
+            buf_ctx->stc_compute_current.simple_tensors.clear();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -1856,36 +2051,69 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // The scheduler doesn't call init_tensor for view tensors that inherit their
         // parent's buffer. Pre-initialize any meta-buffer graph tensors that are not
         // yet in a simple_tensor_container so the per-device copies exist at dispatch.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (!ggml_backend_buffer_is_meta(node->buffer)) {
-                continue;
+        // Both nodes and leafs: the leafs include meta-buffer graph inputs (e.g. the
+        // MTP pre-gate) whose alloc-time copies are discarded with the staging
+        // container - without re-creating them the input copies resolve to nullptr.
+        auto preinit_tensor = [&](ggml_tensor * t) {
+            if (!ggml_backend_buffer_is_meta(t->buffer)) {
+                return;
             }
-            if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                continue;
+            if (t->view_src != nullptr && t->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(t->view_src->buffer)) {
+                return;
             }
-            // Check if the node or any of its sources are missing from all containers
+            // Check if the node or any of its sources are missing from all containers.
+            // The staging container (stc_compute_current) is deliberately not counted:
+            // its copies are discarded at every rebuild and re-created in this graph's
+            // uid container, so a tensor found only there still needs initialization.
             bool needs_init = false;
-            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) node->buffer->context;
-            if (!buf_ctx->stc_static.simple_tensors.count(node) &&
-                !buf_ctx->stc_compute[0].simple_tensors.count(node) &&
-                !buf_ctx->stc_compute[1].simple_tensors.count(node)) {
-                needs_init = true;
+            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) t->buffer->context;
+            const ggml_meta_tensor_key t_key = ggml_meta_tensor_key_of(t);
+            if (!buf_ctx->stc_static.simple_tensors.count(t_key)) {
+                bool in_compute = false;
+                for (auto & kv : buf_ctx->stc_compute) {
+                    if (kv.second.simple_tensors.count(t_key) != 0) {
+                        in_compute = true;
+                        break;
+                    }
+                }
+                needs_init = !in_compute;
             }
             if (needs_init) {
-                // Initialize sources first so split_state can be computed
+                if (getenv("LLAMA_META_TRACE") != nullptr && strstr(t->name, "pregate") != nullptr) {
+                    fprintf(stderr, "PREINIT_PREGATE: %s needs_init=1\n", t->name);
+                }
+                // Initialize sources first so split_state can be computed. Tensors are
+                // created in THIS graph's uid container: the dispatch-based init would
+                // fall back to the shared "current" container, whose tensors belong to
+                // the graph that most recently allocated, and a later eviction of that
+                // uid would take the re-initialized tensors down with it.
+                ggml_backend_meta_simple_tensor_container & stc_uid = buf_ctx->stc_compute[cgraph->uid];
                 for (int s = 0; s < GGML_MAX_SRC; s++) {
-                    if (node->src[s] && ggml_backend_buffer_is_meta(node->src[s]->buffer)) {
-                        ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) node->src[s]->buffer->context;
-                        if (!sbuf_ctx->stc_static.simple_tensors.count(node->src[s]) &&
-                            !sbuf_ctx->stc_compute[0].simple_tensors.count(node->src[s]) &&
-                            !sbuf_ctx->stc_compute[1].simple_tensors.count(node->src[s])) {
-                            ggml_backend_meta_buffer_init_tensor(node->src[s]->buffer, node->src[s]);
+                    if (t->src[s] && ggml_backend_buffer_is_meta(t->src[s]->buffer)) {
+                        ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) t->src[s]->buffer->context;
+                        const ggml_meta_tensor_key src_key = ggml_meta_tensor_key_of(t->src[s]);
+                        if (!sbuf_ctx->stc_static.simple_tensors.count(src_key)) {
+                            bool src_in_compute = false;
+                            for (auto & kv : sbuf_ctx->stc_compute) {
+                                if (kv.second.simple_tensors.count(src_key) != 0) {
+                                    src_in_compute = true;
+                                    break;
+                                }
+                            }
+                            if (!src_in_compute) {
+                                ggml_backend_meta_buffer_init_tensor_impl(sbuf_ctx->stc_compute[cgraph->uid], t->src[s]);
+                            }
                         }
                     }
                 }
-                ggml_backend_meta_buffer_init_tensor(node->buffer, node);
+                ggml_backend_meta_buffer_init_tensor_impl(stc_uid, t);
             }
+        };
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            preinit_tensor(cgraph->nodes[i]);
+        }
+        for (int i = 0; i < cgraph->n_leafs; i++) {
+            preinit_tensor(cgraph->leafs[i]);
         }
 
         for (size_t j = 0; j < n_backends; j++) {
@@ -1900,6 +2128,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
+                if (getenv("LLAMA_META_TRACE") != nullptr && bcj.nodes[i] != nullptr &&
+                        (((uintptr_t) bcj.nodes[i]) & 1) != 0) {
+                    fprintf(stderr, "BCJ_BAD: i=%d j=%zu node=%s p=%p simple=%p\n",
+                        i, j, node->name, (void *) node, (void *) bcj.nodes[i]);
+                }
                 GGML_ASSERT(bcj.nodes[i]);
             }
         }
@@ -2032,6 +2265,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         auto & bcj = backend_ctx->backend_configs[j];
                         if ((bcj.nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                             for (int ii = i + 1; ii <= i_delayed; ii++) {
+                                if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                    fprintf(stderr, "META_CLEAR: node[%d]=%s op=%s cleared by node[%d]=%s (delayed %d->%d)\n",
+                                        ii, bcj.nodes[ii]->name, ggml_op_name(bcj.nodes[ii]->op),
+                                        i, bcj.nodes[i]->name, i, i_delayed);
+                                }
                                 bcj.nodes[ii]->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
                             }
                         }
@@ -2149,6 +2387,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                fprintf(stderr, "META_COMPUTE: subgraph[%zu] last=%s op=%s flags=%x\n",
+                    i, node->name, ggml_op_name(node->op), node->flags);
+            }
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 
@@ -1648,5 +1649,17 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)...);
     CUDA_CHECK(cudaGetLastError());
+    if (getenv("LLAMA_LAUNCH_TRACE") != nullptr) {
+        static uint64_t launch_seq = 0;
+        Dl_info info;
+        const char * caller = "?";
+        if (dladdr((void *) __builtin_return_address(0), &info) != 0 && info.dli_sname != nullptr) {
+            caller = info.dli_sname;
+        }
+        fprintf(stderr, "LAUNCH: seq=%llu caller=%s grid={%u,%u,%u} block={%u,%u,%u}\n",
+            (unsigned long long) launch_seq++, caller,
+            launch_params.block_nums.x, launch_params.block_nums.y, launch_params.block_nums.z,
+            launch_params.block_dims.x, launch_params.block_dims.y, launch_params.block_dims.z);
+    }
 }
 

@@ -8,6 +8,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1379,6 +1380,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (slot != nullptr) {
         LLAMA_LOG_DEBUG("%s: graph cache hit  (n_reused = %d, n_miss = %d)\n", __func__, n_reused + 1, n_graph_miss);
 
+        if (getenv("LLAMA_GRAPH_REUSE_TRACE") != nullptr) {
+            fprintf(stderr, "GRAPH_HIT: slot=%td n_tokens=%u n_seqs=%u n_seq_tokens=%u\n",
+                slot - graph_cache.data(), ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens);
+        }
+
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
@@ -1460,6 +1466,112 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // T1 diagnostic: synchronized recurrent-state row hashes, one line per decode
+    // sub-ubatch. Reading the store while the previous graph is still in flight
+    // races the GPU, so synchronize first; these hashes are a reliable per-step
+    // state fingerprint (the unsynchronized RS_STEP row probes are not).
+    if (getenv("LLAMA_RS_DEBUG") != nullptr && mctx != nullptr && llama_model_is_hybrid(&model)) {
+        ggml_backend_sched_synchronize(slot->sched.get());
+
+        const auto * mem_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
+        const auto * recr    = mem_hyb->get_recr();
+
+        fprintf(stderr, "RSPROBE: n_t=%u n_seqs=%u seqs=[", ubatch.n_seq_tokens, ubatch.n_seqs);
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            fprintf(stderr, "%s%d", s ? "," : "", ubatch.seq_id[s*ubatch.n_seq_tokens][0]);
+        }
+        fprintf(stderr, "]");
+
+        auto hash_rows = [&](const ggml_tensor * t, const char * tag) {
+            if (t == nullptr) {
+                return;
+            }
+            const size_t row_size = ggml_row_size(t->type, t->ne[0]);
+            const size_t n_u32    = (row_size + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+            std::vector<uint32_t> buf(n_u32);
+            for (int64_t i = 0; i < t->ne[1]; ++i) {
+                ggml_backend_tensor_get(t, buf.data(), (size_t) i * row_size, row_size);
+                uint64_t h = 1469598103934665603ull;
+                for (size_t j = 0; j < row_size / sizeof(uint32_t); ++j) {
+                    h ^= buf[j];
+                    h *= 1099511628211ull;
+                }
+                fprintf(stderr, " %s%d=%016llx", tag, (int) i, (unsigned long long) h);
+            }
+        };
+
+        // full recurrent state: hash every recurrent layer's conv (r) and GDN (s) store
+        for (uint32_t il = 0; il < recr->get_n_r_layers(); ++il) {
+            char tag[8];
+            snprintf(tag, sizeof(tag), "r%d", (int) il);
+            hash_rows(recr->get_r_l(il), tag);
+            snprintf(tag, sizeof(tag), "s%d", (int) il);
+            hash_rows(recr->get_s_l(il), tag);
+        }
+
+        // attention K/V cache: hash each batch seq's K/V cell range per KV layer.
+        // sinfos[i_cur] is the current ubatch's slot info; idxs[stream] holds the
+        // cell index of every batch token in batch order. Tokens of seq s occupy
+        // the contiguous run [s*n_seq_tokens, (s+1)*n_seq_tokens) of that list.
+        const auto * kv_ctx = mem_hyb->get_attn();
+        const auto * kv     = kv_ctx != nullptr ? kv_ctx->get_kv_cache() : nullptr;
+        if (kv != nullptr) {
+            const auto & sinfos = kv_ctx->get_slot_infos();
+            const size_t i_cur  = kv_ctx->get_i_cur();
+            const uint32_t n_kv = kv->get_n_kv_layers();
+            const uint32_t n_st = (uint32_t) sinfos[i_cur].idxs.size();
+            for (uint32_t s = 0; s < n_st; ++s) {
+                const auto & cells = sinfos[i_cur].idxs[s];
+                fprintf(stderr, " KVCELLS[s%d]=", (int) s);
+                for (size_t ci = 0; ci < cells.size() && ci < 16; ++ci) {
+                    fprintf(stderr, "%s%u", ci ? "," : "", cells[ci]);
+                }
+            }
+            fprintf(stderr, "\n");
+            for (uint32_t il = 0; il < n_kv; ++il) {
+                const ggml_tensor * k = kv->get_k_l(il);
+                const ggml_tensor * v = kv->get_v_l(il);
+                for (uint32_t s = 0; s < n_st; ++s) {
+                    const auto & cells = sinfos[i_cur].idxs[s];
+                    if (cells.empty()) {
+                        continue;
+                    }
+                    for (uint32_t q = 0; q < ubatch.n_seqs; ++q) {
+                        const size_t b0 = (size_t) q * ubatch.n_seq_tokens;
+                        const size_t b1 = b0 + ubatch.n_seq_tokens;
+                        if (b1 > cells.size()) {
+                            break;
+                        }
+                        const uint32_t c0 = cells[b0];
+                        const uint32_t c1 = cells[b1 - 1];
+                        auto hash_range = [&](const ggml_tensor * t, const char * tag) {
+                            if (t == nullptr) {
+                                return;
+                            }
+                            const size_t block = ggml_row_size(t->type, t->ne[0]);
+                            const size_t off   = (size_t) c0 * block;
+                            const size_t len   = (size_t) (c1 - c0 + 1) * block;
+                            std::vector<uint32_t> buf((len + sizeof(uint32_t) - 1) / sizeof(uint32_t));
+                            ggml_backend_tensor_get(t, buf.data(), off, len);
+                            uint64_t h = 1469598103934665603ull;
+                            for (size_t j = 0; j < len / sizeof(uint32_t); ++j) {
+                                h ^= buf[j];
+                                h *= 1099511628211ull;
+                            }
+                            fprintf(stderr, " %s=%016llx", tag, (unsigned long long) h);
+                        };
+                        char tag[16];
+                        snprintf(tag, sizeof(tag), "k%d_s%d", (int) il, (int) q);
+                        hash_range(k, tag);
+                        snprintf(tag, sizeof(tag), "v%d_s%d", (int) il, (int) q);
+                        hash_range(v, tag);
+                    }
+                }
+            }
+        }
+        fprintf(stderr, "\n");
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -4074,6 +4186,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     }
 
     return mem->get_can_shift();
+}
+
+bool llama_memory_prefix_cache_enabled(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->get_prefix_cache_enabled();
 }
 
 llama_prefix_match llama_memory_prefix_match(

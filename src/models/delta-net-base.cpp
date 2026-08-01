@@ -459,12 +459,18 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
-    if (inp->direct && qkv_mixed->ne[1] == 1) {
+    if (qkv_mixed->ne[1] == 1 && cparams.n_rs_seq == 0) {
         // steady-state decode: read/write the conv state rows in place via s_copy_main,
-        //   skipping the gather, concat and write-back copy
+        //   skipping the gather, concat and write-back copy. Safe for any batch mix:
+        //   each sequence owns the row it reads (K == 1 per-sequence row ownership).
         ggml_tensor * qkv_t = ggml_reshape_3d(ctx0, qkv_mixed, 1, conv_channels, n_seqs);
 
-        return ggml_ssm_conv_idx(ctx0, qkv_t, conv_kernel, conv_states_all, inp->s_copy_main);
+        const auto & fr_d = inp->fresh_rows;
+        int32_t fm_d = 0;
+        for (size_t i = 0; i < fr_d.size() && i < 32; ++i) {
+            if (fr_d[i] >= 0) fm_d |= (1 << i);
+        }
+        return ggml_ssm_conv_idx(ctx0, qkv_t, conv_kernel, conv_states_all, inp->s_copy_main, fm_d);
     }
 
     // Prefill path: use the indexed in-place variant (ssm_conv_idx) when n_rs_seq == 0.
@@ -484,10 +490,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         cb(sx, "conv_sx_transposed", il);
 
         // Zero the scratch state row and stage extra states (same pattern as build_recurrent_attn)
-        build_rs_store_zero(inp, conv_states_all, hparams.n_embd_r());
+        build_rs_store_zero(inp, conv_states_all, hparams.n_embd_r(), n_seqs, /*keep=*/false);
         build_rs_store_extra(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
 
-        return ggml_ssm_conv_idx(ctx0, sx, conv_kernel, conv_states_all, inp->s_copy_main);
+        const auto & fr_d2 = inp->fresh_rows;
+        int32_t fm_d2 = 0;
+        for (size_t i = 0; i < fr_d2.size() && i < 32; ++i) {
+            if (fr_d2[i] >= 0) fm_d2 |= (1 << i);
+        }
+        return ggml_ssm_conv_idx(ctx0, sx, conv_kernel, conv_states_all, inp->s_copy_main, fm_d2);
     }
 
     // Fallback: n_rs_seq > 0 (speculative rollback path) — needs gather+concat
@@ -580,20 +591,35 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         return output;
     }
 
-    build_rs_store_zero(inp, ssm_states_all, hparams.n_embd_s());
+    build_rs_store_zero(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, keep);
 
     // state store view [S_v, S_v, H_v, n_rows]; the op reads row s_copy_main[i] for batch seq i
     ggml_tensor * state_store = ggml_reshape_4d(ctx0, ssm_states_all, S_v, S_v, H_v, ssm_states_all->ne[1]);
+    if (getenv("LLAMA_GDN_BUILD") != nullptr && strstr(ssm_states_all->name, "cache_s_l0") != nullptr) {
+        fprintf(stderr, "GDN_BUILD: nt=%lld ns=%lld store_ne={%ld,%ld} store=%p reshape_ne={%ld,%ld,%ld,%ld} reshape=%p\n",
+            (long long) n_seq_tokens, (long long) n_seqs,
+            (long) ssm_states_all->ne[0], (long) ssm_states_all->ne[1], (void *) ssm_states_all,
+            (long) state_store->ne[0], (long) state_store->ne[1], (long) state_store->ne[2], (long) state_store->ne[3], (void *) state_store);
+    }
     cb(state_store, "state_predelta", il);
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = keep ? (int64_t) cparams.n_rs_seq + 1 : 1;
 
-    // steady-state decode: the op can write the new state back to the rows it read from,
-    //   skipping the snapshot area and the write-back copy below
-    const bool inplace = !keep && n_seq_tokens == 1 && inp->direct;
+    // K == 1: the op writes the new state back to the row it read (per-sequence row
+    //   ownership; fresh rows were zeroed by build_rs_store_zero). This is safe for any
+    //   batch mix and never overwrites an idle sequence's state row, unlike the old
+    //   batch-position write-back which reassigned idle rows and corrupted sequences
+    //   that returned to the batch (concurrent multi-seq corruption).
+    // K > 1: snapshot slots are written out and copied by the graph below.
+    const bool inplace = !keep;
 
-    ggml_tensor * gdn_out = ggml_gated_delta_net_idx(ctx0, q, k, v, g, b, state_store, inp->s_copy_main, K, inplace);
+    const auto & fr_g = inp->fresh_rows;
+    int32_t fm_g = 0;
+    for (size_t i = 0; i < fr_g.size() && i < 32; ++i) {
+        if (fr_g[i] >= 0) fm_g |= (1 << i);
+    }
+    ggml_tensor * gdn_out = ggml_gated_delta_net_idx(ctx0, q, k, v, g, b, state_store, inp->s_copy_main, K, inplace, fm_g);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

@@ -1986,3 +1986,593 @@ the Qwen3.6 model implementation, separate from TP optimization.
 - `271195667` Layer split + zero-split fallback
 - `8b0d2ebef` Prefix cache re-enabled
 - `2d6a42082` ngl=999 for pipeline parallelism
+
+## Wave-2 Verification Fixes - 2026-07-27
+
+Verification of the Wave-2 agent claims (HANDOFF.md "Verification of Agent Wave-2
+Claims") found that "T1 RESOLVED" was false: the handle_reshape keystone bug was
+bypassed via -sm layer, not fixed. Four recommendations applied and validated on
+4xMI100.
+
+### R2: handle_reshape fix attempt and finding
+
+Attempted: propagate per-device ne values from src_ss[0].ne[j] in handle_reshape's
+three return branches. This caused a downstream assertion failure at line 1043
+(GGML_ASSERT(split_state.ne[j] % div == 0)) because the post-processing code at
+lines 1023-1062 recomputes per-device ne from source split states, overwriting
+handler return values. The handler's ne={0} return is intentional: it signals the
+post-processing loop to compute the correct values.
+
+Reverted the handle_reshape changes. The init_tensor_impl stale-state validation
+(ne[split_dim] > tensor->ne[split_dim] check) was kept as defense-in-depth.
+
+The handle_reshape keystone bug remains open. Tensor-split (-sm tensor) is
+unusable for serving: it crashes on the 3rd sequential request and produces 100%
+divergent output under concurrent load (see R3 results below).
+
+### R3: Concurrent correctness gate - RAN AND PRODUCED RESULTS
+
+Script: /tmp/opencode/concurrent_correctness_gate.py (3 modes: ref/test/compare).
+Orchestrator: /tmp/opencode/run_concurrent_gate.sh.
+
+Results (TP4 layer-split reference vs TP4 tensor-split concurrent, C=8, 12 prompts,
+48 tokens, greedy temperature=0.0):
+
+| Prompt | Ref tok | Test tok | Match | Diverge at |
+|--------|---------|----------|-------|------------|
+| 0 | 48 | 35 | N | 0 |
+| 1 | 48 | 48 | N | 6 |
+| 2 | 48 | 48 | N | 0 |
+| 3 | 28 | 33 | N | 13 |
+| 4 | 48 | 48 | N | 4 |
+| 5 | 48 | 48 | N | 0 |
+| 6 | 48 | 48 | N | 0 |
+| 7 | 48 | 48 | N | 3 |
+| 8 | 48 | 48 | N | 0 |
+| 9 | 48 | 48 | N | 4 |
+| 10 | 48 | 48 | N | 0 |
+| 11 | 31 | 48 | N | 2 |
+
+Corruption rate: 12/12 (100%). Every concurrent output diverges from the
+sequential reference. Some diverge at position 0 (entirely different greedy
+output), others at positions 2-13.
+
+Sequential tensor-split test: server crashes on the 3rd sequential request
+(ggml-cuda.cu:416 GGML_ASSERT during decode). Confirms the handle_reshape
+corruption is not fixed.
+
+The C=8 contradiction from the verification is resolved: both "0/8" (sequential)
+and "6-7/8" (concurrent) were real measurements of different test modes, but
+the sequential result was misleading - tensor-split crashes before completing
+8 sequential requests, so "0/8 corrupted" means "crashed before testing all 8".
+
+Note: prefix cache must be disabled for both layer and tensor split
+(LLAMA_PREFIX_CACHE_DISABLE=1). The snapshot path
+(llama_rs_row_block_copy -> get_tensor_async) crashes on meta-backend buffers
+(ggml-cuda.cu:2394: unsupported buffer type). This is D4 (nr>1 snapshot readback).
+
+### R4: DEBUG_TIMINGS instrumentation - RAN AND PRODUCED RESULTS
+
+Added: t_http, t_sampl_spec, t_decode_host/t_decode_gpu to server-context.cpp.
+All are no-op scoped_timers without DEBUG_TIMINGS.
+
+Layer-split C=8 burst (4xMI100, 8 prompts x 48 tokens):
+
+| Phase | Time (ms) | Note |
+|-------|-----------|------|
+| t_pre_decode | 171.9 | batch construction + graph setup |
+| t_decode (total) | 650.0 | |
+| t_decode_host | 597.0 | host-side graph dispatch/launch |
+| t_decode_gpu | 53.0 | GPU compute (t_decode - t_decode_host) |
+| t_post_decode | 8.6 | |
+| t_sampl | 1.9 | |
+| t_http | 0.004 | effectively zero |
+
+The 208-vs-82 gap is explained: it is NOT HTTP/streaming overhead (0.004 ms).
+The dominant cost is host-side decode dispatch (597 ms = 92% of decode time).
+The GPU does only 53 ms of actual compute per step. The host overhead comes
+from the per-slot serialized loop building and dispatching sub-batch graphs
+through the ggml scheduler.
+
+### R1: Serving config
+
+Changed run_tp4_bench.sh to -sm tensor with LLAMA_PREFIX_CACHE_DISABLE=1.
+Created run_golden_reference.sh (layer split, port 8081, -np 1, prefix cache off)
+for golden-reference output generation.
+
+## Paged attention under TP4/MTP2/C8 — fresh analysis (2026-07-27)
+
+Re-analyzed the paged attention shared-block system with fresh measurements,
+replacing the stale assumptions from the T13-T14 deferral. Key correction:
+the "2.6x slower" figure is stale and does not reproduce on this branch.
+
+### Measured state (gfx908, Qwen3.6-27B-UD-Q6_K_XL, 300 MHz pin, C=8 burst, agg tok/s)
+
+| Config | paged OFF | paged ON | delta |
+|--------|-----------|----------|-------|
+| no MTP, KV~75 (short prompts), single GPU | 43.6 | 42.2 | -3% |
+| no MTP, KV~1100 (1024-tok prompts), single GPU | 26.3 | 26.5 | +1% |
+| MTP2, KV~75, single GPU (n=3-4) | 39.8 +/- 0.5 | 37.5 +/- 4.0 | -6% mean, high variance |
+| -sm tensor 4 GPU (engine npl8, log:1297) | 149.6 | 149.6 | identical = paged never engaged |
+
+All paged-ON runs verified engaged: no fallback WARN in the server log (the
+tensor-split run prints one - see below).
+
+### Structural findings (what is actually true)
+
+1. **LLAMA_KV_PAGED never engages under -sm tensor.** The KV buffer type under
+   tensor split is `Meta()` and the gate at llama-kv-cache.cpp:424-434 rejects
+   it ("only supported on the HIP/CUDA backend"). Measured: server log shows
+   `W llama_kv_cache: LLAMA_KV_PAGED is only supported on the HIP/CUDA backend
+   (got buffer type 'Meta()')`. Every prior "paged under TP4" number in this
+   log (engine 149.6 "identical on/off", etc.) was the silent legacy fallback.
+   There is NO dense-vs-paged measurement under TP4 in existence.
+
+2. **The 2.6x (65 -> 24.8, 4 endpoints, 2026-07-25, log:741-747) is stale.**
+   That run predates the ncols>=2 gate (llama-kv-cache.cpp:1903-1909, "HIP
+   paged vec kernel with ncols=2 intermittently hits an illegal memory access
+   on gfx908"). With MTP2, verify ubatches are n_tps=3, so today they fall
+   back to dense; the old run exercised the paged ncols=2 path and paid its
+   cost. The mechanism claim attached to it ("per-seq FA decomposition + vec
+   gather + alloc scans") does not reproduce: per-seq decomposition is
+   measured at ~3% at C=8, and no KV-scaling tax appears at KV~1100.
+
+3. **MTP2 bypasses paged entirely today.** Verify (3 tok/seq) -> ncols gate ->
+   dense. Draft context (ctx_dft) is `other=true`, and the paged env is only
+   read for `!other` (llama-kv-cache.cpp:375-379), so the MTP draft KV is
+   always legacy. Paged only serves plain 1-token/seq decode steps on the
+   main context. The residual -6% +/- 4% under MTP2 is noisy and likely an
+   allocator/rollback interaction (seq-aligned allocator vs recurrent
+   rollback cell frees), not the FA path.
+
+4. **4-GPU layer split + paged crashes** at get_k_paged (log:1282-1283).
+   Paged is single-GPU-only on this branch.
+
+5. **The kernel is batched-capable but the graph never uses it.** The paged
+   vec kernel resolves `sequence = blockIdx.z / ne02` with a per-sequence
+   table column (fattn-vec.cuh:111-132, dst write at :548 indexes by
+   `sequence` with ne03 stride) - it was written for one node per ubatch.
+   The graph instead builds one FA node per sequence + ggml_concat
+   (llama-graph.cpp:2503-2545) because ggml_flash_attn_ext asserts
+   q->ne[3]==k->ne[3]==v->ne[3] (ggml.c:5416-5417) and the K/V pool view has
+   ne[3]=1. The per-seq decomposition costs ~3% at C=8 (measured) - it is a
+   small tax, not the 2.6x.
+
+6. **KV head sharding under TP4 is paged-compatible.** cache_k/v_l split on
+   AXIS_0 (head axis, llama-model.cpp:443-445): each GPU holds its head shard
+   of the full pool. The block table is a host input, MIRRORED under the meta
+   backend (ggml-backend-meta.cpp:752-761). Nothing blocks the paged kernel
+   per-GPU once the buffer gate accepts Meta.
+
+7. **The shared-block VALUE under TP4 is prefix sharing, which is dead.**
+   Zero-copy block sharing between requests goes through the prefix cache
+   registry (prefix_copy in paged mode = pure seq_add bookkeeping,
+   llama-kv-cache.cpp:1306-1335). LLAMA_PREFIX_CACHE_DISABLE=1 is required
+   under TP4 because of D4 (nr>1 get/set_tensor_async snapshot readback).
+   Without the prefix cache, paged under TP4 is pure machinery with no
+   payoff - unified KV already gives the memory sharing.
+
+### Recommended approach (priority order for TP4/MTP2/C8)
+
+1. **Fix the TP4 buffer gate** (llama-kv-cache.cpp:424-434): accept meta
+   buffer types when the underlying simple buffers are ROCm. This is the one
+   change that makes paged exist under TP4 at all. Small, low risk, then
+   measure dense-vs-paged at TP4 for the first time.
+2. **Fix the ncols>=2 IMA in the paged vec kernel** (fattn-vec.cuh). This is
+   the actual MTP2 interaction: verify (n_tps=3) and prefill chunks would
+   use paged. Debug the OOB (likely the strided dst write or the OOB guards
+   at ncols>1 with padded lengths). Unblocks paged under MTP2 and removes
+   the dense/paged split of the graph.
+3. **Hoist the table walk** (fattn-vec.cuh:126-132): resolve one block id per
+   32-row chunk, then rows are contiguous (blk*32 + p%32) - kills 2 lookups
+   per row and enables coalesced loads. Not needed at bench KV (measured 0%),
+   needed to make paged long-context-friendly (16k ctx).
+4. **D4** (get/set_tensor_async nr>1 gather, HANDOFF T2): re-enables the
+   prefix cache under TP4 -> block sharing between concurrent requests ->
+   the shared-block system's actual feature. Without this, paged under TP4
+   has no user-visible benefit.
+5. **Batched single node (T13)**: relax ggml.c:5416-5417 to broadcast k/v
+   ne[3]=1 against q ne[3]=n_seqs, delete the per-seq loop + concat. Expected
+   <=5% at C=8. Do after 1-2 (re-measure; per-seq decomposition may already
+   be hidden under the ncols fix).
+6. **Re-measure at TP4 with MTP2/C8** after 1+2. Acceptance for flipping
+   LLAMA_KV_PAGED default ON: paged >= dense at TP4 C=8 with MTP2, plus
+   sequential + concurrent correctness gate green (concurrent_correctness_gate.py).
+
+Non-goals (explicitly rejected by this analysis): int8-MFMA KQ dots (FA is
+2% of the GPU step at bench KV; log:1132-1134), tile/MMA paged kernels
+(same reason), graph-cache surgery for MTP shape alternation (intrinsic,
+log:1644-1649).
+
+### What was measured and how
+
+- burst_c8.py (logs/bench/burst_c8.py): 8 concurrent /completion requests,
+  stream off, temp 1.0, ignore_eos, n_predict 48, seeds varied; short KV =
+  1 prompt repeat (~50 tok), long KV = 20 repeats (~1024 tok).
+- Server: -c 16384 -np 8 --kv-unified -b 2048 -ub 2048 -sm layer
+  -ts 1,1,1,1, HIP_VISIBLE_DEVICES=0, LLAMA_PREFIX_CACHE_DISABLE=1.
+- Paged engagement verified by absence of the fallback WARNs in the server
+  log (the -sm tensor run prints the Meta() WARN; the -sm layer runs do not).
+
+## Concurrent corruption hunt - 2026-07-31 (multi-seq recurrent state)
+
+### What was proven
+1. The "TP corruption" (12/12 concurrent divergence) reproduces on SINGLE GPU
+   layer split -> it is a multi-sequence bug in the model/memory path, NOT the
+   TP handle_reshape keystone (which is a separate, still-open bug).
+2. Three distinct bugs found and fixed in the recurrent-state machinery
+   (src/llama-memory-recurrent.cpp, src/llama-graph.cpp, src/models/delta-net-base.cpp):
+   a. Stale `src` on reused cells: a cell freed by seq_rm/seq_keep could keep a
+      row pointer to a previous occupant's state; a fresh sequence then read
+      garbage as its initial state. Fixed by resetting src=-1 for all empty
+      cells at the start of apply_ubatch.
+   b. The src0/rs_z loops iterated [min, max] with a stale pre-compaction max,
+      clobbering cells of sequences not in the current batch (sub-batch
+      splits). Fixed by operating on the compacted range [min, min+n_seqs).
+   c. The swap-chain compaction lost a sequence's metadata under some batch
+      orders (reversed tails): one row mapping dropped, another duplicated.
+      Fixed with a two-phase extract-then-place compaction.
+   d. The K==1 state write-back used batch-position rows, so an idle sequence's
+      row could be reassigned and overwritten; on return it read a foreign
+      state. Fixed with per-sequence row ownership: fresh sequences get
+      distinct free rows (refcount 0), zeroed by build_rs_store_zero (baked
+      views, can_reuse keyed on the fresh set), and the GDN kernel writes back
+      in place (state_ip) to the rows it read for ALL K==1 batches.
+   After a-c+d: host-side row mapping fully consistent (0 duplicate-row steps
+   across 100+ multi-seq steps), 8/8 and 9/9 concurrent greedy tests PASS.
+3. Remaining leak (1/12): a fresh request (clean recurrent state, fresh row
+   zeroed) produces different output after 12 prior requests than on a fresh
+   server. Isolated: 1 request twice = SAME; 12-prompt pass then prompt 0 =
+   DIFF (echo mode). The recurrent trace is IDENTICAL in both cases -> the
+   leak is in the attention KV path (k_idxs/cell mapping under slot reuse
+   after KV churn). Also added: n_past clamp for hybrid models when the prefix
+   cache (recurrent snapshots) is disabled (llama_memory_prefix_cache_enabled
+   API + server clamp) - the slot-level cached-prompt reuse is invalid for
+   hybrid models without snapshots.
+
+### Next step
+Instrument llama_kv_cache::set_input_k_idxs (src/llama-kv-cache.cpp:2284)
+sinfo.idxs for prompt 0 in pass 1 vs pass 2 to find the KV cell mapping drift.
+
+## Concurrent corruption hunt - continuation - 2026-07-31 (evening)
+
+### Fixed: the sequential slot-reuse leak (root cause: the graph zeroing ops)
+Minimal repro: P0 -> P1 -> P0 on one slot produced an echo ("France is France is")
+for the second P0 despite byte-identical recurrent/KV/mask host traces. The
+remaining difference was GPU-side: the fresh row contained the previous
+occupant's state because the graph's scale_inplace zeroing ops did not
+guarantee execution before the GDN/conv reads on reused graphs.
+
+FIX (kernel-side, eliminates the zeroing dependency): fresh sequences now skip
+the state read entirely. The GDN kernel (gated_delta_net.cu) and the conv
+kernel (ssm-conv.cu) take a baked fresh_mask op param (GDN: param 2, conv:
+param 0); fresh bits initialize s_shard/st[] to zero without touching the
+store. The graph builder (delta-net-base.cpp) computes the mask from the
+build-time fresh set; can_reuse already keys on the fresh set so the baked
+mask always matches the batch. ggml_gated_delta_net_idx and ggml_ssm_conv_idx
+gained a fresh_mask argument (ggml.c/ggml.h).
+
+Result: P0 -> P1 -> P0 now SAME. Sequential outputs deterministic across
+repeats.
+
+### Still open: concurrent multi-seq fresh prefill corruption
+12-prompt concurrent gate with fresh references: 6/12 match (was 0/12 before
+all fixes). The first 8-seq concurrent prefill (one ubatch, 8 fresh seqs)
+corrupts ~6/8 outputs at early positions (0-6); later smaller batches (1-2
+fresh) are correct. Host-side structure verified correct: distinct fresh rows,
+correct masks, correct k_idxs, correct fresh-skip mask. The corruption is
+inside the 8-seq fresh prefill's GPU execution - next step: dump the GDN
+kernel's per-seq final state for the 8-seq batch and compare against 8
+sequential 1-seq runs (kernel-level bisect of which seqs/heads corrupt).
+
+### Cumulative fixes on this branch (uncommitted)
+1. Recurrent memory: empty-cell src reset, compacted-range [min, min+n_seqs)
+   loops, two-phase extract-then-place compaction (swap chain lost metas),
+   per-sequence row ownership (fresh rows = distinct free rows, state_ip for
+   all K==1 batches), rs_z fallback.
+2. Server: n_past clamp for hybrid models when the prefix cache (recurrent
+   snapshots) is disabled (new llama_memory_prefix_cache_enabled API).
+3. Kernels: fresh_mask skip-read for GDN + conv.
+
+## Concurrent corruption hunt - 2026-07-31 (late) - conv write-back stale-read fix
+
+### Found and fixed: the conv kernel's write-back read the STALE store
+The ssm_conv_idx kernel's state write-back read `st[wcol]` (the STORE row,
+still holding the previous occupant's state) instead of the local x[] window
+(zeroed for fresh sequences by the fresh-skip). For a fresh sequence, the
+first d_conv-1 window entries leaked the previous occupant's conv state into
+the new sequence's first tokens - the "similar but perturbed" divergence
+(the concurrent outputs in a different generation mode: "### Step 1:" vs
+"<think>").
+
+Fix (ssm-conv.cu): `st[c] = wcol < d_conv-1 ? x[wcol] : x_row[wcol-(d_conv-1)]`
+- x[] == st[] for carried sequences (identical), x[] == 0 for fresh.
+
+Result: 8-concurrent 12-token test improved 4/8 -> 5-7/8 across runs (bad set
+varies: run-dependent -> a remaining race or batch-composition-dependent bug).
+
+### Root-cause methodology that worked
+1. Byte-identical host traces (recurrent rows, KV cells, masks, k_idxs) while
+   outputs differed -> GPU-side data was the culprit.
+2. Row-content probes (first floats of the ssm+conv store rows at set_input)
+   showed the concurrent prefill's seq-0 conv state differed from the
+   sequential run's [-0.320 vs -1.444].
+3. Batch-size bisect: 2-seq concurrent PASSES, 4-seq fails -> scales with
+   batch size -> kernel-level stale-read.
+4. The conv write-back's st[] read was the stale path.
+
+### Still open
+5-7/8 concurrent (was 0/12). The remaining divergence is run-dependent
+(bad set varies 2; 5; 2,3,4). Next: capture the trace for a BAD run and diff
+the per-seq row contents vs a good run to find the remaining stale/racing
+path (suspects: the GDN kernel's multi-seq state handling under specific
+batch compositions, or the attention KV under mixed batches).
+
+## Concurrent corruption - 2026-08-01 - conv state probes prove the multi-seq prefill path
+
+Added all-row conv-state probes (first 2 floats of every store row at
+set_input). The concurrent 8-seq first-decode probes show per-row conv states
+that differ from the sequential per-prompt runs (e.g. row 0: [-0.3204, 0.4226]
+vs sequential prompt 0: [-1.444, 0.4226]) - the multi-seq prefill's conv
+states are genuinely wrong for the same prompts, despite:
+- correct host structure (distinct fresh rows, correct masks/k_idxs)
+- the fresh-skip (kernel reads zeros for fresh)
+- the conv write-back fix (local x[] window, not stale store)
+
+The sequential probes themselves are suspicious: run k's row-0 probe equals
+run k+1's probe shifted by one float, suggesting the row-0 conv content is a
+single long sequence read at different offsets across runs - the conv state
+after each prefill may depend on prior row content in a way the fresh-skip
+does not cover (or the probe offset is misaligned for multi-token writes).
+
+Next steps queued:
+1. Dump the conv kernel's sx input (first tokens of seq 0) for the 8-seq
+   batch vs sequential - verify the multi-seq token indexing feeds the right
+   tokens.
+2. Probe the GDN state at a mid-row offset (float ~1000) - confirm the
+   state_ip write actually lands (the row's first floats are near-zero in
+   both seq and conc, so the first-4-float probe cannot discriminate).
+3. If the inputs are right, dump the conv window after the prefill per seq
+   (full d_conv-1 window) and diff against sequential.
+
+Cumulative: 0/12 -> 5-7/8 concurrent (12-token), sequential deterministic.
+
+## Concurrent corruption - 2026-08-01 - batch-size boundary and split structure
+
+1. Sequential determinism PROVEN: the same prompt 3x produces identical output;
+   the row-content probes (first floats at set_input) were a misleading artifact
+   (they cycle with period ~4 - the probes read the row while the GPU is
+   executing the previous graph; not a valid state fingerprint).
+2. Batch-size boundary: 2-seq concurrent PASSES, 3-seq FAILS (2/3, bad=[1]),
+   4-seq 2/4 bad=[2,3], 5-seq 3/5 bad=[3,4]. The bad set varies per run with
+   the same prompts -> slot-state/batch-composition dependent, not prompt-
+   specific.
+3. The C-seq prefill is CHUNKED: the trace shows the prefill split into
+   sequential sub-ubatches [C], [C-2], [2], [1] (the seqs with different
+   prompt lengths finish in different chunks; the recurrent state carries
+   across chunks through the store rows). The host structure of every chunk
+   is correct (distinct fresh rows, correct fresh masks, correct carried
+   reads).
+
+Conclusion: the remaining corruption is inside the multi-seq GDN/conv
+prefill GPU computation (2 seqs fine, 3+ corrupt, variance by composition).
+The next step is a kernel-level trace: dump the GDN kernel's per-seq final
+s_shard (or the store rows after each chunk) for a corrupting run, comparing
+the per-seq state evolution against 2-seq (correct) runs.
+
+Cumulative: 0/12 -> 5-7/8 concurrent, sequential deterministic.
+
+## T13: batched varlen paged FA decode node (one FA per ubatch) - 2026-08-01
+
+### Change
+The paged attention graph path (LLAMA_KV_PAGED=1) built one GGML_OP_FLASH_ATTN_EXT
+node per sequence of the ubatch (n_seq launches per layer) plus a concat along the
+sequence axis. The paged vec kernel already derives `sequence` from blockIdx.z
+(grid.z = n_head*n_seq), so the batched form is a single node:
+
+- `src/llama-graph.cpp` (build_attn_mha): for n_tps == 1, view Q as
+  [D, n_tps, n_head, n_seq] (strided view of the seq-major token dim, no copy),
+  pass the full mask [n_kv, n_tps, 1, n_seq] and the full block table
+  [kv_size/32, n_seq]; one node, one launch, no concat. The n_tps > 1 case keeps
+  the per-seq loop (the batched kernel writes the output seq-major in the token
+  dim, which matches the per-seq concat layout only for n_tps == 1; paged_ubatch
+  gates n_tps == 1 anyway today).
+- `ggml/src/ggml.c` (ggml_flash_attn_ext): relax q->ne[3] == k/v->ne[3] to allow
+  k/v->ne[3] == 1 (seq-broadcast K/V pool: the pool views have nb[3] == 0, and the
+  vec kernel's K/V sequence term is 0 there; dense paths always have equal ne[3],
+  so the relaxation is paged-only in practice).
+- Comments updated in get_k_paged/get_v_paged (llama-kv-cache.cpp/.h).
+
+### Validation (this box, gfx908, Qwen3.6-27B Q6_K)
+- Single-seq greedy: output matches the dense reference for 60+ chars (then the
+  expected FA accumulation-order drift; same tokenization quality).
+- 8-way concurrent greedy (8 slots, one ubatch): 8/8 coherent, twice.
+- 4x fresh-restart single-request cycles: 4/4 correct.
+- One unexplained one-off: a fresh server's first request returned "!!!!!!!!"
+  (16 chars) once across ~30 requests; not reproducible in 5 subsequent cycles.
+  Same signature as the known concurrent multi-seq corruption; treated as the
+  open recurrent-path bug, not the paged path (dense 1-GPU control was clean).
+- Perf A/B (1 GPU, c=8192, 8 slots x 128 tok, greedy, server /metrics deltas):
+  - batched paged: 1024 tok / 133.3 slot-s -> ~61.4 agg tok/s
+  - dense        : 1024 tok / 136.9 slot-s -> ~59.8 agg tok/s
+  - OLD per-seq paged (HEAD, stash A/B): ~59.4 agg tok/s
+  Parity across all three on this config. The historical "2.6x slower" paged
+  figure did NOT reproduce here (it was measured on the TP4/MTP server config
+  and/or under KV churn) - re-verify under TP4 before claiming closure.
+- Structure win independent of raw tok/s: one FA node per layer instead of
+  n_seq, no concat, and the paged mask is ubatch-wide (padded), so the graph
+  cache key is stable across seq-length changes within a pad bucket.
+
+### Kept. Next
+1. Re-verify paged-vs-dense under TP4 tensor split + MTP2 at C8 (the config of
+   the original 2.6x measurement).
+2. The real paged-vs-dense speedup needs a tensor-core (MFMA) paged kernel
+   (T14): paged is forced to the vec kernel today (fattn.cu:443-448).
+
+## T1 keystone: tensor-split recurrent-state corruption - ROOT CAUSE FOUND - 2026-08-01
+
+### Symptom (repro)
+`-sm tensor` (1 GPU or TP4): the 2nd consecutive same-prompt request on a reused
+slot outputs "!!!!!!!!" from decode step 2 onward. Host-side traces (RS_STEP,
+KV_IDXS, fresh rows) are byte-identical between request 1 and request 2; layer
+split is clean. The GDN kernel's per-GPU state tensor on the reused graph has
+degenerate metadata (ne={786432,0,1,1} or all-zero), so the state_ip write-back
+lands in recycled memory and the recurrent state row stays zero.
+
+### Root cause (ggml-backend-meta.cpp)
+The meta backend keeps per-GPU ("simple") tensor copies in two rotating
+"compute" containers. A rebuild of ANY graph resets the other container
+(ggml_reset + map clear). The llama graph cache keeps several graphs alive at
+once (prefill chunks, decode, per-slot graphs); when graph B's first compute
+resets the container, graph A's cached per-GPU tensors dangle. Graph A's next
+compute hits the uid cache (no rebuild) and replays sub-graphs referencing
+recycled tensor metadata - the GDN state view then points into a recycled
+region (wrong ne/nb/data), the write-back lands nowhere, the state reads back
+as all zeros. The old design comment even says "rotating set of 2 compute
+containers... works correctly for llama.cpp" - its one-graph-at-a-time
+assumption is violated by the llama graph cache.
+
+### Fix (worktree, validated)
+1. Replace the 2 rotating containers with a per-graph-uid container map
+   (stc_compute[uid]); tensors created at alloc go to a "current" container
+   which the graph's first compute adopts into its uid slot; a uid's own
+   container is reset only when that same uid rebuilds. Other graphs' tensors
+   stay valid across computes.
+2. Bound the container pool sizes (one graph's per-GPU metadata is a few MB;
+   the old 1M-tensor / 16x-ctx pools multiplied by the uid map exhausted host
+   RAM under concurrent load - the container ggml_init allocates eagerly).
+3. Guard init_tensor_impl against re-initializing tensors already in the
+   container (the scheduler calls init on every graph alloc; without the guard
+   the static container leaks one per-GPU copy per alloc until its pool fills).
+4. Pre-init (rebuild) initializes missing tensors into the graph's own uid
+   container instead of through the container dispatch (which falls back to
+   the shared current container).
+
+### Validation
+- 1-GPU tensor split: same-prompt-twice x6 + A/B alternation x6 all correct;
+  8-way concurrent correct, server stable.
+- TP4 (4x MI100, tensor split): same-prompt-twice + A/B alternation 6/6
+  correct (was "!!!!!!!!"); outputs match the layer-split reference.
+- Remaining edge: 4-GPU CONCURRENT load still crashes (GDN state tensor is a
+  fully zeroed object - a dangling reference into recycled memory, likely the
+  backend aux-pool / container-pool address reuse under uid eviction or the
+  backend ctx re-init on growth). Next slice: pin down that last dangling
+  reference (the GDN_STATE_NONCONTIG dump is in place).
+
+## T1 continuation: per-uid containers + fingerprint keys (2026-08-01, continued)
+
+### Landed since the previous entry
+1. Per-graph-uid container map: each graph's per-GPU tensors live in a container
+   keyed by the graph's uid; other graphs' containers are never reset, so cached
+   sub-graphs no longer reference freed metadata. Containers are sized per graph
+   (n_nodes+n_leafs)*n_bufs*overhead instead of the eager 1M-tensor/16x-ctx
+   pools (which exhausted host RAM once the map held many graphs).
+2. Fingerprint-keyed simple-tensor map (tensor ptr + type + ne[0..3] +
+   view_offs): the llama graph cache recycles its ctx arenas, so a tensor
+   address can be reused by a different tensor; address-only keys returned
+   stale per-GPU copies with garbage shape/type ("SETROWS_BAD", the
+   "src0 type=1751343459" crash).
+3. Init guard: skip re-initializing tensors already in a container (the
+   scheduler calls init on every graph alloc; without the guard the static
+   container leaked one per-GPU copy per alloc).
+4. Pre-init creates missing tensors directly in the graph's own uid container
+   (the dispatch falls back to the shared staging container, whose copies are
+   discarded per rebuild).
+
+### Validation
+- 1-GPU + TP4 tensor split: sequential same-prompt-twice / A/B alternation all
+  correct (was "!!!!!!!!"); 8-way concurrent (same-length prompts) correct,
+  server stable.
+- Mixed-length 8-way concurrent (corruption gate, 12 prompts): round 1 passes,
+  round 2 (same prompts, graph reuse/replay) triggers an illegal memory access
+  (HSA MEMORY_APERTURE_VIOLATION) - reproducible on 1 GPU, with and without
+  HIP graphs, and with the meta forced to rebuild every compute (so it is NOT
+  stale tensor reuse; the fault is in a kernel's data path under the mixed-
+  length replay).
+- Suspect kernel family: grid {160,1,1} x block {128,1,1} (160 = the mixed
+  batch's token count) - the per-token KV write / cpy family. Next: rocgdb or
+  per-op launch tracing to name the faulting kernel.
+
+### Worktree debug instrumentation (env-gated, remove before commit)
+LLAMA_GDN_DEBUG / LLAMA_GDN_PTRS / LLAMA_GDN_CALLTRACE / LLAMA_GDN_BUILD /
+LLAMA_META_TRACE / LLAMA_META_INIT_TRACE / LLAMA_META_ALWAYS_REBUILD /
+LLAMA_LAUNCH_TRACE / LLAMA_RS_DEBUG / LLAMA_RS_ZERO_DISABLE /
+LLAMA_GRAPH_REUSE_TRACE + GGML_OOM / GDN_STATE_NONCONTIG / SETROWS_BAD prints.
+
+## T1 continuation: mixed-length concurrent IMA - cell-mapping anomaly found (2026-08-01)
+
+### New evidence (1-GPU tensor split, GGML_CUDA_DISABLE_GRAPHS, LLAMA_SETROWS_TRACE)
+The crash round's KV write (set_rows) receives k_idxs = [35,0,36,0,37,0,38,0]
+for an 8-seq decode step: the ODD-indexed sequences' tokens map to CELL 0 (the
+unallocated/default cell) instead of their real cells. Consequences:
+- the odd seqs' KV writes all land in cell 0 (overwrite each other and their
+  own prefill), producing the wrong KV for those seqs (the corruption source
+  for mixed batches),
+- the same k_idxs are used by the tensor-split path; on the layer-split the
+  workload runs without the IMA, so the cell-0 values alone are not the IMA.
+
+The k_idxs come from slot_info.idxs (llama-kv-cache.cpp:2290 set_input_k_idxs)
+- the kv-unified stream/head bookkeeping under mixed-length concurrent batches
+  (odd streams' heads resolve to 0). Next: instrument the kv-unified slot
+  allocation to find why the odd streams' cells are 0, then fix the mapping.
+  The IMA itself is still not pinned to a kernel (the 160x128 grid kernel
+  family = the F32 set_rows path); the SETROWS trace + caller-tagged launch
+  trace (dladdr in ggml_cuda_kernel_launch) are in place for the next session.
+
+### Also on the crash path (fixed earlier this session)
+- the meta backend now keeps per-uid containers, fingerprint-keyed tensor maps,
+  bounded per-graph pools and a staging-discard pre-init - the sequential and
+  same-length-concurrent tensor-split paths are correct.
+
+## T1 continuation: FAULTING KERNEL IDENTIFIED - ssm_conv_idx_f32 (2026-08-01)
+
+rocgdb catch (1-GPU tensor split, GGML_CUDA_DISABLE_GRAPHS, first gate round):
+  Thread 22 "ssm_conv_idx_f32" received signal SIGSEGV
+  ssm_conv_idx_f32<true, 128, 4> at ssm-conv.cu:197 (x[d_conv-1] = x_row[0])
+
+The conv kernel's src0 (the mixed-batch qkv input) is read out of bounds -
+the per-GPU src0 data pointer or its strides are wrong on the first mixed
+prefill batch under tensor split. This is the IMA family all along (the
+"illegal memory access" reported at the next sync was this kernel). The conv
+kernel reads the state store via sidx + writes back in place; its src0 is the
+graph's qkv_mixed [n_t, channels, n_seqs] per-GPU slice.
+
+Next: dump the conv kernel's launch args (src0 data + nb1/nb2 + grid) for the
+first mixed batch via the ssm-conv.cu launcher (env-gated), compare against
+the same batch on layer split, and fix the per-GPU slice/stride mismatch.
+
+Also observed: intermittent SILENT death at the first gate batch (no ROCm
+error, no assert) - the same conv kernel fault without the HIP error
+reporting; and the kv-unified cell-0 anomaly for odd seqs (shared with layer
+split; corruption source, not the crash cause).
+
+## T1 continuation: conv args captured at the fault (2026-08-01)
+
+LLAMA_CONV_TRACE on the crashing mixed gate round (1-GPU tensor split):
+  CONV_IDX: nr=10240 n_t=1 n_s=7 nc=4 grid=(7,80) fresh=0
+    src0=linear_attn_qkv_mixed-N (reshaped) ne={1,10240,7,1} nb={4,4,40960,286720}
+    src2=cache_r_lN ne={30720,8,1,1} sidx[0]=1
+
+The launch geometry and strides are internally consistent (channel stride 4,
+seq stride 40960, max access = src0 size). The device SIGSEGV at
+ssm-conv.cu:197 (x_row[0]) therefore points at the src0 DATA address itself
+being outside the GPU's legal range on that execution - i.e. a stale/recycled
+per-GPU data pointer under the graph-cache + meta interplay, not a stride bug.
+Next: capture the faulting address + wavefront PC via rocgdb
+("info waves" / the device trap state) for the exact call, and check whether
+the src0 pointer matches a live compute-buffer range at fault time.
+
+## T1 continuation: conv src0 pointer verified VALID at the fault (2026-08-01)
+
+The crashing conv's src0 sits inside a live HIP buffer:
+  src0 data=0x7dc17308be80 buf=ROCm0 base=0x7dc173000000 size=26628608
+  (offset 573056, region 286720 bytes, max access well inside the buffer).
+The launch geometry, strides and state-store row (sidx[0]=1) are all valid and
+identical to the non-faulting earlier layers of the same graph. So the device
+SIGSEGV at ssm-conv.cu:197 is neither a stale per-GPU pointer nor a stride bug
+with these arguments. The remaining possibilities: (a) the faulting access is
+on a *different* execution of the same kernel (the gdb stops at the first
+wavefront to trap; the traced args are from the same call sequence), or
+(b) an access beyond the GPU aperture from a vectorized read at the region
+edge. Next: capture the exact faulting address from the wavefront trap state
+(rocgdb "info waves" / wave status) on the crashing call.

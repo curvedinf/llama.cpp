@@ -60,6 +60,7 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    bool get_prefix_cache_enabled() const override;
 
     // state write/load
 
@@ -103,6 +104,14 @@ public:
 
     // first zero-ed state
     int32_t rs_z = -1;
+
+    // rows zeroed before the op for fresh sequences (K == 1 path): one entry per batch
+    // position, -1 when the position carries its state. The GDN/conv kernels write back
+    // in place to the rows they read, so each fresh sequence gets its own zeroed row
+    // and idle sequences' state rows are never overwritten.
+    std::vector<int32_t> fresh_rows;
+
+    const std::vector<int32_t> & get_fresh_rows() const { return fresh_rows; }
 
     // TODO: optimize for recurrent state needs
     struct mem_cell {
@@ -188,6 +197,9 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // rows zeroed before the op for fresh sequences (K == 1 path), per batch position
+    const std::vector<int32_t> & get_fresh_rows() const;
+
     // true when every running sequence's state row is stable (src0 == own index), so the
     //   fused op can write the new state back to the row it read from (in place) instead
     //   of staging it in the op output and copying it back with ggml_cpy
@@ -195,6 +207,7 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    uint32_t      get_n_r_layers() const;
 
     int32_t s_copy(int i) const;
 

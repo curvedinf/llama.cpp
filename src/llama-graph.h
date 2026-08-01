@@ -272,11 +272,18 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // rows to zero before the op for fresh sequences (K == 1 path):
+    // I32 [n_seqs], -1 when the position carries its state
+    ggml_tensor * rows_zero;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // fresh-row set at build time (K == 1 zeroing views are baked); must match for reuse
+    std::vector<int32_t> fresh_rows;
 
     // llama_memory_recurrent_context::get_direct() at build time
     bool direct = false;
@@ -1282,13 +1289,16 @@ struct llm_graph_context {
 
     // split variants of build_rs for consumers that read the state store in place
     // (indexed GDN) instead of through a gathered copy:
-    // - build_rs_store_zero clears the scratch state row, must run before the store is read
+    // - build_rs_store_zero clears the fresh state rows (K == 1, per-sequence row
+    //   ownership) or the shared zero row (K > 1), must run before the store is read
     // - build_rs_store_extra stages the extra states (n_seqs .. n_rs), must run after the
     //   store is read since read rows can alias the copy destinations
     void build_rs_store_zero(
             llm_graph_input_rs * inp,
             ggml_tensor * s,
-                int32_t   state_size) const;
+                int32_t   state_size,
+                int32_t   n_seqs,
+                bool      keep) const;
 
     void build_rs_store_extra(
             llm_graph_input_rs * inp,

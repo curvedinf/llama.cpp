@@ -163,7 +163,7 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                         const float * __restrict__ bias, float * __restrict__ src2,
-                                        const int32_t * __restrict__ sidx, const int src0_nb1, const int src0_nb2,
+                                        const int32_t * __restrict__ sidx, const int fresh_mask, const int src0_nb1, const int src0_nb2,
                                         const int src1_nb1, const int src2_nb1, float * __restrict__ dst,
                                         const int dst_nb1, const int dst_nb2, const int64_t n_t) {
     const int tid  = threadIdx.x;
@@ -173,6 +173,7 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
     const int r = bidy * split_d_inner + tid;
 
     const int32_t row = sidx[bidx];
+    const bool fresh = (fresh_mask >> bidx) & 1;
     float * s_row = (float *) ((char *) src2 + (int64_t) row * src2_nb1);
 
     const float * x_row = (const float *) ((const char *) src0 + (int64_t) bidx * src0_nb2 + r * src0_nb1); // [n_t]
@@ -189,7 +190,7 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
     }
 #pragma unroll
     for (size_t j = 0; j < d_conv - 1; j++) {
-        x[j] = st[j];
+        x[j] = fresh ? 0.0f : st[j];
     }
     x[d_conv - 1] = x_row[0];
 
@@ -214,18 +215,27 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
             apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
     }
 
-    // write the new state (window columns [n_t, n_t + d_conv - 2] of [old state | new tokens]) back to the
-    // store row; reads are always at a higher column index than the writes done so far, so no staging is needed
+    // write the new state back to the store row: the sliding window x[] holds
+    // the padded sequence [old state | new tokens] shifted so that x[j] is the
+    // element at column j + n_t - 1, hence the last d_conv-1 columns of the
+    // padded sequence - the new state - are x[1 .. d_conv-1]. (The previous
+    // x[n_t + c] / x_row[n_t + c - (d_conv-1)] indexing was only correct for
+    // n_t >= d_conv-1; for n_t = 2 it stored the newest token in the oldest
+    // slot, corrupting the conv state - the multi-seq divergence when a
+    // sequential reference is chunked at n_t=2 but the concurrent run is not.)
+    // Read the local x[] window (zeroed for fresh sequences by the fresh-skip)
+    // instead of the store st[] - for fresh sequences the store still holds the
+    // previous occupant's state and would leak it into the new sequence's conv
+    // state.
 #pragma unroll
     for (size_t c = 0; c < d_conv - 1; c++) {
-        const int64_t wcol = n_t + (int64_t) c;
-        st[c] = wcol < (int64_t) (d_conv - 1) ? st[wcol] : x_row[wcol - (d_conv - 1)];
+        st[c] = x[c + 1];
     }
 }
 
 template <bool apply_silu>
 static void ssm_conv_idx_f32_cuda(const float * src0, const float * src1, const float * bias, float * src2,
-                                  const int32_t * sidx, const int src0_nb1, const int src0_nb2, const int src1_nb1,
+                                  const int32_t * sidx, const int fresh_mask, const int src0_nb1, const int src0_nb2, const int src1_nb1,
                                   const int src2_nb1, float * dst, const int dst_nb1, const int dst_nb2,
                                   const int64_t nc, const int64_t nr, const int64_t n_t, const int64_t n_s,
                                   cudaStream_t stream) {
@@ -236,7 +246,7 @@ static void ssm_conv_idx_f32_cuda(const float * src0, const float * src1, const 
         constexpr int kNC = decltype(NC)::value;
         const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
         ssm_conv_idx_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
-            src0, src1, bias, src2, sidx, src0_nb1, src0_nb2, src1_nb1, src2_nb1, dst, dst_nb1, dst_nb2, n_t);
+            src0, src1, bias, src2, sidx, fresh_mask, src0_nb1, src0_nb2, src1_nb1, src2_nb1, dst, dst_nb1, dst_nb2, n_t);
     };
 
     switch (nc) {
@@ -295,12 +305,25 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         const int32_t * sidx_d = (const int32_t *) src3->data;
         float *         dst_d  = (float *)         out->data;
         cudaStream_t    stream = ctx.stream();
+        const int32_t   fresh_mask = ggml_get_op_params_i32(dst, 0);
+
+        if (getenv("LLAMA_CONV_TRACE") != nullptr) {
+            fprintf(stderr, "CONV_IDX: nr=%ld n_t=%ld n_s=%ld nc=%ld grid=(%ld,%ld) fresh=%x | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p | sidx[0]=%d\n",
+                (long) nr, (long) n_t, (long) n_s, (long) nc, (long) n_s, (long) ((nr + 127) / 128), fresh_mask,
+                src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
+                src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "none",
+                src0->buffer ? ggml_backend_buffer_get_base(src0->buffer) : nullptr,
+                src0->buffer ? ggml_backend_buffer_get_size(src0->buffer) : 0,
+                src2->name, (long) src2->ne[0], (long) src2->ne[1], (long) src2->ne[2], (long) src2->ne[3], src2->data,
+                ((const int32_t *) src3->data)[0]);
+        }
 
         if (fuse_silu) {
-            ssm_conv_idx_f32_cuda<true>(src0_d, src1_d, bias_d, src2_d, sidx_d, src0->nb[1], src0->nb[2], src1->nb[1],
+            ssm_conv_idx_f32_cuda<true>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
                                         src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
         } else {
-            ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, src0->nb[1], src0->nb[2], src1->nb[1],
+            ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
                                          src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
         }
         return;

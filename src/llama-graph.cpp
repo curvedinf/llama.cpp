@@ -348,6 +348,17 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+
+        // T1 diagnostic: dump per-step recurrent-state row mapping
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "RS_STEP: n_rs=%lld n_seqs=%lld head=%u rs_z=%d direct=%d s_copy=[",
+                (long long) n_rs, (long long) s_copy_main->ne[0], mctx->get_head(),
+                mctx->get_rs_z(), (int) mctx->get_direct());
+            for (int64_t i = 0; i < s_copy_main->ne[0]; ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+            }
+            fprintf(stderr, "]\n");
+        }
     }
 }
 
@@ -1019,6 +1030,48 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+
+        // T1 diagnostic: dump per-step recurrent-state row mapping
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "RS_STEP: n_rs=%lld n_seqs=%lld n_t=%u head=%u rs_z=%d direct=%d s_copy=[",
+                (long long) n_rs, (long long) inp_rs->s_copy_main->ne[0], ubatch != nullptr ? ubatch->n_seq_tokens : 0,
+                mctx->get_recr()->get_head(),
+                mctx->get_recr()->get_rs_z(), (int) mctx->get_recr()->get_direct());
+            for (int64_t i = 0; i < inp_rs->s_copy_main->ne[0]; ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+            }
+            fprintf(stderr, "] fresh=[");
+            const auto & fr = mctx->get_recr()->get_fresh_rows();
+            for (size_t i = 0; i < fr.size(); ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", fr[i]);
+            }
+            fprintf(stderr, "]");
+            // tag the batch's seq ids (first token per seq) to map positions to prompts
+            if (ubatch != nullptr && ubatch->n_seqs > 0) {
+                fprintf(stderr, " seqids=[");
+                for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
+                    fprintf(stderr, "%s%d", s ? "," : "", ubatch->seq_id[s*ubatch->n_seq_tokens][0]);
+                }
+                fprintf(stderr, "]");
+            }
+            // probe the actual store content of ALL rows (ssm + conv state, layer 0)
+            if (inp_rs->s_copy_main->ne[0] > 0) {
+                ggml_tensor * s0 = mctx->get_recr()->get_s_l(0);
+                ggml_tensor * r0 = mctx->get_recr()->get_r_l(0);
+                for (int64_t ri = 0; ri < inp_rs->s_copy_main->ne[0]; ++ri) {
+                    const int32_t prow = data[ri];
+                    if (prow < 0) continue;
+                    float vr[2] = {0,0};
+                    // skip the probe under tensor split: reading a tiny slice of a
+                    // sharded tensor trips the meta readback chunk-size assert
+                    if (r0 && ggml_backend_dev_type(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(r0->buffer))) != GGML_BACKEND_DEVICE_TYPE_META) {
+                        ggml_backend_tensor_get(r0, vr, (size_t) prow * ggml_row_size(r0->type, r0->ne[0]), 2*sizeof(float));
+                    }
+                    fprintf(stderr, " r%d[%.4g,%.4g]", prow, (double)vr[0], (double)vr[1]);
+                }
+            }
+            fprintf(stderr, "\n");
+        }
     }
 }
 
@@ -1042,6 +1095,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+    res &= inp_rs->fresh_rows == mctx->get_recr()->get_fresh_rows();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
@@ -1097,6 +1151,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+    res &= inp_rs->fresh_rows == mctx->get_recr()->get_fresh_rows();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
@@ -1197,6 +1252,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
     res &= inp_rs->direct == mctx->get_recr()->get_direct();
+    res &= inp_rs->fresh_rows == mctx->get_recr()->get_fresh_rows();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
@@ -1299,6 +1355,9 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "SET_INPUTS: n_inputs=%zu\n", inputs.size());
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }
@@ -2501,48 +2560,75 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
 
         if (block_table && block_table->ne[1] > 1) {
-            // paged attention with multiple sequences in the ubatch: the unified K/V pool
-            // is shared by all sequences and ggml cannot alias it into one view per
-            // sequence (its view-size assert counts the aliased dim), so each sequence
-            // gets its own FA node over the full pool with its own block table column
-            // and mask slice. the results are concatenated along the sequence axis
+            // paged attention with multiple sequences in the ubatch (vLLM-style): one FA
+            // node for the whole batch. the ubatch tokens are seq-major, so Q is viewed as
+            // [D, n_tps, n_head, n_seq] (a strided view, no copy); the unified K/V pool is
+            // shared by all sequences and seq-broadcast (k/v have ne[3] == 1 with nb[3] ==
+            // 0 - the kernel resolves each sequence's rows through the block table); the
+            // mask keeps one slice per sequence in dim 3. a single kernel launch then
+            // covers all (head, sequence) pairs (grid.z = n_head*n_seq), avoiding one
+            // launch per sequence plus the concat.
             const int64_t n_seq = block_table->ne[1];
             const int64_t n_tps = q->ne[1]/n_seq;
 
             GGML_ASSERT(q->ne[1]%n_seq == 0);
             GGML_ASSERT(kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_seq);
 
-            ggml_tensor * cur_seq = nullptr;
+            if (n_tps == 1) {
+                // the batched kernel writes the output seq-major in the token dim, which
+                // matches the per-sequence concat layout only for n_tps == 1 (decode) -
+                // n_tps > 1 keeps the per-sequence nodes below
+                q = ggml_view_4d(ctx0, q,
+                        q->ne[0], n_tps, q->ne[2], n_seq,
+                        q->nb[1], q->nb[2], q->nb[1]*n_tps,
+                        0);
 
-            for (int64_t g = 0; g < n_seq; ++g) {
-                ggml_tensor * q_g = ggml_view_4d(ctx0, q,
-                        q->ne[0], n_tps, q->ne[2], 1,
-                        q->nb[1], q->nb[2], q->nb[3],
-                        (size_t) g*n_tps*q->nb[1]);
+                cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale,
+                                          hparams.f_max_alibi_bias,
+                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
-                ggml_tensor * mask_g = ggml_view_4d(ctx0, kq_mask,
-                        kq_mask->ne[0], n_tps, 1, 1,
-                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3],
-                        (size_t) g*kq_mask->nb[3]);
+                ggml_flash_attn_ext_add_sinks      (cur, sinks);
+                ggml_flash_attn_ext_set_prec       (cur, GGML_PREC_F32);
+                ggml_flash_attn_ext_set_block_table(cur, block_table);
+            } else {
+                // the unified K/V pool is shared by all sequences and ggml cannot alias it
+                // into one view per sequence (its view-size assert counts the aliased dim),
+                // so each sequence gets its own FA node over the full pool with its own
+                // block table column and mask slice. the results are concatenated along
+                // the sequence axis
+                ggml_tensor * cur_seq = nullptr;
 
-                ggml_tensor * bt_g = ggml_view_2d(ctx0, block_table,
-                        block_table->ne[0], 1,
-                        block_table->nb[1],
-                        (size_t) g*block_table->ne[0]*sizeof(int32_t));
+                for (int64_t g = 0; g < n_seq; ++g) {
+                    ggml_tensor * q_g = ggml_view_4d(ctx0, q,
+                            q->ne[0], n_tps, q->ne[2], 1,
+                            q->nb[1], q->nb[2], q->nb[3],
+                            (size_t) g*n_tps*q->nb[1]);
 
-                ggml_tensor * cur_g = ggml_flash_attn_ext(ctx0, q_g, k, v, mask_g, kq_scale,
-                                                          hparams.f_max_alibi_bias,
-                                                          hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-                res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_g, il});
+                    ggml_tensor * mask_g = ggml_view_4d(ctx0, kq_mask,
+                            kq_mask->ne[0], n_tps, 1, 1,
+                            kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3],
+                            (size_t) g*kq_mask->nb[3]);
 
-                ggml_flash_attn_ext_add_sinks      (cur_g, sinks);
-                ggml_flash_attn_ext_set_prec       (cur_g, GGML_PREC_F32);
-                ggml_flash_attn_ext_set_block_table(cur_g, bt_g);
+                    ggml_tensor * bt_g = ggml_view_2d(ctx0, block_table,
+                            block_table->ne[0], 1,
+                            block_table->nb[1],
+                            (size_t) g*block_table->ne[0]*sizeof(int32_t));
 
-                cur_seq = cur_seq == nullptr ? cur_g : ggml_concat(ctx0, cur_seq, cur_g, 3);
+                    ggml_tensor * cur_g = ggml_flash_attn_ext(ctx0, q_g, k, v, mask_g, kq_scale,
+                                                              hparams.f_max_alibi_bias,
+                                                              hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                    res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur_g, il});
+
+                    ggml_flash_attn_ext_add_sinks      (cur_g, sinks);
+                    ggml_flash_attn_ext_set_prec       (cur_g, GGML_PREC_F32);
+                    ggml_flash_attn_ext_set_block_table(cur_g, bt_g);
+
+                    cur_seq = cur_seq == nullptr ? cur_g : ggml_concat(ctx0, cur_seq, cur_g, 3);
+                }
+
+                cur = cur_seq;
             }
-
-            cur = cur_seq;
         } else {
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
@@ -3289,6 +3375,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
     inp->direct = mctx_cur->get_direct();
+    inp->fresh_rows = mctx_cur->get_fresh_rows();
 
     return inp;
 }
@@ -3317,15 +3404,43 @@ ggml_tensor * llm_graph_context::build_rs(
 void llm_graph_context::build_rs_store_zero(
         llm_graph_input_rs * inp,
         ggml_tensor * s,
-            int32_t   state_size) const {
-    const int32_t rs_zero = inp->mctx->get_rs_z();
-
+            int32_t   state_size,
+            int32_t   n_seqs,
+            bool      keep) const {
+    GGML_UNUSED(n_seqs);
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
 
-    // Clear a single state which will then be copied to the other cleared states.
-    // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    if (keep) {
+        // K > 1 (speculative rollback): zero the shared zero row rs_z.
+        const int32_t rs_zero = inp->mctx->get_rs_z();
+
+        // Clear a single state which will then be copied to the other cleared states.
+        // Note that this is a no-op when the view is zero-sized.
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+        return;
+    }
+
+    // K == 1: zero the per-sequence fresh rows. The views are baked at graph build
+    // time; can_reuse forces a rebuild whenever the fresh-row set changes (same
+    // mechanism the rs_z path used). No-op when a view is zero-sized.
+    // EXPERIMENT (T1): the GDN/conv kernels skip the state read for fresh sequences
+    // (fresh_mask), and the write-back overwrites the row fully - the zeroing is
+    // redundant and its baked views are a stale-state risk on graph reuse.
+    const auto & fresh = inp->mctx->get_fresh_rows();
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "RS_ZERO: n_fresh=%zu rows=[", fresh.size());
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", fresh[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
+    for (int32_t row : fresh) {
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(row >= 0), row*states->nb[1]*(row >= 0));
+        if (getenv("LLAMA_RS_ZERO_DISABLE") == nullptr) {
+            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+        }
+    }
 }
 
 void llm_graph_context::build_rs_store_extra(

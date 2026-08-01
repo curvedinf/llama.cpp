@@ -481,6 +481,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "KV_SEQRM: seq=%d p0=%lld p1=%lld caller=%p\n", seq_id, (long long) p0, (long long) p1,
+            (void *) __builtin_return_address(0));
+    }
+
     if (seq_id >= 0) {
         // registered blocks are retained by the pinned cells - only the token chain is affected
         chains[seq_id].truncate(p0);
@@ -1754,6 +1759,20 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     assert(res.s1 >= res.s0);
 
+    if (getenv("LLAMA_KV_FIND_TRACE") != nullptr) {
+        fprintf(stderr, "FIND_SLOT: n_seqs=%u n_tokens=%u cont=%d |", ubatch.n_seqs_unq, ubatch.n_tokens, (int) cont);
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const auto seq_id = ubatch.seq_id_unq[s];
+            const auto stream_id = seq_to_stream[seq_id];
+            fprintf(stderr, " seq%d(strm%d,head%d)[", (int) seq_id, (int) stream_id, (int) v_heads[stream_id]);
+            for (size_t i = 0; i < res.idxs[s].size() && i < 8; ++i) {
+                fprintf(stderr, "%s%u", i ? "," : "", res.idxs[s][i]);
+            }
+            fprintf(stderr, "]");
+        }
+        fprintf(stderr, "\n");
+    }
+
     return res;
 }
 
@@ -1854,6 +1873,10 @@ bool llama_kv_cache::get_can_shift() const {
         return false;
     }
     return true;
+}
+
+bool llama_kv_cache::get_prefix_cache_enabled() const {
+    return prefix_enabled;
 }
 
 uint32_t llama_kv_cache::get_size() const {
@@ -2060,10 +2083,11 @@ ggml_tensor * llama_kv_cache::get_k_paged(ggml_context * ctx, int32_t il, uint32
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     // the full physical pool (a single slice) - the kernel resolves the actual rows for
-    // each sequence through the block table (src[5]). note: the pool cannot be aliased
-    // into one view per sequence (nb[3] = 0) - ggml's view-size assert counts the
-    // broadcast dim against the source size, so multi-sequence ubatches use one FA node
-    // per sequence instead (see build_attn_mha)
+    // each sequence through the block table (src[5]). the pool is seq-broadcast:
+    // ne[3] == 1 with nb[3] == 0 (ggml cannot alias it into one view per sequence - its
+    // view-size assert counts the aliased dim against the source size), so multi-sequence
+    // ubatches use a single batched FA node whose kernel derives the sequence from
+    // blockIdx.z (see build_attn_mha)
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), kv_size, 1,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
@@ -2290,6 +2314,15 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
+    }
+
+    // KV diagnostic: dump the token-to-cell mapping for single-token (decode) ubatches
+    if (getenv("LLAMA_RS_DEBUG") != nullptr && sinfo.size() == 1) {
+        fprintf(stderr, "KV_IDXS: size=%u n_stream=%u idxs=[", sinfo.size(), sinfo.n_stream());
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            fprintf(stderr, "%s%lld", s ? "," : "", (long long) (sinfo.idxs[s][0] + sinfo.strm[s]*get_size()));
+        }
+        fprintf(stderr, "]\n");
     }
 }
 
@@ -2545,6 +2578,25 @@ skip:
             }
         }
     }
+
+    // KV diagnostic: dump the attended cell range for single-token (decode) ubatches
+    if (getenv("LLAMA_RS_DEBUG") != nullptr && n_tps == 1) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const uint32_t i = s*n_tps;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const int64_t off = n_kv*i;
+            int32_t n_keep = 0;
+            int32_t p_max = -1;
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (data[off + j] == mask_keep) {
+                    n_keep++;
+                    p_max = (int32_t) j;
+                }
+            }
+            fprintf(stderr, "KV_MASK: seq=%d n_kv=%lld n_keep=%d p_max=%d pos=%lld\n",
+                seq_id, (long long) n_kv, n_keep, p_max, (long long) ubatch->pos[i]);
+        }
+    }
 }
 
 template<typename T, bool causal, bool swa, bool is_2d>
@@ -2751,6 +2803,18 @@ void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+uint32_t llama_kv_cache::get_n_kv_layers() const {
+    return (uint32_t) layers.size();
+}
+
+const ggml_tensor * llama_kv_cache::get_k_l(int32_t il) const {
+    return layers[il].k;
+}
+
+const ggml_tensor * llama_kv_cache::get_v_l(int32_t il) const {
+    return layers[il].v;
 }
 
 void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
@@ -3639,4 +3703,16 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+const llama_kv_cache_context::slot_info_vec_t & llama_kv_cache_context::get_slot_infos() const {
+    return sinfos;
+}
+
+size_t llama_kv_cache_context::get_i_cur() const {
+    return i_cur;
+}
+
+const llama_kv_cache * llama_kv_cache_context::get_kv_cache() const {
+    return kv;
 }

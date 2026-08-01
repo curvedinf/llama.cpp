@@ -2469,7 +2469,8 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c,
             struct ggml_tensor  * store,
-            struct ggml_tensor  * s_idxs);
+            struct ggml_tensor  * s_idxs,
+            int32_t               fresh_mask);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
@@ -2621,7 +2622,8 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * s_idxs,
             int64_t               K,
-            bool                  state_ip);
+            bool                  state_ip,
+            int32_t               fresh_mask);
 
     // DSA lightning indexer
     //

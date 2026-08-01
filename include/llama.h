@@ -781,6 +781,11 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Check if the block-hash prefix cache is active (with recurrent-state snapshots
+    // for hybrid models). When false, cached-prompt reuse (n_past > 0) is unsafe for
+    // recurrent models: their state lives at the generation end, not the prefix end.
+    LLAMA_API bool llama_memory_prefix_cache_enabled(llama_memory_t mem);
+
     //
     // Block-hash prefix cache
     //

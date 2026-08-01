@@ -2499,6 +2499,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 
+        if (getenv("LLAMA_GRAPH_CHECK_TRACE") != nullptr && ((uintptr_t) node < 0x10000 || ((uintptr_t) node & 1) != 0)) {
+            fprintf(stderr, "GRAPH_CHECK_BAD: node[%d]=%p\n", i, (void *) node);
+        }
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
         }

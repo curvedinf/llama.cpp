@@ -728,6 +728,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // can only process batches with an equal number of new tokens in each sequence
     GGML_ASSERT(ubatch.equal_seqs());
 
+    // Multi-seq fix: a cell that becomes empty (seq_rm, seq_keep, seq_cp, or swap
+    // leftovers) can carry a stale src pointing at a row holding a previous
+    // occupant's state. If a fresh sequence later takes that cell, it would read
+    // the stale row as its initial state instead of the zero row, corrupting its
+    // first decode token(s). Reset src for every empty cell here so the fresh/carried
+    // decision below (src < 0) is authoritative. Empty cells are referenced by no
+    // active sequence, so their src is meaningless by definition.
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].seq_id.empty()) {
+            cells[i].src = -1;
+        }
+    }
+
     int32_t min = size - 1;
     int32_t max = 0;
 
@@ -763,7 +776,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
-#ifndef NDEBUG
+#if 1 // NDEBUG-removed for multi-seq corruption diagnosis
     {
         std::vector<int32_t> tails_verif;
         tails_verif.assign(size, -1);
@@ -833,29 +846,78 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         if (max < seq_meta.tail) { max = seq_meta.tail; }
     }
 
-    // gather and re-order
+    // gather and re-order (two-phase, order-independent)
+    // The old swap-chain compaction lost a sequence's metadata under certain batch
+    // orderings (e.g. reversed tail order): a later swap could overwrite an earlier
+    // swap's destination before its meta was consumed, dropping one row mapping and
+    // duplicating another, corrupting the state rows of the sequences involved.
+    // Phase 1 extracts every batch sequence's metadata from its current cell; phase 2
+    // evacuates any remaining (idle) content out of the destination range, then
+    // places the batch metadata at the compacted cells.
+    // Note: placing in batch order and moving the destination's "old content" into
+    // the vacated source cell is unsafe - a later seq's source cell can be an
+    // earlier seq's destination, and the move would destroy the metadata already
+    // placed there (dropping that sequence's state-row mapping: the concurrent
+    // multi-seq corruption). The state rows live in the store, not the cells, so
+    // idle content can be evacuated to any free cell outside the compacted range.
+    struct rs_meta { int32_t pos; int32_t src; int32_t src_cell; };
+    std::vector<rs_meta> metas(n_seqs);
+
+    // phase 1: extract
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
-        const int32_t dst_id = s + min;
-        const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
-        if (dst_id != src_id) {
-            auto & dst_cell = cells[dst_id];
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const int32_t src_id = cells[seq_id].tail;
+        if (src_id >= 0) {
             auto & src_cell = cells[src_id];
+            metas[s] = {src_cell.pos, src_cell.src, src_id};
+            src_cell.seq_id.erase(seq_id);
+            if (src_cell.seq_id.empty()) {
+                src_cell.pos = -1;
+                src_cell.src = -1;
+            }
+        } else {
+            metas[s] = {-1, -1, -1};
+        }
+    }
 
-            std::swap(dst_cell.pos, src_cell.pos);
-            std::swap(dst_cell.src, src_cell.src);
-            std::swap(dst_cell.seq_id, src_cell.seq_id);
+    // phase 2: evacuate idle content out of the destination range, then place
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t i = s*n_seq_tokens;
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const int32_t dst_id = s + min;
+        auto & dst_cell = cells[dst_id];
 
-            // swap tails
-            for (uint32_t j = 0; j < size; ++j) {
-                int32_t & tail = cells[j].tail;
-                if (tail == src_id) {
-                    tail = dst_id;
-                } else if (tail == dst_id) {
-                    tail = src_id;
+        if (!dst_cell.seq_id.empty()) {
+            // phase 1 emptied every batch seq's source cell, so any content left
+            // here belongs to idle sequences - move it to a free cell outside
+            // [min, min + n_seqs) before the placement overwrites it
+            int32_t free_id = -1;
+            for (uint32_t t = 0; t < size; ++t) {
+                if (t >= (uint32_t) min && t < (uint32_t) min + n_seqs) {
+                    continue;
+                }
+                if (cells[t].is_empty()) {
+                    free_id = t;
+                    break;
+                }
+            }
+            if (free_id >= 0) {
+                auto & free_cell = cells[free_id];
+                free_cell.pos = dst_cell.pos;
+                free_cell.src = dst_cell.src;
+                free_cell.seq_id = std::move(dst_cell.seq_id);
+                for (llama_seq_id q : free_cell.seq_id) {
+                    if (q >= 0 && (uint32_t) q < size) {
+                        cells[q].tail = free_id;
+                    }
                 }
             }
         }
+
+        dst_cell.pos  = metas[s].pos;
+        dst_cell.src  = metas[s].src;
+        cells[seq_id].tail = dst_id;
     }
 
     // update the pos of the used seqs
@@ -880,35 +942,96 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
     }
 
-    // Find first cell without src refs, to use as the zero-ed state
-    {
-        // TODO: bake-in src refcounts in the cell metadata
-        std::vector<int32_t> refcounts(size, 0);
-        for (size_t i = 0; i < size; ++i) {
-            const int32_t src = cells[i].src;
-            if (src >= 0) {
-                refcounts[src] += 1;
+        // Find first cell without src refs, to use as the zero-ed state
+        {
+            // TODO: bake-in src refcounts in the cell metadata
+            std::vector<int32_t> refcounts(size, 0);
+            for (size_t i = 0; i < size; ++i) {
+                const int32_t src = cells[i].src;
+                if (src >= 0) {
+                    refcounts[src] += 1;
+                }
             }
-        }
 
-        rs_z = -1;
-        for (int i = min; i <= max; ++i) {
-            if (refcounts[i] == 0) {
-                rs_z = i;
-                break;
-            }
-        }
+            // Multi-seq fix: after the gather/re-order compaction, the batch's sequences
+            // occupy exactly [min, min + n_seqs). The pre-compaction `max` can extend past
+            // that range and the cells there may hold OTHER sequences' metadata (other
+            // sub-batch splits of the same decode step, or sequences outside this ubatch).
+            // The old [min, max] loops clobbered those cells' src/src0, corrupting the
+            // state-row mapping of sequences not in this batch. Operate on the compacted
+            // range only.
+            const int32_t max_batch = min + (int32_t) n_seqs - 1;
 
-        for (int i = min; i <= max; ++i) {
-            if (cells[i].src < 0) {
-                GGML_ASSERT(rs_z >= 0);
-                cells[i].src0 = rs_z;
+            if (n_rs_seq == 0) {
+                // K == 1: per-sequence row ownership. The GDN/conv kernels write new
+                // states back in place to the rows they read (state_ip), so:
+                //   - carried cells keep reading their own state rows (refcount >= 1)
+                //   - fresh cells get DISTINCT free rows (refcount == 0: not read by any
+                //     carried or idle sequence), zeroed by build_rs_store_zero before the op
+                // This replaces the old design where new states were written to batch
+                // position rows: an idle sequence's state row could be reassigned and
+                // overwritten by another batch, and when the idle sequence returned it
+                // read a foreign state (the concurrent multi-seq corruption).
+                std::vector<int32_t> free_rows;
+                for (int i = 0; i < (int32_t) size; ++i) {
+                    if (refcounts[i] == 0) {
+                        free_rows.push_back(i);
+                    }
+                }
+                size_t fi = 0;
+                fresh_rows.assign(n_seqs, -1);
+                for (int i = min; i <= max_batch; ++i) {
+                    if (cells[i].src < 0) {
+                        GGML_ASSERT(fi < free_rows.size());
+                        cells[i].src0 = free_rows[fi++];
+                        fresh_rows[i - min] = cells[i].src0;
+                    } else {
+                        // Stage the source ids for all used cells to allow correct seq_* behavior
+                        // and still make these values available when setting the inputs
+                        cells[i].src0 = cells[i].src;
+                    }
+                    // With in-place write-back the state lives at the row the seq READ
+                    // (src0), not at the cell index - keep src pointing at that row so
+                    // the next batch reads the right state even after compaction moves
+                    // the metadata to a different cell.
+                    cells[i].src = cells[i].src0;
+                }
+                rs_z = min; // unused by the K == 1 path
             } else {
-                // Stage the source ids for all used cells to allow correct seq_* behavior
-                // and still make these values available when setting the inputs
-                cells[i].src0 = cells[i].src;
+                // K > 1 (speculative rollback): keep the shared zero row for fresh cells.
+                rs_z = -1;
+                for (int i = min; i <= max_batch; ++i) {
+                    if (refcounts[i] == 0) {
+                        rs_z = i;
+                        break;
+                    }
+                }
+                if (rs_z < 0) {
+                    rs_z = min;
+                }
+                fresh_rows.clear();
+                for (int i = min; i <= max_batch; ++i) {
+                    if (cells[i].src < 0) {
+                        GGML_ASSERT(rs_z >= 0);
+                        cells[i].src0 = rs_z;
+                    } else {
+                        cells[i].src0 = cells[i].src;
+                    }
+                    cells[i].src = i;
+                }
             }
-            cells[i].src = i; // avoid moving or clearing twice
+
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "RS_CELLS: min=%d max=%d head=%d n=%u rs_z=%d n_seqs=%u |", min, max, head, n, rs_z, n_seqs);
+            fprintf(stderr, " seqs=[");
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                fprintf(stderr, "%s%d", s ? "," : "", ubatch.seq_id[s*n_seq_tokens][0]);
+            }
+            fprintf(stderr, "]");
+            for (int i = 0; i < (int32_t) size; ++i) {
+                fprintf(stderr, " c%d{pos=%d,src=%d,src0=%d,ns=%zu}", i, cells[i].pos, cells[i].src, cells[i].src0, cells[i].seq_id.size());
+            }
+            fprintf(stderr, "\n");
         }
     }
 
@@ -926,6 +1049,10 @@ bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
 }
+bool llama_memory_recurrent::get_prefix_cache_enabled() const {
+    return false;
+}
+
 
 size_t llama_memory_recurrent::total_size() const {
     size_t size = 0;
@@ -1456,6 +1583,11 @@ int32_t llama_memory_recurrent_context::get_rs_z() const {
     return is_full ? 0 : mem->rs_z;
 }
 
+const std::vector<int32_t> & llama_memory_recurrent_context::get_fresh_rows() const {
+    static const std::vector<int32_t> empty;
+    return is_full ? empty : mem->fresh_rows;
+}
+
 bool llama_memory_recurrent_context::get_direct() const {
     // in-place state write-back is only valid when every sequence in the batch reads
     // and writes the same state row (steady state, no empty states, no shared rows)
@@ -1478,6 +1610,10 @@ uint32_t llama_memory_recurrent_context::get_size() const {
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_r_layers() const {
+    return (uint32_t) mem->r_l.size();
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {

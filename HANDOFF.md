@@ -155,3 +155,84 @@ Respecified after evaluating the 31 commits pushed 2026-07-26 (17:09→19:49 UTC
 **Deprioritized by evidence:** chunked-prefill tuning under TP4 (compute-bound, no effect), FA vec kernel micro-opt (2% of step), AR block/stride sweeps (optimal found), graph-cache resizing (8 optimal).
 
 **Critical path:** T1 → T2/T3 → T5 → T6 → T8/T9 → T10 → T11/T12. P4/P5 parallel-safe anytime.
+
+
+# Verification of Agent Wave-2 Claims — 2026-07-27
+
+**Method:** GitHub API was rate-limited and git/https intermittently blocked, so verification used the full branch tarball (codeload) diffed against a fresh upstream-master tarball, cross-referenced with the pre-wave-2 diff stats recorded in the previous verification. New OPTIMIZATION_LOG sections (lines 1699–1988) read in full.
+
+## What is TRUE this time
+
+- **Real code exists.** Wave-2 source deltas vs the pre-wave-2 state: `llama-model.cpp` (+17/−17: flat single-segment layout for r_cache/s_cache), `delta-net-base.cpp` (+28/−24: prefill via `ssm_conv_idx` instead of get_rows+reshape+concat), `ggml-backend-meta.cpp` (+12: split_state_cache clear on rebuild), `ggml-cuda.cu` (+13/−45), `server-context.cpp` (~−5: DEBUG_TIMINGS). Consistent with the claimed "7 files, +84/−71." **The "all functional code" claim — false in wave 1 — is true in wave 2.**
+- **The root-cause diagnosis is genuinely good.** They pinned the residual tensor-split corruption to `handle_reshape` producing inconsistent per-device shapes for the `state_predelta` reshape_4d across graph rebuilds, with concrete GDN_IDX evidence: correct `{128,128,24,1}` vs wrong `{786432,0,1,1}` (stale full tensor), `{393216,1,1,1}` (flat), `{0,1,1,1}` (zero). This matches and refines your HANDOFF analysis. The flat-segment + `ssm_conv_idx` changes are real, sensible fixes that **eliminated the crash** under tensor split. Keep them.
+- **T17 Poisson sweep actually ran** (rates 1/2/4/8 with a table) — done properly this time.
+- **T5 instrumentation exists** (DEBUG_TIMINGS, per-phase table) — see caveats below.
+
+## What is FALSE or misleading
+
+### 1. "T1 RESOLVED" — it was bypassed, not fixed, and the price is the whole program
+The log's own sequence: real fixes → crash gone under tensor split → **corruption remained** ("TP2: correct on request 1, '!!!' garbage on request 2+"; "split_state_cache clear didn't fix it") → "RESOLVED: switched to `-sm layer`" (run_tp4_bench.sh now `-sm layer -ts 1,1,1,1`, comment: "layer split keeps tensors whole"). `handle_reshape` is untouched. The keystone bug is documented, not fixed.
+
+The cost, in the agent's own numbers vs your own prior measurements:
+
+| Metric | Your tensor-split (engine) | Agent's layer-split | vLLM ref | Verdict |
+|---|---|---|---|---|
+| Decode C=8 agg | 149.3 tok/s (npl8) | **82 tok/s** | ~150 | **1.8× regression vs your own path** |
+| Prefill | 1204 tok/s (ub2048) | **384 tok/s** | ~1500 | **3.1× regression** |
+| vs vLLM | ~96% (npl12) | 55% decode / 26% prefill | — | gap widened on every axis |
+
+Layer split also orphans the entire TP program: no allreduce (your ring-AR work is dead code in this config), KV per-GPU unshared (the agent's own T13 entry admits this "reduces the benefit of paging"), and your earlier direct measurement said it plainly: "Layer split... worse than tensor split. Tensor split confirmed optimal." "10/10 correct" is also still a small sequential sample — the Phase 0.2 formal divergence gate remains unbuilt.
+
+### 2. The C=8 corruption self-contradiction — unresolved
+- T1 section: "**TP4 layer split C=8: 0/8 corrupted**"
+- T3 section (same wave, same date): "**concurrent C=8 has high corruption rate (6-7/8)** — separate issue from burst stability"
+
+One of these is false. Sequential tests pass; the concurrent figure says 6-7 of 8 outputs are garbage. If the T3 note reflects current state, **the branch cannot serve concurrent load in any configuration** and "T1 RESOLVED" is false even under layer split. This must be resolved before anything else is believed.
+
+### 3. T2/T3/T4 — true only inside the retreated architecture
+- T2: prefix cache "works" under layer split because D4 (nr>1 gather) is a tensor-split problem that layer split never encounters. The task's TP4 acceptance criterion is unmet where it matters.
+- T3: bursts 71/69/76 stable — consistent with layer-split C=8 (~82), but this is ~half of your tensor-split server's c8 decode aggregate (110).
+- T4: MTP3 no-crash under layer split, 5 sequential correct — plausible, but no draft-acceptance number reported (last wave's 23% was the corruption tell; its absence is conspicuous).
+
+### 4. T5 — better, but a 2.5× hole is hand-waved
+Their own math: (89.5+25.8)/(8×3) ≈ 4.8 ms/tok → ~208 tok/s theoretical; measured 82. The 2.5× discrepancy is attributed to "HTTP/streaming overhead not captured by timers" with zero evidence. Also presented as "much improved" over the 47 ms figure without noting the config changed to a strictly slower parallelism mode.
+
+### 5. T7 — "adequate" with no measurement ("would need profiling"). Corner cut, again.
+### 6. T10–T12 entry is incoherent post-retreat — it discusses AR being "24% of GPU time" and "at hw limit" in a config where **there is no allreduce at all**, and still says "would need RCCL" without noticing RCCL is wired in CMake.
+
+## Bottom line
+
+| Area | Verdict |
+|---|---|
+| Code reality (7 files, +84/−71) | **TRUE** |
+| handle_reshape root-cause diagnosis | **TRUE and valuable** |
+| Crash elimination (tensor split) | **TRUE** |
+| "T1 RESOLVED" | **FALSE** — bypassed via layer split; 1.8× decode / 3.1× prefill regression vs your own TP path; AR/paging programs orphaned |
+| C=8 correctness | **CONTRADICTED BY ITS OWN LOG (0/8 vs 6-7/8)** |
+| T2–T4 | Scoped-valid under layer split only; TP acceptance criteria unmet |
+| T5 | Improved, but 2.5× theory/measurement gap unexplained |
+| T7, T10–T12 | Not performed / incoherent |
+
+## Recommendations
+1. **Do not accept `-sm layer` as the serving config.** Keep it as the golden-reference generator for the divergence gate (its sequential output is correct — that's valuable).
+2. **Fix the actual bug using their own diagnosis.** Their pre-retreat candidate #2 — bypass `handle_reshape` for the `state_predelta` reshape via `view_4d` (views propagate src split state) — or forced shape validation in `init_tensor_impl` for RESHAPE ops. They had the root cause and two concrete fix paths, tried one (cache clear), and stopped.
+3. **Immediately resolve the C=8 contradiction**: run the concurrent 8-slot correctness gate under layer split. If 6-7/8 is current, the keystone is open in every config and all serving numbers are void.
+4. Keep: flat segments, ssm_conv_idx prefill path, per-layer copy, split_state_cache clear, Poisson harness, DEBUG_TIMINGS (add GPU/host attribution + close the 208-vs-82 hole).
+
+## Verification Fixes Applied and GPU-Validated — 2026-07-27
+
+All four recommendations implemented, compiled, and run on 4xMI100. See
+OPTIMIZATION_LOG.md "Wave-2 Verification Fixes" for full details.
+
+| Recommendation | Status | Result |
+|---------------|--------|--------|
+| R1: Revert to -sm tensor | **DONE** | run_tp4_bench.sh uses -sm tensor, prefix cache disabled. run_golden_reference.sh for layer-split ref. |
+| R2: Fix handle_reshape | **ATTEMPTED, BUG STILL OPEN** | Per-device ne propagation broke downstream assertions (post-processing recomputes ne). Reverted. init_tensor_impl validation kept. handle_reshape bug confirmed unfixed: tensor-split crashes on 3rd sequential request. |
+| R3: Concurrent correctness gate | **DONE, RAN** | 12/12 concurrent prompts diverge from layer-split reference (100% corruption). Tensor-split crashes on 3rd sequential request. Gate is at /tmp/opencode/concurrent_correctness_gate.py. |
+| R4: DEBUG_TIMINGS | **DONE, RAN** | 208-vs-82 gap explained: t_decode_host=597ms (92% of decode), t_decode_gpu=53ms. HTTP overhead is 0.004ms (negligible). Host-side graph dispatch dominates, not HTTP. |
+
+Key finding: prefix cache must be disabled for BOTH layer and tensor split.
+The snapshot path (llama_rs_row_block_copy -> get_tensor_async) crashes on
+meta-backend buffers (D4). All gate runs use LLAMA_PREFIX_CACHE_DISABLE=1.
+
+The handle_reshape keystone bug remains the blocker for -sm tensor serving.

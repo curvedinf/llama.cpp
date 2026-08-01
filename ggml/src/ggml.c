@@ -1803,6 +1803,9 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     GGML_ASSERT(GGML_TENSOR_SIZE <= SIZE_MAX - obj_alloc_size);
 
     struct ggml_object * const obj_new = ggml_new_object(ctx, GGML_OBJECT_TYPE_TENSOR, GGML_TENSOR_SIZE + obj_alloc_size);
+    if (obj_new == NULL) {
+        fprintf(stderr, "GGML_OOM: ctx=%p mem_size=%zu want=%zu\n", (void *) ctx, ctx->mem_size, GGML_TENSOR_SIZE + obj_alloc_size);
+    }
     GGML_ASSERT(obj_new);
 
     struct ggml_tensor * const result = (struct ggml_tensor *)((char *)ctx->mem_buffer + obj_new->offs);
@@ -5413,8 +5416,10 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
-    GGML_ASSERT(q->ne[3] == k->ne[3]);
-    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    // K/V may be seq-broadcast (ne[3] == 1 with nb[3] == 0) for paged attention: the
+    // kernel resolves each sequence's rows through the block table (src[5])
+    GGML_ASSERT(q->ne[3] == k->ne[3] || k->ne[3] == 1);
+    GGML_ASSERT(q->ne[3] == v->ne[3] || v->ne[3] == 1);
 
     if (mask) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
@@ -5601,7 +5606,8 @@ struct ggml_tensor * ggml_ssm_conv_idx(
         struct ggml_tensor  * sx,
         struct ggml_tensor  * c,
         struct ggml_tensor  * store,
-        struct ggml_tensor  * s_idxs) {
+        struct ggml_tensor  * s_idxs,
+        int32_t               fresh_mask) {
     GGML_ASSERT(ggml_is_3d(sx));
     GGML_ASSERT(ggml_is_matrix(c));
     GGML_ASSERT(ggml_is_matrix(store));
@@ -5619,6 +5625,7 @@ struct ggml_tensor * ggml_ssm_conv_idx(
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
 
+    ggml_set_op_params_i32(result, 0, fresh_mask);
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
     result->src[1] = c;
@@ -6370,7 +6377,8 @@ struct ggml_tensor * ggml_gated_delta_net_idx(
         struct ggml_tensor  * state,
         struct ggml_tensor  * s_idxs,
         int64_t               K,
-        bool                  state_ip) {
+        bool                  state_ip,
+        int32_t               fresh_mask) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6411,6 +6419,7 @@ struct ggml_tensor * ggml_gated_delta_net_idx(
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
     ggml_set_op_params_i32(result, 1, (int32_t) state_ip);
+    ggml_set_op_params_i32(result, 2, fresh_mask);
 
     result->op     = GGML_OP_GATED_DELTA_NET_IDX;
     result->src[0] = q;

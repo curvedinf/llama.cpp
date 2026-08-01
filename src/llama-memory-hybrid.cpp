@@ -142,6 +142,10 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::get_prefix_cache_enabled() const {
+    return mem_attn->get_prefix_cache_enabled();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     pendings.clear();
 

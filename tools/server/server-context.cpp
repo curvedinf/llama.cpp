@@ -2812,6 +2812,12 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+    int64_t t_sampl_spec  = 0; // speculative sampling (verify + accept)
+    int64_t n_sampl_spec  = 0;
+    int64_t t_http        = 0; // HTTP streaming + response formatting
+    int64_t n_http        = 0;
+    int64_t t_decode_host = 0; // decode host-side launch overhead (before GPU sync)
+    int64_t n_decode_host = 0;
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -2844,6 +2850,11 @@ private:
             SRV_INF("avg t_decode      = %f ms\n", (double) t_decode / n_decode / 1000.0);
             SRV_INF("avg t_post_decode = %f ms\n", (double) t_post_decode / n_post_decode / 1000.0);
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
+            // t_sampl and t_http are subsets of t_post_decode (nested scoped_timers)
+            SRV_INF("avg t_sampl_spec  = %f ms\n", (double) t_sampl_spec / (n_sampl_spec ? n_sampl_spec : 1) / 1000.0);
+            SRV_INF("avg t_http        = %f ms\n", (double) t_http / (n_http ? n_http : 1) / 1000.0);
+            SRV_INF("avg t_decode_host = %f ms\n", (double) t_decode_host / (n_decode_host ? n_decode_host : 1) / 1000.0);
+            SRV_INF("avg t_decode_gpu  = %f ms\n", (double) (t_decode - t_decode_host) / (n_decode ? n_decode : 1) / 1000.0);
         }
 #endif
 
@@ -2910,8 +2921,12 @@ private:
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
+                int64_t t_host_start = ggml_time_us();
                 batch_view = batch.get_view(off, n_tokens);
                 bool ok = decode(n_batch, off, batch_view);
+                int64_t t_host_end = ggml_time_us();
+                t_decode_host += t_host_end - t_host_start;
+                n_decode_host++;
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -2933,6 +2948,8 @@ private:
             }
 
             try {
+                // t_sampl and t_http are subsets of t_post_decode (nested timers);
+                // this is a known artifact, not double-counting in the aggregate
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
@@ -3301,6 +3318,26 @@ private:
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // Recurrent models keep their state at the generation end, not at the
+                                // prompt end. Reusing cached prompt tokens (n_past > 0) requires the
+                                // prefix cache's recurrent-state snapshots to roll the state back to the
+                                // prefix end; without them the new request would continue from a stale
+                                // state (repeated/echo output). Force a full re-evaluation in that case.
+                                if (model_tgt != nullptr && llama_model_is_hybrid(model_tgt) &&
+                                        !llama_memory_prefix_cache_enabled(llama_get_memory(ctx_tgt))) {
+                                    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                                        fprintf(stderr, "RS_NPAST: hybrid + no prefix cache: n_past %d -> 0\n", n_past);
+                                    }
+                                    // The recurrent state cannot be partially rewound without the prefix
+                                    // cache's snapshots (seq_rm refuses the rollback), so the state would
+                                    // carry over into the re-evaluation and double-process the prompt.
+                                    // Drop the cached content entirely - the re-evaluation rebuilds it.
+                                    if (n_past > 0) {
+                                        slot.prompt_clear();
+                                    }
+                                    n_past = 0;
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot, "only caching to alora invocation start (n_past = %d, alora_invocation_start = %d)\n", n_past, slot.alora_invocation_start);
@@ -3557,6 +3594,11 @@ private:
 
                     // truncate any tokens that are beyond n_past for this slot
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
+
+                    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                        fprintf(stderr, "SRV_SEQRM: slot=%d prompt_len=%zu pos_next=%lld\n",
+                            slot.id, slot.prompt.tokens.size(), (long long) p0);
+                    }
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
@@ -3991,14 +4033,19 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                metrics.on_prediction(slot);
-                slot.release();
+            // R4: t_http/t_sampl/t_sampl_spec are subsets of t_post_decode
+            // (which wraps the whole post_decode call). Known nesting artifact.
+            {
+                scoped_timer t_http_timer(t_http, n_http);
+                if (!process_token(result, slot)) {
+                    // release slot because of stop condition
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
 
-                return;
+                    return;
+                }
             }
 
             slot.print_timings_tg();
@@ -4017,6 +4064,7 @@ private:
 
             // verify and try to accept the draft
             {
+                scoped_timer t_spec(t_sampl_spec, n_sampl_spec);
                 // save the sampler sampler state in case we need to restore it
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
@@ -4114,13 +4162,16 @@ private:
 
                 slot.n_decoded += 1;
 
-                if (!process_token(result, slot)) {
-                    slot.print_timings();
-                    send_final_response(slot);
-                    metrics.on_prediction(slot);
-                    slot.release();
+                {
+                    scoped_timer t_http_timer(t_http, n_http);
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
 
-                    return;
+                        return;
+                    }
                 }
             }
 

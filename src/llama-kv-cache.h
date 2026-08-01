@@ -131,6 +131,7 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool get_prefix_cache_enabled() const override;
 
     void clear(bool data) override;
 
@@ -229,9 +230,9 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
-    // paged mode: views of the full physical K/V pool (single slice) - multi-sequence
-    // ubatches are handled with one FA node per sequence (see build_attn_mha), each with
-    // its own block table column, since the kernel gathers rows via the table anyway
+    // paged mode: views of the full physical K/V pool (single slice, seq-broadcast
+    // ne[3] == 1 / nb[3] == 0) - multi-sequence ubatches use a single batched FA node
+    // (see build_attn_mha); the kernel gathers rows via the block table anyway
     ggml_tensor * get_k_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const;
     ggml_tensor * get_v_paged(ggml_context * ctx, int32_t il, uint32_t n_seq) const;
 
@@ -288,6 +289,11 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // diagnostic accessors for the K/V cache tensors
+    uint32_t              get_n_kv_layers() const;
+    const ggml_tensor *   get_k_l(int32_t il) const;
+    const ggml_tensor *   get_v_l(int32_t il) const;
 
 private:
     const llama_model & model;
@@ -512,6 +518,11 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // diagnostic accessors for the current ubatch's K/V cell assignment
+    const slot_info_vec_t & get_slot_infos() const;
+    size_t                  get_i_cur() const;
+    const llama_kv_cache *  get_kv_cache() const;
 
 private:
     llama_memory_status status;

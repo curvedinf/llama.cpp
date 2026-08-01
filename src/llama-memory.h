@@ -100,6 +100,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // whether the block-hash prefix cache (with recurrent-state snapshots for hybrid
+    // models) is active; when false, cached-prompt reuse is unsafe for recurrent models
+    virtual bool get_prefix_cache_enabled() const { return false; }
+
     //
     // ops
     //

@@ -23,10 +23,15 @@ PREFILL_CHUNK="${PREFILL_CHUNK:-1024}"
 SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 
 export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
-# Prefix cache: re-enabled with -sm layer (tensor split's meta-backend had
-# split state bugs in handle_reshape; layer split keeps tensors whole).
-export LLAMA_PREFIX_CACHE_DISABLE=0
+# Prefix cache: disabled under tensor split. D4 (nr>1 snapshot readback in
+# get/set_tensor_async) only handles nr==1; enabling prefix cache under tensor
+# split triggers snapshot paths that crash. Re-enable after D4 is fixed.
+export LLAMA_PREFIX_CACHE_DISABLE=1
 
+# Primary serving config: tensor split (-sm tensor) is the TP4 topology that
+# parallelizes each prompt's prefill across all 4 MI100s. Layer split
+# (-sm layer) is available via run_golden_reference.sh for correctness
+# verification (keeps tensors whole, produces correct sequential output).
 mkdir -p "${LOG_DIR}"
 
 COMMON_ARGS=(
@@ -42,7 +47,7 @@ COMMON_ARGS=(
   -fa on -ctk "${CACHE_TYPE}" -ctv "${CACHE_TYPE}"
   --no-warmup
   --metrics
-  -sm layer -ts 1,1,1,1
+  -sm tensor -ts 1,1,1,1
   --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 )
 
@@ -69,6 +74,7 @@ case "${1:-start}" in
     setsid env \
       LLAMA_GDN_STATE_F16="${GDN_F16}" \
       LLAMA_KV_PAGED="${KV_PAGED}" \
+      LLAMA_PREFIX_CACHE_DISABLE="${LLAMA_PREFIX_CACHE_DISABLE}" \
       LLAMA_UX_DYNAMIC_BUDGET="${UX_DYNAMIC_BUDGET}" \
       LLAMA_PREFILL_CHUNK="${PREFILL_CHUNK}" \
       LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \

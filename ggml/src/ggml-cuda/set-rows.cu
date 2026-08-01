@@ -377,8 +377,34 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (!(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16))) {
+        fprintf(stderr, "SETROWS_BAD: dst=%s type=%d ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p vsrc=%p voffs=%zu | src0=%s type=%d ne={%ld,%ld,%ld,%ld} data=%p | src1=%s type=%d ne={%ld,%ld,%ld,%ld}\n",
+            dst->name, (int) dst->type,
+            (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], dst->data, (void *) dst->view_src, dst->view_offs,
+            src0->name, (int) src0->type,
+            (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+            src1->name, (int) src1->type,
+            (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3]);
+    }
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (getenv("LLAMA_SETROWS_TRACE") != nullptr) {
+        fprintf(stderr, "SETROWS: dst=%s ne={%ld,%ld,%ld,%ld} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p idxs=[",
+            dst->name,
+            (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data,
+            src0->name,
+            (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+            src1->name,
+            (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data);
+        const int32_t * idx_p = (const int32_t *) src1->data;
+        int64_t n_print = std::min(src1->ne[0], (int64_t) 32);
+        for (int64_t i = 0; i < n_print; ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", idx_p[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
 
     if (src0->type == GGML_TYPE_F32) {
         if (src1->type == GGML_TYPE_I64) {

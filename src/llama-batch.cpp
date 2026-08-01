@@ -675,6 +675,11 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         idxs.insert(idxs.end(), idxs_per_seq[s].begin(), idxs_per_seq[s].end());
     }
 
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "SPLIT: n_ubatch=%u n_seqs=%u n_seq_tokens=%zu batch_n_tokens=%u\n",
+            n_ubatch, n_seqs, idxs_per_seq[0].size(), batch.n_tokens);
+    }
+
     return ubatch_add(idxs, n_seqs, true);
 }
 

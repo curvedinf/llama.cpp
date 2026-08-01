@@ -2772,3 +2772,29 @@ remaining suspect is a cross-uid dangling reference NOT visible to the audit
 LATER rebuild of the same uid resets - the audit compares bcj.nodes, not the
 node->src links). Next slice: extend the audit to the node->src links, and/or
 rocgdb with HIP_LAUNCH_BLOCKING catching the faulting kernel's SGPRs.
+
+## Scoped src/view_src resolution: cross-uid dangling src links fixed (2026-08-02)
+
+The STALE_SRC audit caught the remaining recycled-metadata class: cached
+subgraph nodes' src links pointed into ANOTHER graph's uid container (the
+graph-cache recycles tensor addresses; the global per-GPU-copy lookup returned
+the colliding graph's copies), and the src dangled when that graph rebuilt.
+Fixes (all in ggml-backend-meta.cpp):
+- init_tensor_impl: src and view_src resolution is now scoped own-container
+  first, then static, then CREATE the copy in the own container - never leave
+  the original graph tensor as the src (its data is the 0x2000000000000000
+  placeholder / the un-split full tensor).
+- pre-init src-loop: create the src copies in the graph's own uid container
+  whenever missing there (the old cross-uid in_compute skip was the collision
+  source).
+- preinit_tensor: only static + own uid container count for needs_init.
+- LLAMA_STALE_AUDIT reworked: validates cached src data pointers vs their
+  buffers (placeholder-data srcs are now impossible; the audit shows 0).
+
+Result: all dispatch-time audits (node ptr, src ptr, extent, stale) are CLEAN
+on the 4-GPU config, but the C8 burst still crashes (run-varying IMA / host
+segfault / wedged-device hipGetDevice abort at the first burst). The last
+GETROWS trace shows the crash follows a valid 2-seq state gather (cache_r_l12-14,
+idxs=[5,6]) - the fault is in the following GDN/conv kernels of the tail
+chunk. Next slice: rocgdb + HIP_LAUNCH_BLOCKING catching the faulting kernel's
+SGPRs (the previous catch was pre-fix; the fault location may have moved).

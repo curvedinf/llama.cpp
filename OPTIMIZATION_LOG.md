@@ -2798,3 +2798,18 @@ GETROWS trace shows the crash follows a valid 2-seq state gather (cache_r_l12-14
 idxs=[5,6]) - the fault is in the following GDN/conv kernels of the tail
 chunk. Next slice: rocgdb + HIP_LAUNCH_BLOCKING catching the faulting kernel's
 SGPRs (the previous catch was pre-fix; the fault location may have moved).
+
+## rocgdb catch: faulting kernel = k_set_rows_quant (KV write) (2026-08-02)
+
+Attached rocgdb as the server's parent (ptrace_scope=1 blocks attach-to-
+running): the first concurrent burst faults in
+`k_set_rows_quant<long, block_q8_0, 32>` (the q8_0 KV write) - the wave traps
+in the quantize (fmaxf, the src0 scale path). The SETROWS trace at the fault
+shows VALID args: src0 = the per-GPU qkv slice [256, 2], dst = cache_v_l11
+[256, 16384], idxs = the canonical kv-unified [c,0,c+1,0,...] pattern
+(identical to the passing layer-split reference - the pattern is correct).
+So the kernel faults with in-bounds-looking geometry - the remaining suspects
+are a launch-param mismatch between the traced host view and the device
+execution, or the dst write crossing the cell stride. Next slice: correlate
+the exact launching set_rows (host trace + rocgdb in one run) and dump the
+kernel's SGPRs at the trap.

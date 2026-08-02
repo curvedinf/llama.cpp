@@ -3456,3 +3456,19 @@ slots), not cell 0. The allocation is in find_slot/alloc_find (llama-kv-cache.cp
 2nd-token allocation yields 0 (the alloc_find semantics for the speculative tokens
 or the batch construction assigning the draft tokens a sentinel cell) and allocate
 the real continuation cells.
+
+## Draft-stream allocation: the 2nd stream's cells are all 0 (2026-08-02)
+
+The kv-unified cache has 2 STREAMS (main + draft). The verify batch's SETROWS idxs
+decode as the 2-stream interleave: stream-0 (main) = [0,1,2,...] (real cells),
+stream-1 (draft) = [0,0,0,...] - the draft's stream allocates the SAME cell 0 for
+every token, which is also the main's position-0 cell. The draft's KV writes
+clobber the main's first-token KV. The allocation is in find_slot's per-seq loop
+(llama-kv-cache.cpp:1704+): the cont-branch walks from v_heads[stream]; the draft's
+stream head is 0 (or the loop's can_use/clear-retry collapses to cell 0), producing
+[0,0,0]. The fix: the draft's stream must allocate the real continuation cells
+(from the shared pool's actual head) - i.e. the draft's tokens' cells must be the
+main's next cells, not the recycled cell 0.
+
+Next: fix find_slot for the 2-stream case (the draft's stream head / allocation),
+then re-validate the 1-GPU MTP single (expect bit-exact vs golden) and the burst.

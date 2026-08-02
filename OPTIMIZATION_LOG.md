@@ -3224,3 +3224,21 @@ Next: audit the draft context's forward - the draft KV cells (all 0 in the unifi
 idxs), the draft's recurrent-state store rows (ctx_dft has its own hybrid state with
 the same n_rs_seq=2 rollback), and the g_embd pairing (pending_h / verify_h stashes).
 The kv-unified stream-B cell mapping for the draft's tokens is the prime suspect.
+
+## Draft KV-cell audit (2026-08-02)
+
+The kv-unified cell allocation (llama-kv-cache.cpp find_slot/alloc_find): the MTP
+verify batch carries 2 tokens/seq - the even positions get the real cells (158, 159,
+...), the odd positions (the speculative/draft-predicted tokens) get cell 0 (the
+allocator's first free cell) - the [c,0,c+1,0,...] idxs pattern. The verify's 2nd
+token's KV therefore lives in cell 0 with all other speculative tokens (they
+overwrite each other), so the verify's 2nd-token attention sees a degenerate 1-cell
+KV window. The verify's FIRST-token logits are ALSO wrong though (13=10.38 vs the
+plain decode's 11=20.47 for the same position) with the first token on a real cell -
+so the corruption is not just the 0-cell KV; the verify's 2-token GDN/FA compute path
+itself diverges from the 1-token decode path for the same first token.
+
+Next: instrument the verify graph's first-token path - compare the verify's GDN
+launch (nt=2) against the decode's (nt=1) on the same token position (state row,
+sidx, snapshot slots), and the verify's first-token FA mask (the causal mask for the
+2-token batch). The layer-split config keeps this simple (no meta).

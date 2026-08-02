@@ -2392,6 +2392,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         backend_ctx->n_subgraphs = n_subgraphs;
 
         if (max_tmp_size > backend_ctx->max_tmp_size) {
+            // the old tmp buffers can still be in flight (the previous graph's
+            // async compute reads them for its reduce steps) - synchronize every
+            // device before freeing, else the queued kernels read freed memory
+            // (the device IMA under concurrent MTP bursts)
+            for (size_t j = 0; j < n_backends; j++) {
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+            }
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
                 for (size_t i = 0; i < backend_ctx->n_reduce_steps; i++) {

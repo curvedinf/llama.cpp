@@ -3833,7 +3833,7 @@ private:
 
         const int ret = llama_decode(ctx_tgt, batch_view);
 
-        if (getenv("LLAMA_SYNC_DFT") != nullptr) {
+        if (getenv("LLAMA_SYNC_DFT") != nullptr || getenv("LLAMA_FULL_SYNC") != nullptr) {
             llama_synchronize(ctx_tgt);
         }
 

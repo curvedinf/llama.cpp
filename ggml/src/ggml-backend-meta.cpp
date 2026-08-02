@@ -729,6 +729,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return src_ss[0];
         }
+        // a permuted view can still preserve the source's split axis in one of its
+        // dims (e.g. the paged FA batched-Q view {D, n_tps, n_head, n_seq} keeps
+        // the token-major source's n_head dim with its stride): match on both ne
+        // and stride so the per-device slices follow the view's own strides
+        if (axis >= 0 && axis < GGML_MAX_DIMS) {
+            for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+                if (tensor->ne[dim] == tensor->src[0]->ne[axis] &&
+                    tensor->nb[dim] == tensor->src[0]->nb[axis]) {
+                    return {ggml_backend_meta_split_axis(dim), {0}, {1}, 1};
+                }
+            }
+        }
+        fprintf(stderr, "META_SPLIT_ABORT: tensor=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} op=%s\n",
+            tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3], ggml_op_name(tensor->op));
         GGML_ABORT("view of permuted tensor not implemented");
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
     };
@@ -2627,9 +2642,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         cached = cur;
                     }
                     for (int s = 0; s < GGML_MAX_SRC; s++) {
-                        ggml_tensor * expected = (orig->src[s] != nullptr && ggml_backend_buffer_is_meta(orig->src[s]->buffer))
-                            ? ggml_backend_meta_buffer_simple_tensor(orig->src[s], j)
-                            : nullptr;
+                        ggml_tensor * expected = nullptr;
+                        if (orig->src[s] != nullptr) {
+                            if (ggml_backend_buffer_is_meta(orig->src[s]->buffer)) {
+                                expected = ggml_backend_meta_buffer_simple_tensor(orig->src[s], j);
+                            } else {
+                                // src outside the meta buffer is shared as-is - a
+                                // nullptr here made the device op dereference a null
+                                // src0 (ggml_cuda_cpy SIGSEGV with paged attention,
+                                // which feeds non-meta srcs into meta CPY nodes)
+                                expected = orig->src[s];
+                            }
+                        }
                         if (cached->src[s] != expected) {
                             if (getenv("LLAMA_META_TRACE") != nullptr) {
                                 fprintf(stderr, "SRC_REPLACE: j=%zu i=%zu k2=%zu node=%s src%d cached=%p expected=%p\n",

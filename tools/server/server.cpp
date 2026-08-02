@@ -16,6 +16,15 @@
 #include <clocale>
 #include <exception>
 #include <signal.h>
+#include <execinfo.h>
+
+static void crash_handler(int sig) {
+    fprintf(stderr, "CRASH: signal %d (%s)\n", sig, strsignal(sig));
+    void * bt[32];
+    int n = backtrace(bt, 32);
+    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    _exit(1);
+}
 #include <thread> // for std::thread::hardware_concurrency
 
 #if defined(_WIN32)
@@ -87,6 +96,15 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    // crash diagnostics: silent death (no ggml abort output) under concurrent MTP
+    // is a bare SIGSEGV/SIGBUS/SIGILL - print a backtrace before exiting
+    if (getenv("LLAMA_CRASH_HANDLER") != nullptr) {
+        signal(SIGSEGV, crash_handler);
+        signal(SIGBUS,  crash_handler);
+        signal(SIGILL,  crash_handler);
+        signal(SIGABRT, crash_handler);
+    }
 
     // own arguments required by this example
     common_params params;

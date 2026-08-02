@@ -1929,11 +1929,10 @@ bool llama_kv_cache::paged_ubatch(const llama_ubatch & ubatch) const {
 
     const uint32_t n_tps = ubatch.n_tokens/n_seq;
 
-    // the paged FA kernel is used only for single-token-per-sequence ubatches (decode).
-    // the n_tps > 1 shapes (prefill chunks, multi-token MTP verify) take the legacy path:
-    // the HIP paged vec kernel with ncols = 2 intermittently hits an illegal memory
-    // access on gfx908 (see the crash logs of the bench validation)
-    if (n_tps != 1) {
+    // the paged FA kernel is used for single-token-per-sequence ubatches (decode)
+    // and the n_tps == 2 shapes (MTP verify batches). Larger n_tps shapes (prefill
+    // chunks) keep the legacy path.
+    if (n_tps > 2) {
         return false;
     }
 

@@ -1330,6 +1330,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             if (tensor->src[i] == tensor) {
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
+                // Resolve to the per-GPU copy. On a miss leave NULL (never the
+                // original full tensor: its data is the whole-meta-buffer region with
+                // full strides - the per-GPU kernels would read the wrong GPU's bytes
+                // and walk out of bounds, the root corruption behind the first-burst
+                // class). The dispatch-time src replacement fills NULL srcs with the
+                // correct copies before the compute.
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
             }
         }
@@ -2584,15 +2590,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     j, i, (void *) bcj.cgraphs[i].cgraph_main,
                     (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes);
             }
-            // src-link repair: a cached subgraph node's src can dangle into a
-            // reset container arena (the alloc-time/staging container is reset at
-            // every rebuild; the build-time resolution returned its objects). The
-            // dangling object reads as a zeroed ggml_tensor (type 0, zero ne, NULL
-            // buffer/data - invisible to the pointer audits which skip NULL data).
-            // Re-resolve such srcs through the original graph node's copy lookup
-            // so the kernel never launches with a NULL/garbage src pointer (the
-            // recurring set_rows host crash / device IMA under the first burst).
-            // Runs unconditionally (cheap; the broken case is rare).
+            // src-link repair: a cached subgraph node's srcs can be recycled
+            // container objects (the alloc-time/staging container is reset at every
+            // rebuild; the build-time resolution returned its objects). A recycled
+            // src reads as a zeroed/garbage ggml_tensor (the set_rows src0-type
+            // asserts, the "valid args, garbage execution" IMA, and the recurring
+            // runtime host crash at the launch). Repair by POINTER-COMPARING each
+            // cached src against the expected copy of the original graph node's src
+            // (and the node itself against its current copy) - never dereference the
+            // stale objects. Runs unconditionally (cheap; stale links are rare).
             {
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i].offset;
@@ -2606,17 +2612,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (cached == nullptr) {
                         continue;
                     }
-                    for (int s = 0; s < GGML_MAX_SRC; s++) {
-                        ggml_tensor * src = cached->src[s];
-                        if (src != nullptr && (src->buffer == nullptr || src->data == nullptr)) {
-                            if (getenv("LLAMA_META_TRACE") != nullptr) {
-                                fprintf(stderr, "SRC_REPAIR: j=%zu i=%zu k2=%zu node=%s src%d broken (type=%d ne={%ld,%ld,%ld,%ld} data=%p)\n",
-                                    j, i, k2, orig->name, s, (int) src->type,
-                                    (long) src->ne[0], (long) src->ne[1], (long) src->ne[2], (long) src->ne[3], src->data);
+                    ggml_tensor * cur = ggml_backend_meta_buffer_simple_tensor(orig, j);
+                    if (cached != cur) {
+                        for (int k = 0; k < cgraph_ij->n_nodes; k++) {
+                            if (cgraph_ij->nodes[k] == cached) {
+                                cgraph_ij->nodes[k] = cur;
                             }
-                            cached->src[s] = orig->src[s] != nullptr
-                                ? ggml_backend_meta_buffer_simple_tensor(orig->src[s], j)
-                                : nullptr;
+                        }
+                        if (getenv("LLAMA_META_TRACE") != nullptr) {
+                            fprintf(stderr, "NODE_REPLACE: j=%zu i=%zu k2=%zu node=%s cached=%p cur=%p\n",
+                                j, i, k2, orig->name, (void *) cached, (void *) cur);
+                        }
+                        bcj.nodes[k2] = cur;
+                        cached = cur;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        ggml_tensor * expected = (orig->src[s] != nullptr && ggml_backend_buffer_is_meta(orig->src[s]->buffer))
+                            ? ggml_backend_meta_buffer_simple_tensor(orig->src[s], j)
+                            : nullptr;
+                        if (cached->src[s] != expected) {
+                            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                fprintf(stderr, "SRC_REPLACE: j=%zu i=%zu k2=%zu node=%s src%d cached=%p expected=%p\n",
+                                    j, i, k2, orig->name, s, (void *) cached->src[s], (void *) expected);
+                            }
+                            cached->src[s] = expected;
                         }
                     }
                 }

@@ -3115,3 +3115,21 @@ init_tensor_impl (resolve only static + the graph's own uid container, creating 
 copy there when missing - the scoping's create path must be reworked to not corrupt
 the first compute, see the earlier regression entry). Then re-validate single +
 burst + perf.
+
+## NULL-src resolution fix (never the original full tensor) (2026-08-02)
+
+init_tensor_impl's src resolution: on a lookup miss the per-GPU copy's src now stays
+NULL instead of the original graph tensor (whose data is the whole-meta-buffer region
+with full strides - the per-GPU kernels read the wrong GPU's bytes and walk OOB).
+The dispatch-time src replacement fills NULL srcs before the compute. Validation:
+single request still produces garbage (500), the burst still crashes (1,416 SRC_REPLACEs
+this run vs 6,884 on the ASAN-pass run) - the repair+NULL-src reduce the stale-src
+class but the corruption persists run-varying. The ASAN's single 8/8 pass remains the
+only clean run.
+
+Note for the next slice: the single-request GARBAGE (no crash) is the cleanest
+debuggable manifestation - the first graph's outputs are wrong even with the repairs
+in place. Attack it directly: LLAMA_LOGIT_DUMP (the sampler debug already in the tree)
+for the first step's top logits, and compare the first graph's per-GPU copies against
+the dense reference (run_golden_reference.sh exists for layer-split correctness
+verification) to find which tensors diverge.

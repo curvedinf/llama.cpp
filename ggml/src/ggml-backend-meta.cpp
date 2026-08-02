@@ -1297,26 +1297,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         t_ij->view_src = tensor->view_src;
         t_ij->view_offs = tensor->view_offs;
         if (t_ij->view_src != nullptr && ggml_backend_buffer_is_meta(t_ij->view_src->buffer)) {
-            // scoped like the src resolution: own container first, then static,
-            // create on demand - never fall back to the original (placeholder data)
-            ggml_backend_meta_buffer_context * vsbuf_ctx = (ggml_backend_meta_buffer_context *) t_ij->view_src->buffer->context;
-            const ggml_meta_tensor_key vsrc_key = ggml_meta_tensor_key_of(tensor->view_src);
-            ggml_tensor * vsrc_ij = nullptr;
-            auto it_vsrc = stc.simple_tensors.find(vsrc_key);
-            if (it_vsrc != stc.simple_tensors.end()) {
-                vsrc_ij = it_vsrc->second[j];
-            } else if (vsbuf_ctx->stc_static.simple_tensors.count(vsrc_key) != 0) {
-                vsrc_ij = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
-            } else {
-                ggml_backend_meta_buffer_init_tensor_impl(stc, t_ij->view_src);
-                it_vsrc = stc.simple_tensors.find(vsrc_key);
-                if (it_vsrc != stc.simple_tensors.end()) {
-                    vsrc_ij = it_vsrc->second[j];
-                }
-            }
-            if (vsrc_ij != nullptr) {
-                t_ij->view_src = vsrc_ij;
-            }
+            t_ij->view_src = ggml_backend_meta_buffer_simple_tensor(tensor->view_src, j);
             if (t_ij->view_offs > 0 && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
                 GGML_ASSERT(tensor->ne[split_dim] != 0);
                 const int split_dim_view_src = ggml_backend_meta_get_split_state(tensor->view_src, /*assume_sync =*/ true).axis;
@@ -1349,32 +1330,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             if (tensor->src[i] == tensor) {
                 t_ij->src[i] = t_ij;
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
-                // Resolve the src within THIS container first: the global lookup
-                // (static -> any uid container -> staging) can return another graph's
-                // per-GPU copies when the graph cache recycles tensor addresses, and
-                // the cached node's src link then dangles when that graph rebuilds
-                // (observed as garbage src types at set-rows and IMA under C>=6).
-                // If the copy does not exist in this container or static yet, create
-                // it here - never fall back to the original tensor, whose data is a
-                // placeholder (0x2000000000000000) and faults when read.
-                ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) t_ij->src[i]->buffer->context;
-                const ggml_meta_tensor_key src_key = ggml_meta_tensor_key_of(t_ij->src[i]);
-                ggml_tensor * src_ij = nullptr;
-                auto it_src = stc.simple_tensors.find(src_key);
-                if (it_src != stc.simple_tensors.end()) {
-                    src_ij = it_src->second[j];
-                } else if (sbuf_ctx->stc_static.simple_tensors.count(src_key) != 0) {
-                    src_ij = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
-                } else {
-                    ggml_backend_meta_buffer_init_tensor_impl(stc, t_ij->src[i]);
-                    it_src = stc.simple_tensors.find(src_key);
-                    if (it_src != stc.simple_tensors.end()) {
-                        src_ij = it_src->second[j];
-                    }
-                }
-                if (src_ij != nullptr) {
-                    t_ij->src[i] = src_ij;
-                }
+                t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
             }
         }
 
@@ -2166,13 +2122,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             bool needs_init = false;
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) t->buffer->context;
             const ggml_meta_tensor_key t_key = ggml_meta_tensor_key_of(t);
-            // Only the static container and THIS graph's own uid container count:
-            // a key found in another graph's container is a recycled-address
-            // collision, and reusing that graph's copies makes the subgraph dangle
-            // when it rebuilds.
-            if (!buf_ctx->stc_static.simple_tensors.count(t_key) &&
-                    !buf_ctx->stc_compute[cgraph->uid].simple_tensors.count(t_key)) {
-                needs_init = true;
+            if (!buf_ctx->stc_static.simple_tensors.count(t_key)) {
+                bool in_compute = false;
+                for (auto & kv : buf_ctx->stc_compute) {
+                    if (kv.second.simple_tensors.count(t_key) != 0) {
+                        in_compute = true;
+                        if (getenv("LLAMA_META_TRACE") != nullptr && kv.first != cgraph->uid &&
+                                (strstr(t->name, "leaf_61") != nullptr || strstr(t->name, "leaf_63") != nullptr)) {
+                            fprintf(stderr, "CROSS_UID_SHARE: %s p=%p this_uid=%llu other_uid=%llu\n", t->name,
+                                (void *) t, (unsigned long long) cgraph->uid, (unsigned long long) kv.first);
+                        }
+                        break;
+                    }
+                }
+                needs_init = !in_compute;
             }
             if (needs_init) {
                 if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(t->name, "leaf_61") != nullptr || strstr(t->name, "leaf_63") != nullptr)) {
@@ -2188,15 +2151,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (t->src[s] && ggml_backend_buffer_is_meta(t->src[s]->buffer)) {
                         ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) t->src[s]->buffer->context;
                         const ggml_meta_tensor_key src_key = ggml_meta_tensor_key_of(t->src[s]);
-                        // Create the src copies in THIS graph's uid container whenever
-                        // they are missing there. The previous check skipped when the
-                        // key existed in ANY uid container (a graph-cache recycled
-                        // address colliding with another graph's entry), which made
-                        // the node's src resolution fall back to that graph's copies
-                        // and dangle when it rebuilt (STALE_SRC under C>=6).
-                        if (!sbuf_ctx->stc_static.simple_tensors.count(src_key) &&
-                                !sbuf_ctx->stc_compute[cgraph->uid].simple_tensors.count(src_key)) {
-                            ggml_backend_meta_buffer_init_tensor_impl(sbuf_ctx->stc_compute[cgraph->uid], t->src[s]);
+                        if (!sbuf_ctx->stc_static.simple_tensors.count(src_key)) {
+                            bool src_in_compute = false;
+                            for (auto & kv : sbuf_ctx->stc_compute) {
+                                if (kv.second.simple_tensors.count(src_key) != 0) {
+                                    src_in_compute = true;
+                                    break;
+                                }
+                            }
+                            if (!src_in_compute) {
+                                ggml_backend_meta_buffer_init_tensor_impl(sbuf_ctx->stc_compute[cgraph->uid], t->src[s]);
+                            }
                         }
                     }
                 }
@@ -2642,22 +2607,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 cached ? (int) cached->type : -1,
                                 cached ? (long) cached->ne[0] : 0, cached ? (long) cached->ne[1] : 0,
                                 cached ? (long) cached->ne[2] : 0, cached ? (long) cached->ne[3] : 0);
-                        }
-                        if (cached != nullptr) {
-                            for (int s2 = 0; s2 < GGML_MAX_SRC; s2++) {
-                                ggml_tensor * cached_src = cached->src[s2];
-                                if (cached_src == nullptr || cached_src->buffer == nullptr || cached_src->data == nullptr) {
-                                    continue;
-                                }
-                                const char * src_base = (const char *) ggml_backend_buffer_get_base(cached_src->buffer);
-                                const size_t src_size = ggml_backend_buffer_get_size(cached_src->buffer);
-                                if ((const char *) cached_src->data < src_base ||
-                                        (const char *) cached_src->data >= src_base + src_size) {
-                                    fprintf(stderr, "STALE_SRC: j=%zu i=%zu k=%zu node=%s src%d=%s data=%p OUTSIDE buf=%s base=%p size=%zu\n",
-                                        j, i, k2, orig->name, s2, cached_src->name, (void *) cached_src->data,
-                                        ggml_backend_buffer_name(cached_src->buffer), (void *) src_base, src_size);
-                                }
-                            }
                         }
                     }
                 }

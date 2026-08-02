@@ -3027,3 +3027,26 @@ src resolution, preinit needs_init, pre-init src-loop) - disable the create-on-d
 parts one at a time on the first-request repro; then fix the underlying copy-creation
 bug instead of reverting (the scoping's cross-uid fix may still be needed for other
 paths; test the burst on the pre-scoping build to see if the old class returns).
+
+## src-scoping regression confirmed + reverted; the burst class predates it (2026-08-02)
+
+Surgical results (single-request repro):
+- Variant A (scoping hunks 1-2 reverted, 3-4 kept): garbage.
+- Variant B (hunks 1-2 kept, 3-4 reverted): garbage.
+- Full scoping + src-buft-container creation fix: garbage (and the META_COPY trace
+  showed 0 OUTSIDE copies - all created copies have valid in-buffer data, so the
+  mixed-buft-base theory is wrong; the corruption is subtler than the copy address).
+- Full revert (7b8f30311^): single request CORRECT (validated twice).
+So ANY part of the scoping corrupts the first compute; the mechanism is not the copy
+data address (verified in-buffer) - likely the lookup-order/creation interplay
+changing WHICH per-GPU copies the subgraphs reference (staging vs own-container) with
+some content/geometry difference not captured by the address check.
+
+Burst on the pre-scoping build: STILL CRASHES (the old cross-uid class the scoping
+was written for persists there too). So both states crash the burst; only the single
+request differs. DECISION: revert the scoping (pre-scoping = strictly better baseline:
+single request correct, burst class isolated as the next target).
+
+Next: the burst class on the pre-scoping baseline - the rocgdb catch to see whether
+the trap is the same set_rows_quant (i.e. the class is NOT the scoping's cross-uid
+src-links but something the scoping only shifted), then hunt it from the clean base.

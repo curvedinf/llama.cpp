@@ -3168,3 +3168,21 @@ Next probes queued: the verify graph's recurrent-state rollback (snapshot row
 selection under the meta backend - the draft+verify both read the state store through
 the meta's per-GPU copies) via LLAMA_RS_DEBUG + GDN_PTRS on the 1-GPU MTP single;
 and the kv-unified stream-B cell mapping for the draft context.
+
+## MTP path: warmup state copies verified correct; RS_DEBUG readback crashes (2026-08-02)
+
+1-GPU MTP + LLAMA_GDN_PTRS: the per-GPU state copies are geometrically CORRECT on the
+first graph ({128,128,48,12} nb={2,256,32768,1572864} contiguous, H=48 full heads on
+1 GPU, 12 rows = 4 seqs x 3 slots). LLAMA_RS_DEBUG (post-compute synchronized state
+row hashing) crashes the server at the first request (SEGFAULT - the readback of the
+state stores hits the corrupted device state / or the debug's own interference). The
+MTP ubatch is 2 "seqs" with seqs=[0,0] (main + draft share seq_id 0) - the draft's
+KV cells in the kv-unified [c,0,c+1,0,...] idxs pattern are all 0 (a single rolling
+cell), so the draft's attention sees a degenerate 1-cell KV window.
+
+Remaining suspects for the MTP-path corruption: (a) the kv-unified stream-B cell
+mapping for the draft context, (b) the verify graph's recurrent-state rollback
+(snapshot row selection), (c) the draft's MTP-head forward. Next: read the kv-unified
+cell allocation for the draft stream and the verify's snapshot-row bookkeeping in the
+code (llama-kv-cache.cpp kv-unified + llama-memory-recurrent.cpp rollback), and/or
+run the 1-GPU MTP single with the SPEC_DRAFT... offload variations.

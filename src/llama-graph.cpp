@@ -3454,12 +3454,8 @@ void llm_graph_context::build_rs_store_zero(
     // EXPERIMENT (T1): the GDN/conv kernels skip the state read for fresh sequences
     // (fresh_mask), and the write-back overwrites the row fully - the zeroing is
     // redundant and its baked views are a stale-state risk on graph reuse.
-    // DISABLED by default: the baked fresh-row views are a stale-address risk under
-    // the meta backend's graph caching (the view data pointer is computed from the
-    // fresh-row set at build time; a reused graph zeroes rows it must not touch),
-    // and concurrent MTP bursts with paged attention crashed on it. The host-side
-    // zeroing in find_slot covers the current fresh rows. LLAMA_RS_ZERO_ENABLE
-    // restores the graph-based zeroing.
+    // NOTE: disabling it (LLAMA_RS_ZERO_DISABLE) regressed the concurrent MTP
+    // burst (1/3 clean vs 12/13 with it enabled) - keep it enabled by default.
     const auto & fresh = inp->mctx->get_fresh_rows();
     if (getenv("LLAMA_RS_DEBUG") != nullptr) {
         fprintf(stderr, "RS_ZERO: n_fresh=%zu rows=[", fresh.size());
@@ -3468,9 +3464,9 @@ void llm_graph_context::build_rs_store_zero(
         }
         fprintf(stderr, "]\n");
     }
-    if (getenv("LLAMA_RS_ZERO_ENABLE") != nullptr) {
-        for (int32_t row : fresh) {
-            ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(row >= 0), row*states->nb[1]*(row >= 0));
+    for (int32_t row : fresh) {
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(row >= 0), row*states->nb[1]*(row >= 0));
+        if (getenv("LLAMA_RS_ZERO_DISABLE") == nullptr) {
             ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
         }
     }

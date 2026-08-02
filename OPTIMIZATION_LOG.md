@@ -3662,3 +3662,33 @@ hijacked runs - the source of the "1945-865" garbage + draft-accounting anomalie
 capture-safe probes (CPY_POST/GETROWS_V D2H during CUDA-graph capture aborts were the
 root of ALL TP4 empty-reply crashes); post-launch probes CPY_AFTER/SCALE_AFTER/GR_AFTER
 proved the state write-backs land and the SCALE zeroing is a genuine no-op.
+
+## Concurrent MTP crash: arena-corruption class localized (2026-08-02, this session, cont.)
+
+After the row-collision fixes (8f538332d) the 1-GPU burst still crashes ~15%
+(no paged) / ~60% (paged on). Crash handler (LLAMA_CRASH_HANDLER) revealed:
+- SIGSEGV: ggml_cuda_cpy with src1=(nil) - the CPY node's src1 (self-reference)
+  was nulled by dispatch SRC_REPLACE because the ORIGINAL graph node was already
+  corrupted: SRC_NULL_ORIG dumps show garbage fields (ne={30720,1,1,1},
+  data=0x200000000003c000) - an out-of-bounds host write into the ggml_context
+  arena (node objects live there) corrupts node metadata.
+- The corrupted node's src1 (self-ref) reads as NULL -> SRC_REPLACE nulls the
+  cached src -> ggml_cuda_cpy SIGSEGV (or GGML_ASSERT ne mismatch when the kept
+  cached object is also corrupt - the abort variant).
+- SRC_KEEP (keep non-null cached src when expected is NULL) removes the SIGSEGV
+  but the abort variant remains (the kept object is corrupt too).
+
+Experiments:
+- LLAMA_RS_ZERO_DISABLE (graph fresh-row SCALE zeroing off): paged burst 3/3
+  clean once, but re-testing showed no reliable effect (2/5). Making it the
+  DEFAULT regressed the no-paged baseline (1/3 vs 12/13 enabled) - reverted
+  (aa3000f5f partially reverted by the follow-up commit).
+- The out-of-bounds write is NOT caught by ASAN (the ggml_context arena is a
+  big malloc block ASAN should cover - yet no report; suspect a non-malloc
+  region (HIP host mapping / mmap) or a write through a corrupted pointer).
+
+Next: localize the writer. Candidates ranked: (a) find_slot's host zeroing via
+the meta set_tensor scatter (offset math on per-device views), (b) a paged-view
+data-pointer overrun (batched-Q view / block-table view offsets), (c) the
+s_copy/k_idxs host leaves' write bounds. Experiment: disable the host zeroing
+(env gate) and re-run; then mprotect the arena region.

@@ -3382,3 +3382,23 @@ the verify batch's qkv/g/mask CONTENT against the decode's for the same position
 padded-write path (n_tps=2 should not, but the decode's n_tps=1-with-pad is
 guarded while the verify's exact-2 may expose the same write beyond the allocation
 in a different shape).
+
+## Verify P(t+1) corruption double-confirmed at both batch positions (2026-08-02)
+
+The verify's logits[1] = P(t+2|13) is the SAME condition as the next decode step of
+the accepted token 13, and they differ (verify 220=8.94 vs decode 417=10.00) - the
+2-token batch forward is corrupted for BOTH positions at their same conditions. The
+per-position ops (qkv projection, GDN first-iteration, FA first column, FFN) are all
+shape-identical to the 1-token path; the only 2-token-specific differences are the
+FA ncols=2 exact-columns, the GDN nt=2 state writes (slots {1,0} vs {0}), and the
+2-token KV write/mask. The GDN nt=2 writes the state row sidx+1 (slot 1) for the
+first token - the state rows of the NEXT graph's read are therefore affected if the
+slot mapping is off by one for nt=2 (the store has mem_size*(1+n_rs_seq) rows; the
+nt=2 write pattern {1,0} vs nt=1 {0} lands the final state in the same slot 0, but
+the intermediate slot-1 write may clobber the row the next graph reads as its
+current state).
+
+Next: dump the state rows before/after the verify (the LLAMA_RS_DEBUG hashes are the
+tool; they crashed once at startup - run them on the layer-split config where the
+startup crash did not occur) to compare the state-store rows across the verify vs
+the decode on the same position.

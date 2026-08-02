@@ -3208,3 +3208,19 @@ container lifetime) only ever produced one lucky ASAN pass. The MTP path to audi
 Debug on the layer-split config (simplest, no meta). Compare the verify's first-token
 logits against the plain decode's (which are correct) to bisect which input/op of the
 verify graph diverges.
+
+## MTP bisect: draft tokens are the trigger (2026-08-02)
+
+1-GPU tensor-split MTP with SPEC_DRAFT_N_MAX=0 (the MTP machinery active but zero
+draft tokens): output CORRECT ("Today, abacuses are"), logits in the correct family
+(561=16.36, 11=21.08, 567=15.88, 92016=20.16, 565=20.24 - matching the golden
+pattern). Any n_max>=1 (1 or 2 draft tokens) = the same bit-identical garbage. So:
+- the verify-only path (n_max=0) is correct: the g_embd stash, the verify batch, the
+  MTP head's verify forward are all fine;
+- the corruption appears exactly when the DRAFT decodes its own token(s) - the draft
+  context's forward (ctx_dft: MTP head + the draft's own state/KV stores + the
+  kv-unified cell-0 pattern) corrupts the subsequent output.
+Next: audit the draft context's forward - the draft KV cells (all 0 in the unified
+idxs), the draft's recurrent-state store rows (ctx_dft has its own hybrid state with
+the same n_rs_seq=2 rollback), and the g_embd pairing (pending_h / verify_h stashes).
+The kv-unified stream-B cell mapping for the draft's tokens is the prime suspect.

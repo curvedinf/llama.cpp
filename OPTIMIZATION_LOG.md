@@ -3133,3 +3133,23 @@ in place. Attack it directly: LLAMA_LOGIT_DUMP (the sampler debug already in the
 for the first step's top logits, and compare the first graph's per-GPU copies against
 the dense reference (run_golden_reference.sh exists for layer-split correctness
 verification) to find which tensors diverge.
+
+## Corruption isolated to the MTP path (2026-08-02) - the single-request bisect
+
+With the dispatch-time src replacement + NULL-src fixes in place, the single-request
+manifestation was bisected on 1 GPU (HIP_VISIBLE_DEVICES=0, -sm tensor -ts 1):
+- 1-GPU, no MTP (--spec-type none): output "Today, abacuses are" - CORRECT, and the
+  LLAMA_LOGIT_DUMP values are BIT-IDENTICAL to the layer-split golden reference
+  (561=16.364374, 11=20.466438, 567=15.855005, ...). The 1-GPU tensor-split meta path
+  is bit-exact correct.
+- 1-GPU, MTP (--spec-type draft-mtp, n-max 2): output "A. B. . ." - GARBAGE; the
+  decode logits diverge from the golden from the first decode step (13=10.37 vs
+  11=20.47), and even the prefill's last-token logits have the right top-1 (561) but
+  wrong values (12.41 vs 16.36).
+- Draft KV f16 instead of q8_0: identical garbage - not the draft KV type.
+
+So the ENTIRE crash/garbage class is the MTP path (draft/verify graphs under the meta
+backend). The 4-GPU prefill corruption and the burst IMA are the same root, amplified.
+Next: bisect the MTP path - draft n-max (1 vs 2), the draft's recurrent-state store
+(the draft ctx is a second hybrid context on the same backend), and the verify graph's
+state rollback. The no-MTP 1-GPU config is the clean baseline for every test.

@@ -453,6 +453,10 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_backend_meta_simple_tensor_container stc_compute_current;
     std::map<uint64_t, ggml_backend_meta_simple_tensor_container> stc_compute;
+    // graph uid of the compute currently being dispatched: lookups must prefer
+    // THIS graph's container - same-shape graphs share tensor keys, and an
+    // unordered traversal can hit another graph's (evicted/reset) container
+    uint64_t current_uid = 0;
     ggml_init_params stc_params;
     size_t n_simple_bufts = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -486,6 +490,13 @@ struct ggml_backend_meta_buffer_context {
                 fprintf(stderr, "STC_LOOKUP: %s p=%p -> STATIC\n", tensor->name, (void *) tensor);
             }
             return stc_static;
+        }
+        // the graph being dispatched must resolve to its OWN container first:
+        // same-shape graphs share tensor keys, so a plain map traversal can land
+        // on another graph's container whose objects were reset/evicted
+        auto it_cur = stc_compute.find(current_uid);
+        if (it_cur != stc_compute.end() && it_cur->second.simple_tensors.find(key) != it_cur->second.simple_tensors.end()) {
+            return it_cur->second;
         }
         for (auto & kv : stc_compute) {
             if (kv.second.simple_tensors.find(key) != kv.second.simple_tensors.end()) {
@@ -2085,6 +2096,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+            buf_ctx->current_uid = cgraph->uid;
             // Clear split_state_cache on rebuild: stc_compute tensors are freed by
             // ggml_reset below, and new tensors may reuse the same addresses, causing
             // the cache to return stale split states from the previous graph.
@@ -2159,18 +2171,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) t->buffer->context;
             const ggml_meta_tensor_key t_key = ggml_meta_tensor_key_of(t);
             if (!buf_ctx->stc_static.simple_tensors.count(t_key)) {
-                bool in_compute = false;
-                for (auto & kv : buf_ctx->stc_compute) {
-                    if (kv.second.simple_tensors.count(t_key) != 0) {
-                        in_compute = true;
-                        if (getenv("LLAMA_META_TRACE") != nullptr && kv.first != cgraph->uid &&
-                                (strstr(t->name, "leaf_61") != nullptr || strstr(t->name, "leaf_63") != nullptr)) {
-                            fprintf(stderr, "CROSS_UID_SHARE: %s p=%p this_uid=%llu other_uid=%llu\n", t->name,
-                                (void *) t, (unsigned long long) cgraph->uid, (unsigned long long) kv.first);
-                        }
-                        break;
-                    }
-                }
+                // only THIS graph's uid container counts as initialized: another
+                // graph's container may hold a same-key tensor (same-shape graphs),
+                // but that graph can be reset/evicted at any time - sharing its
+                // objects makes this graph's sub-graphs dangle
+                auto it_cur = buf_ctx->stc_compute.find(cgraph->uid);
+                const bool in_compute = it_cur != buf_ctx->stc_compute.end() &&
+                    it_cur->second.simple_tensors.count(t_key) != 0;
                 needs_init = !in_compute;
             }
             if (needs_init) {
@@ -2188,13 +2195,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         ggml_backend_meta_buffer_context * sbuf_ctx = (ggml_backend_meta_buffer_context *) t->src[s]->buffer->context;
                         const ggml_meta_tensor_key src_key = ggml_meta_tensor_key_of(t->src[s]);
                         if (!sbuf_ctx->stc_static.simple_tensors.count(src_key)) {
-                            bool src_in_compute = false;
-                            for (auto & kv : sbuf_ctx->stc_compute) {
-                                if (kv.second.simple_tensors.count(src_key) != 0) {
-                                    src_in_compute = true;
-                                    break;
-                                }
-                            }
+                            auto it_src = sbuf_ctx->stc_compute.find(cgraph->uid);
+                            const bool src_in_compute = it_src != sbuf_ctx->stc_compute.end() &&
+                                it_src->second.simple_tensors.count(src_key) != 0;
                             if (!src_in_compute) {
                                 ggml_backend_meta_buffer_init_tensor_impl(sbuf_ctx->stc_compute[cgraph->uid], t->src[s]);
                             }
@@ -2223,10 +2226,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 bcj.nodes[i] = ggml_backend_meta_buffer_simple_tensor(node, j);
-                if (getenv("LLAMA_META_TRACE") != nullptr && bcj.nodes[i] != nullptr &&
-                        (((uintptr_t) bcj.nodes[i]) & 1) != 0) {
-                    fprintf(stderr, "BCJ_BAD: i=%d j=%zu node=%s p=%p simple=%p\n",
-                        i, j, node->name, (void *) node, (void *) bcj.nodes[i]);
+                if (getenv("LLAMA_META_TRACE") != nullptr && node->op == GGML_OP_CPY) {
+                    ggml_backend_meta_buffer_context * buf_ctx2 = (ggml_backend_meta_buffer_context *) node->buffer->context;
+                    ggml_backend_meta_simple_tensor_container & stc2 = buf_ctx2->get_simple_tensor_container(node);
+                    const char * which = (&stc2 == &buf_ctx2->stc_static) ? "static"
+                        : (&stc2 == &buf_ctx2->stc_compute_current) ? "staging" : "uid";
+                    fprintf(stderr, "FILL_CPY: i=%d node=%s -> %s p=%p\n", i, node->name, which, (void *) bcj.nodes[i]);
                 }
                 GGML_ASSERT(bcj.nodes[i]);
             }
@@ -2616,9 +2621,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj = backend_ctx->backend_configs[j];
             GGML_ASSERT(bcj.cgraphs[i].cgraph_main->size >= bcj.cgraphs[i].cgraph_main->n_nodes);
             if (getenv("LLAMA_META_TRACE") != nullptr) {
-                fprintf(stderr, "META_DISPATCH: j=%zu i=%zu ptr=%p size=%d n_nodes=%d\n",
+                fprintf(stderr, "META_DISPATCH: j=%zu i=%zu ptr=%p size=%d n_nodes=%d uid=%llu\n",
                     j, i, (void *) bcj.cgraphs[i].cgraph_main,
-                    (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes);
+                    (int) bcj.cgraphs[i].cgraph_main->size, (int) bcj.cgraphs[i].cgraph_main->n_nodes,
+                    (unsigned long long) bcj.cgraphs[i].cgraph_main->uid);
             }
             // src-link repair: a cached subgraph node's srcs can be recycled
             // container objects (the alloc-time/staging container is reset at every

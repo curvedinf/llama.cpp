@@ -3326,3 +3326,19 @@ single rolling cell - the draft's garbage is EXPECTED there, but the acceptance 
 reject it (the verify's P(t+1) is correct). If the acceptance accepts garbage, the
 fix is in the acceptance criterion; if the draft's cell-0 KV is unintended, the fix
 is in the kv-unified allocation for the draft stream.
+
+## MTP dump-sequence analysis (2026-08-02)
+
+The first request's LOGIT_DUMP sequence: prefill (idx=3) then a 3-position verify
+pattern [idx=0: 13=10.38, idx=1: 220=8.94, idx=2: 13=14.50] (the MTP verify's
+positions 0..2 = the trailing 1+n_rs_seq window) then the decode steps. The verify's
+logits[0] top-1 is the draft's own token 13 (the draft's t+1), so the acceptance
+criterion (verify logits[i] argmax vs draft[i]) accepts the draft's garbage if the
+draft's t+1 prediction (13) matches the verify's P(t+2|13) argmax (13) - the model
+repeating the token it was just given. The draft's t+1 = 13 comes from the draft's
+own decode whose attention is degenerate (KV cells all 0 in the unified idxs - every
+draft token writes cell 0). Whether the draft's cell-0 KV is intended is the key
+question; the fix candidates remain (a) the kv-unified allocation for the draft
+stream's cells, (b) the acceptance criterion. Next: run with the SPC_TRC-level
+verbosity (-lv 5) on the layer-split config to capture the accepted count and the
+draft/verify tokens for the first step.

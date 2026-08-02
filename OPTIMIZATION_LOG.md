@@ -3436,3 +3436,23 @@ Next: dump the KV pool cells (the first ~16 cells of the k/v pools of layer 0) a
 the verify vs after the decode on the same position - the cell-0 content after the
 verify (the 2nd token's KV write) vs the expected; and verify the 1st token's mask
 column bounds (n_kv = t+1 for the 1st, t+2 for the 2nd) don't include cell 0.
+
+## ROOT CAUSE: draft tokens allocated to cell 0 = the main's position-0 cell (2026-08-02)
+
+Layer-split MTP + KVDUMP + SETROWS idxs: the verify batch writes idxs
+[0,0], [0,0,1,0,2,0], [6,0,7,0], [10] - the even positions get real cells, but the
+ODD positions (the draft's speculative tokens) get CELL 0, which is also the main's
+position-0 KV cell. The draft's KV writes therefore CLOBBER the main's first-token
+KV, and every subsequent attention that includes position 0 (the 1st column's mask
+[0..t+1] includes it) attends the draft's KV instead of the prompt's first token -
+the verify's P(t+1) is corrupted at the same condition as the decode, the acceptance
+accepts garbage, and under concurrency/tensor-split the same class escalates into
+the burst IMA/crash. The no-MTP path never writes the draft tokens, so it is
+bit-exact.
+
+The fix: the draft's speculative tokens must get REAL cells (their actual positions'
+slots), not cell 0. The allocation is in find_slot/alloc_find (llama-kv-cache.cpp)
+- the 2nd token of each (main, draft) pair resolves to 0. Next: find why the
+2nd-token allocation yields 0 (the alloc_find semantics for the speculative tokens
+or the batch construction assigning the draft tokens a sentinel cell) and allocate
+the real continuation cells.

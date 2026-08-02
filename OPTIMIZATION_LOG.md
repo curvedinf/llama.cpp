@@ -3741,3 +3741,19 @@ Remaining class (~15%): binbcast (ADD) abort at a CUDA_CHECK (device IMA) -
 suspected async sched-buffer reuse or a residual container path. Next: probe
 the ADD node's src objects at dispatch like SRC_NULL_ORIG, or HIP_LAUNCH_BLOCKING
 to confirm the async component.
+
+## TP4 burst race: timing-only, all sync/container fixes insufficient (2026-08-02, cont. 4)
+
+- rocgdb (any slowdown) makes even the TP4 burst pass - the crash is a pure
+  timing race. HIP_LAUNCH_BLOCKING also eliminates it (kernel-level serial).
+  LLAMA_FULL_SYNC (per-decode llama_synchronize on ctx_tgt), UBATCH_SYNC
+  (per-ubatch sched sync), SYNC_DFT (ctx_dft sync), LLAMA_DISABLE_CONCURRENT_EVENTS,
+  GGML_CUDA_DISABLE_GRAPHS, tmp-buffer realloc sync (0afb4559e): all insufficient.
+- TP4 tensor-split MTP burst still ~100% crash (IMA); 1-GPU ~85% clean after
+  cf09c840f. Layer-split TP4 burst is fully stable (8/8) but throughput is
+  ~5 PP / ~4 TG tok/s at C8 short prompts - 300x below target, unusable.
+- The race is an async use-after-free invisible to rocgdb; remaining suspects:
+  host-leaf overwrite during in-flight replay, or a HIP-driver-level stream
+  interaction. Next best ROI: finish the paged-attention roadmap on 1 GPU
+  (n_tps>2 prefill chunks, MFMA paged kernel) which does not depend on the
+  TP4 crash being fixed, then return to the race with fresh evidence.

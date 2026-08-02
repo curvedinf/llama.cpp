@@ -35,6 +35,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    if (getenv("LLAMA_RS_SIZE_DBG") != nullptr) {
+        fprintf(stderr, "RS_SIZE: mem_size=%u n_seq_max=%u n_rs_seq=%u\n", mem_size, n_seq_max, n_rs_seq);
+    }
+
     cells.clear();
     cells.resize(mem_size);
 

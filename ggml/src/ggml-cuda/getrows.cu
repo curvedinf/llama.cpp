@@ -56,6 +56,11 @@ static __global__ void k_get_rows_float(
     const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
     dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
     ggml_cuda_pdl_sync();
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && ne00 == 7680 && src1[0] == 0) {
+        printf("GR_K: i01=%d src0row=%p val=%.6g\n", src1[0],
+            (const void *) ((const char *) src0 + src1[0]*nb01),
+            (double) ((const float *) ((const char *) src0 + src1[0]*nb01))[0]);
+    }
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
             // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
@@ -100,6 +105,10 @@ static __global__ void k_get_rows_float_f32_vec4(
             float4 * dst_row = (float4 *) (dst + i10*s1 + i11*s2 + i12*s3);
             const float4 * src0_row = (const float4 *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
+            if (i00 == 0 && i01 == 0 && ne00_vec4 == 1920) {
+                printf("GRV_K: row=%d src=%p v0=%.6g v1=%.6g\n", i01,
+                    (const void *) src0_row, (double) src0_row[0].x, (double) src0_row[0].y);
+            }
             dst_row[i00] = src0_row[i00];
         }
     }
@@ -333,6 +342,23 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
         fprintf(stderr, "] dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
             dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+        if (src0->ne[1] == 24 && src1->ne[0] == 1) {
+            // conv-state gather: read the store row and the gathered dst (sync).
+            // Skip while a CUDA graph capture is active (memcpy is illegal there).
+            cudaStreamCaptureStatus cap_status;
+            CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap_status));
+            if (cap_status != hipStreamCaptureStatusActive) {
+                cudaStreamSynchronize(ctx.stream());
+                const int32_t row0 = idx_p[0];
+                float sv[4] = {0}, dv[4] = {0};
+                CUDA_CHECK(cudaMemcpyAsync(sv, (const char *) src0->data + (int64_t) row0 * src0->nb[1], 4 * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaMemcpyAsync(dv, dst->data, 4 * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream()));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+                fprintf(stderr, "GETROWS_V: row=%d store=[%.5g %.5g %.5g %.5g] dst=[%.5g %.5g %.5g %.5g]\n",
+                    row0, (double) sv[0], (double) sv[1], (double) sv[2], (double) sv[3],
+                    (double) dv[0], (double) dv[1], (double) dv[2], (double) dv[3]);
+            }
+        }
     }
 
     cudaStream_t stream = ctx.stream();

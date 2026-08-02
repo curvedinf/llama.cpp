@@ -4032,6 +4032,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (getenv("LLAMA_GRAPH_NODE_TRACE") != nullptr && i < 80) {
+                    fprintf(stderr, "GNODE[%d]: %s (%s)\n", i, node->name, ggml_op_name(node->op));
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4099,6 +4102,36 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+
+        // Post-launch probe (env-gated, device 0 only): after the graph has
+        // executed, read the recurrent-state write-back rows and the gather
+        // source, and dump the SCALE zeroing node's baked view size.
+        if (getenv("LLAMA_CPY_TRACE") != nullptr && cuda_ctx->device == 0) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_CPY && node->src[1] != nullptr &&
+                        node->src[1]->ne[0] == 7680 && node->src[1]->ne[1] == 1) {
+                    const ggml_tensor * dst = node->src[1];
+                    float vals[4];
+                    CUDA_CHECK(cudaMemcpy(vals, dst->data, sizeof(vals), cudaMemcpyDeviceToHost));
+                    fprintf(stderr, "CPY_AFTER: node=%d dst=%s data=%p vals={%.6f,%.6f,%.6f,%.6f}\n",
+                        i, dst->name, (const void *) dst->data, vals[0], vals[1], vals[2], vals[3]);
+                }
+                if (node->op == GGML_OP_SCALE && node->src[0] != nullptr &&
+                        strstr(node->name, "cache_r_l") != nullptr) {
+                    fprintf(stderr, "SCALE_AFTER: node=%d dst=%s view_ne={%ld,%ld} view_data=%p\n",
+                        i, node->name, (long) node->src[0]->ne[0], (long) node->src[0]->ne[1],
+                        (const void *) node->src[0]->data);
+                }
+                if (node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr &&
+                        node->src[0]->ne[0] == 7680 && node->src[0]->ne[1] == 24) {
+                    fprintf(stderr, "GR_AFTER: node=%d src0=%s data=%p nb01=%zu | dst=%s\n",
+                        i, node->src[0]->name, (const void *) node->src[0]->data, node->src[0]->nb[1],
+                        node->name);
+                }
+            }
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;

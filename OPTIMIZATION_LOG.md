@@ -3530,3 +3530,135 @@ input/output hashes + CONV_DUMP element dumps):
   golden re-verifies from a non-rolled-back state by design.
 
 Next: TP4 burst validation (8/8) with MTP on, then the paged-attention roadmap.
+
+## TP4 tensor-split MTP: write-back cpys verified correct; reads see zeros (2026-08-02)
+
+The TP4 (tensor-split, -sm tensor) MTP run still garbles from the first graph.
+Localized with kernel-level probes:
+
+- The cpy-based state write-backs (conv fallback + GDN snapshot cpys) execute
+  OUTSIDE the CUDA-graph capture (cap=0) and the cpy_scalar kernel WRITES
+  CORRECTLY (d0 == x0 == -0.524205 for the first non-zero element). The
+  device-level store values (CONV_VD, FORCE=0 in-place path) also match golden.
+- Yet the next graph's gather (get_rows) reads ZERO from the store row, and the
+  RSPROBE meta readback shows zero for the written rows. The store appears
+  zeroed or the read addresses diverge from the write addresses.
+- Suspects: (a) the get_rows read addressing vs the sharded store layout under
+  tensor split, (b) a zeroing/overwrite between the write-back and the next
+  graph, (c) the meta readback showing stale assembled data. The FORCE=0 TP4
+  single request also crashes (empty reply) - a second issue.
+
+Next: probe the get_rows read side (the gather's row addressing + values under
+the sharded store).
+
+## TP4: value vanishes between cpy write and host readback (2026-08-02)
+
+Kernel-level probes settled the picture:
+- cpy_scalar kernel writes correctly: d0 == x0 == -0.524205 (element 1/2 of the
+  conv write-backs). The write-back machinery is NOT broken at the kernel level.
+- The gather (get_rows vec4 kernel, GRV_K probe) reads row 0 as ZERO and writes
+  zero to the gathered dst. The GETROWS_V dst readback non-zero values were
+  STALE buffer content (the kernel demonstrably writes 0).
+- The CPY_V host readback (after cudaStreamSynchronize on the same stream)
+  shows 0 for the same addresses the kernel just wrote - the value is gone by
+  the host readback. Same-stream sync makes a pure ordering race unlikely.
+
+Conclusion: the store row is genuinely zero at gather time. Either the write
+lands somewhere else physically (view data pointer vs the readback pointer
+diverge under the meta backend's per-device view remapping), or something
+zeroes the row between the graph and the next graph (all zeroing paths are
+no-ops for carried cells: rs_z=-1, fresh_rows=-1).
+
+Next: compare the CPY kernel cdst pointer vs the CPY_V host readback pointer
+per instance (aliasing check), and dump the store row's device content from the
+next graph's set_input via the RS_STEP probe (already shows zero).
+
+## TP4: graph order correct, value still vanishes (2026-08-02)
+
+Graph node trace (LLAMA_GRAPH_NODE_TRACE) for the warmup graph:
+- node 4: cache_r_l0 SCALE (the fresh-row zeroing - rs_z=-1 makes the rs_z
+  zeroing a zero-sized no-op, so this is the fresh-row zeroing)
+- node 9: GET_ROWS (the gather), node 18: CONCAT
+- nodes 21/24/27: the three write-back CPYs (slot 2/1/0)
+- node 31: SSM_CONV, node 48: GATED_DELTA_NET_IDX
+
+Execution order is correct: zeroing BEFORE the write-backs, write-backs before
+the conv. The CPY_V host readback (stream sync + device sync) still shows 0
+for the exact address the cpy kernel just wrote (d0 == x0 == -0.524205).
+Pointers match (CPY_V dst == CPY_LAUNCH cdst == 0x...600000 for the slot-0
+view). The value is gone from the same physical address after the kernel.
+
+Remaining suspects: (a) the write goes to a device-local buffer that is NOT
+the same physical memory the readback/gather reads (meta per-device view
+remapping producing different physical addresses for the same logical row),
+(b) an async buffer reset (VMM/no-VMM pool) recycling the store pages between
+graphs. Next: compare the physical addresses across the cpy write, the CPY_V
+readback, the RS_STEP readback, and the gather read for the same logical row.
+
+## TP4 MTP "corruption" resolved: probe capture-crashes were the crashes; state path verified correct (2026-08-02, this session)
+
+Root-caused the TP4 (tensor-split) MTP empty-reply crashes and the "value vanishes"
+finding chain:
+
+- ALL TP4 crashes (exit 52 / empty reply) were caused by probe code doing host-side
+  D2H readbacks (cudaMemcpy/cudaDeviceSynchronize) WHILE a CUDA/HIP graph capture
+  was active - illegal during capture ("previous error during capture" -> abort).
+  The offenders: the pre-existing CPY_V readback at the top of ggml_cuda_cpy
+  (runs before the launch!) and the GETROWS_V readback in ggml_cuda_op_get_rows.
+  Fixed by replacing CPY_V with a pointer-only CPY_PRE print and making
+  GETROWS_V capture-aware (cudaStreamIsCapturing gate). The "write-back value
+  vanishes at host readback" chain from earlier entries was this artifact.
+- Post-launch probes (CPY_AFTER/SCALE_AFTER/GR_AFTER in ggml_cuda_graph_evaluate_and_capture)
+  verify: the state write-back CPYs land real values (e.g. {-0.148382, ...} rows 0/8/16),
+  the SCALE zeroing node is a true no-op (view_ne={0,1}), and the gather reads the
+  exact addresses the CPYs write (cache_r_lX row bases, constant per device).
+- RSPROBE (synchronized state fingerprints) for TP4+MTP are byte-identical to
+  TP4+LLAMA_N_RS_SEQ_FORCE=0 across all 12 chunks - the recurrent state path is
+  correct under tensor split with MTP.
+- TP4+MTP single request now produces coherent text (validated repeatedly) with
+  draft acceptance ~9/10; a single earlier garbage output ("1945-865-...") is
+  attributed to a stale server process answering the health poll after a killed
+  run (draft accounting fields differed) - run_tp4_bench.sh now waits for port
+  8080 to be free before starting, so stale servers can never hijack a run.
+
+Pending: TP4 MTP burst validation (8/8 concurrent), then the paged-attention
+roadmap (ncols>=2 paged vec kernel fix for MTP2 verify batches).
+
+## Burst crash (MTP + concurrency): bisected to 1-GPU np>=5; race signature found (2026-08-02, this session)
+
+Repro chain: TP4 MTP burst (8 concurrent) crashes -> TP4 no-MTP burst passes 8/8 ->
+1-GPU tensor-split MTP burst crashes -> FORCE=2 (copy path, no drafts) burst passes ->
+np boundary: np<=4 passes, np>=5 crashes (~80% rate) -> timing-sensitive race
+(rocgdb run passed, HIP_LAUNCH_BLOCKING=1 passed once).
+
+Signals that shift timing and (coincidentally) sometimes pass: RS_DEBUG RSPROBE syncs
+(1/1 pass), LLAMA_UBATCH_SYNC (1/2), baseline (2/4 pass g17) - NOT reliable fixes,
+the window is short and variable. LLAMA_SYNC_DFT (sync after llama_decode) does NOT fix.
+
+The MTP verify runs in the shared ctx_dft (8 cells, n_rs_seq=0, plain recurrent mem)
+and the server merges multiple slots' tokens into one decode (slot_batched): with 5
+concurrent requests the merged batch has n_seqs=5 (vs 2-3 for fewer slots).
+
+RS_CELLS/RS_STEP dump from a passing run shows the merged 5-seq batches:
+  s_copy=[0,1,2,0,1] fresh=[0,1,2,-1,-1] seqids=[0,1,2,3,4]   <- carried seqs 3,4 read rows 0,1 = the FRESH cells' rows!
+  s_copy=[0,1,2,13,14] / [10,11,7,13,14] / [0,1,2,3,4]        <- row mapping rotates across batches
+The K>1 s_copy formula (llama-memory-recurrent.cpp:1663-1681) = rs_idx*size + src0;
+the observed carried-cell src0 values (0,1) collide with the fresh rows. This is the
+same row-collision family the 3da0f5e87 fix addressed for the single-seq case; the
+merged multi-seq batch exposes a new variant. Suspected mechanism: the fresh-row free
+scan vs the multi-seq extraction/placement ordering hands out rows that carried cells
+of the same batch read, and/or the rollback rs_idx mapping under merged batches.
+
+Next: trace find_slot on the merged 5-seq batch step-by-step (the RS_CELLS dump has
+the alternating 2-seq verify / 5-seq merged pattern), and/or rocgdb-catch the burst
+at np=8 TP4 (the old sessions' config that trapped k_set_rows_quant) for the faulting
+kernel. Note the old sessions' "launch-machinery corruption" conclusion was on builds
+with the now-reverted scoping + pre-3da0f5e87 state path - re-verify on the current
+HEAD before reusing their conclusions.
+
+Also fixed this session (kept): run_tp4_bench.sh SIGKILL + port-free wait (the server's
+SIGTERM graceful shutdown can hang, and a stale server answering the health poll
+hijacked runs - the source of the "1945-865" garbage + draft-accounting anomalies);
+capture-safe probes (CPY_POST/GETROWS_V D2H during CUDA-graph capture aborts were the
+root of ALL TP4 empty-reply crashes); post-launch probes CPY_AFTER/SCALE_AFTER/GR_AFTER
+proved the state write-backs land and the SCALE zeroing is a genuine no-op.

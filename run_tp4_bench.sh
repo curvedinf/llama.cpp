@@ -68,7 +68,18 @@ usage() { echo "usage: $0 {start|stop}"; }
 
 case "${1:-start}" in
   start)
-    pkill -f "${BIN_DIR}/llama-server" 2>/dev/null || true
+    # the server's graceful SIGTERM shutdown can hang (stuck queue/GPU wait), so
+    # use SIGKILL - a lingering old server would hold the port and answer this
+    # run's health poll, hijacking its requests
+    pkill -9 -f "${BIN_DIR}/llama-server" 2>/dev/null || true
+    # wait until the port is actually free: a stale server surviving the pkill
+    # would answer the health poll and steal this run's requests
+    for _ in $(seq 1 30); do
+      if ! ss -tln 2>/dev/null | grep -q ":${PORT} "; then
+        break
+      fi
+      sleep 1
+    done
     sleep 2
     log="${LOG_DIR}/server-tp4.log"
     setsid env \
@@ -77,6 +88,7 @@ case "${1:-start}" in
       LLAMA_PREFIX_CACHE_DISABLE="${LLAMA_PREFIX_CACHE_DISABLE}" \
       LLAMA_UX_DYNAMIC_BUDGET="${UX_DYNAMIC_BUDGET}" \
       LLAMA_PREFILL_CHUNK="${PREFILL_CHUNK}" \
+      LLAMA_N_RS_SEQ_FORCE="${LLAMA_N_RS_SEQ_FORCE:-}" \
       LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
         "${BIN_DIR}/llama-server" "${COMMON_ARGS[@]}" \
         >"${log}" 2>&1 </dev/null &
@@ -90,6 +102,6 @@ case "${1:-start}" in
     done
     echo "TP4 server failed to start"; tail -20 "${log}" >&2; exit 1
     ;;
-  stop) pkill -f "${BIN_DIR}/llama-server" 2>/dev/null || true; sleep 2; echo "stopped" ;;
+  stop) pkill -9 -f "${BIN_DIR}/llama-server" 2>/dev/null || true; sleep 2; echo "stopped" ;;
   *) usage; exit 1 ;;
 esac

@@ -1468,6 +1468,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // T1: per-ubatch sync probe (experiment): the merged multi-seq batches split
+    // into several ubatches; the next ubatch's input leaves are written while the
+    // previous ubatch's graph still executes (torn reads -> garbage row indices ->
+    // device IMA under concurrent MTP). Sync here to validate the race window.
+    if (getenv("LLAMA_UBATCH_SYNC") != nullptr) {
+        ggml_backend_sched_synchronize(slot->sched.get());
+    }
+
     // T1 diagnostic: synchronized recurrent-state row hashes, one line per decode
     // sub-ubatch. Reading the store while the previous graph is still in flight
     // races the GPU, so synchronize first; these hashes are a reliable per-step

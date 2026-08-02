@@ -1037,12 +1037,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
         // T1 diagnostic: dump per-step recurrent-state row mapping
         if (getenv("LLAMA_RS_DEBUG") != nullptr) {
-            fprintf(stderr, "RS_STEP: n_rs=%lld n_seqs=%lld n_t=%u head=%u rs_z=%d direct=%d s_copy=[",
+            fprintf(stderr, "RS_STEP: n_rs=%lld n_seqs=%lld n_t=%u head=%u rs_z=%d direct=%d scopy=%p s_copy=[",
                 (long long) n_rs, (long long) inp_rs->s_copy_main->ne[0], ubatch != nullptr ? ubatch->n_seq_tokens : 0,
                 mctx->get_recr()->get_head(),
                 mctx->get_recr()->get_rs_z(), (int) mctx->get_recr()->get_direct());
             for (int64_t i = 0; i < inp_rs->s_copy_main->ne[0]; ++i) {
                 fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+            }
+            fprintf(stderr, "] real=[");
+            for (int64_t i = 0; i < inp_rs->s_copy_main->ne[0]; ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", ((const int32_t *) inp_rs->s_copy->data)[i]);
             }
             fprintf(stderr, "] fresh=[");
             const auto & fr = mctx->get_recr()->get_fresh_rows();

@@ -3833,6 +3833,10 @@ private:
 
         const int ret = llama_decode(ctx_tgt, batch_view);
 
+        if (getenv("LLAMA_SYNC_DFT") != nullptr) {
+            llama_synchronize(ctx_tgt);
+        }
+
         metrics.on_decoded(slots);
 
         if (ret != 0) {

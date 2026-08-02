@@ -7,6 +7,7 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
+__device__ int g_cpy_probe = 0;
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
@@ -39,6 +40,12 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
 
     ggml_cuda_pdl_sync();
     cpy_1(cx + x_offset, cdst + dst_offset);
+    if (i == 1 && ne00 == 3 && ne01 == 2560) {
+        printf("CPY_K: ne=%lld ne00=%lld ne01=%lld nb00=%lld nb01=%lld ne10=%lld nb10=%lld xoff=%lld doff=%lld x0=%.6g d0=%.6g\n",
+            (long long) ne, (long long) ne00, (long long) ne01, (long long) nb00, (long long) nb01,
+            (long long) ne10, (long long) nb10, (long long) x_offset, (long long) dst_offset,
+            (double) *((const float *) (cx + x_offset)), (double) *((const float *) (cdst + dst_offset)));
+    }
 }
 
 template <typename T>
@@ -209,6 +216,15 @@ static void ggml_cpy_scalar_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     const auto launch_scalar_generic = [&]() {
+        if (getenv("LLAMA_CPY_TRACE") != nullptr) {
+            cudaStreamCaptureStatus cap;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+            fprintf(stderr, "CPY_LAUNCH: ne=%lld ne00=%lld ne01=%lld ne02=%lld nb00=%lld nb01=%lld nb02=%lld ne10=%lld ne11=%lld nb10=%lld nb11=%lld cx=%p cdst=%p cap=%d\n",
+                (long long) ne, (long long) ne00, (long long) ne01, (long long) ne02,
+                (long long) nb00, (long long) nb01, (long long) nb02,
+                (long long) ne10, (long long) ne11, (long long) nb10, (long long) nb11,
+                (const void *) cx, (const void *) cdst, (int) cap);
+        }
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
@@ -427,6 +443,18 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
+    g_cpy_probe = getenv("LLAMA_CPY_TRACE") != nullptr ? 1 : 0;
+    const char * cpydbg = getenv("LLAMA_CPY_TRACE");
+    if (cpydbg != nullptr && strstr(src1->name, "cache_") != nullptr) {
+        fprintf(stderr, "CPY: src=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p nbytes=%zu | dst=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p nbytes=%zu\n",
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data, (size_t) ggml_nbytes(src0),
+            src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3], src1->data, (size_t) ggml_nbytes(src1));
+        if (src1->ne[1] == 1 && src1->ne[0] == 7680 && src0->ne[1] == 2560) {
+            fprintf(stderr, "CPY_PRE: src=%p dst=%p\n", (const void *) src0->data, (const void *) src1->data);
+        }
+    }
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
@@ -608,6 +636,23 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else {
         GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
+    }
+
+    // CPY_POST: post-launch readback probe (env-gated), matches CPY_PRE condition.
+    // Illegal during CUDA graph capture - skip then.
+    if (cpydbg != nullptr && src1->ne[1] == 1 && src1->ne[0] == 7680 && src0->ne[1] == 2560) {
+        cudaStreamCaptureStatus cap_status;
+        CUDA_CHECK(cudaStreamIsCapturing(main_stream, &cap_status));
+        if (cap_status == hipStreamCaptureStatusActive) {
+            fprintf(stderr, "CPY_POST_CAPTURE: dst=%p\n", (const void *) src1_ddc);
+        } else {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            float vals[8] = {0.0f};
+            CUDA_CHECK(cudaMemcpy(vals, src1_ddc, sizeof(vals), cudaMemcpyDeviceToHost));
+            fprintf(stderr, "CPY_POST: dst=%p src0_ne={%ld,%ld} type=%d vals={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                (const void *) src1_ddc, (long) src0->ne[0], (long) src0->ne[1], (int) src1->type,
+                vals[0], vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+        }
     }
 }
 

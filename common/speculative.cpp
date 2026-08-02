@@ -1441,6 +1441,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ok = false;
                     break;
                 }
+                if (getenv("LLAMA_SYNC_DFT") != nullptr) {
+                    llama_synchronize(ctx_dft);
+                }
             }
 
             if (chain_heads) {

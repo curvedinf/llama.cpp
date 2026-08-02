@@ -318,7 +318,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
         if (getenv("LLAMA_CONV_TRACE") != nullptr) {
             const int32_t * sidx_p = (const int32_t *) src3->data;
-            fprintf(stderr, "CONV_IDX: nr=%ld n_t=%ld n_s=%ld nc=%ld grid=(%ld,%ld) fresh=%x | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | sidx=[",
+            fprintf(stderr, "CONV_IDX: nr=%ld n_t=%ld n_s=%ld nc=%ld grid=(%ld,%ld) fresh=%x | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | src3=%s data=%p buf=%s | sidx=[",
                 (long) nr, (long) n_t, (long) n_s, (long) nc, (long) n_s, (long) ((nr + 127) / 128), fresh_mask,
                 src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
@@ -333,7 +333,11 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             for (int64_t i = 0; i < n_sidx; ++i) {
                 fprintf(stderr, "%s%d", i ? "," : "", sidx_p[i]);
             }
-            fprintf(stderr, "]\n");
+            fprintf(stderr, "]");
+            if (n_sidx >= 3 && (sidx_p[0] > (int32_t) src2->ne[1] || sidx_p[0] < -1)) {
+                fprintf(stderr, " BAD");
+            }
+            fprintf(stderr, "\n");
         }
 
         if (fuse_silu) {
@@ -342,6 +346,21 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         } else {
             ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
                                          src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
+        }
+
+        if (getenv("LLAMA_CONV_VDUMP") != nullptr) {
+            cudaStreamSynchronize(stream);
+            const int32_t row0 = sidx_d[0];
+            float sv[8] = {0}, ov[8] = {0};
+            CUDA_CHECK(cudaMemcpyAsync(sv, (const char *) src2->data + (int64_t) row0 * src2->nb[1], 8 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(ov, out->data, 8 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(stderr, "CONV_VD: n_t=%ld n_s=%ld fresh=%x row0=%d store=[%.5g %.5g %.5g %.5g %.5g %.5g %.5g %.5g] out=[%.5g %.5g %.5g %.5g %.5g %.5g %.5g %.5g]\n",
+                (long) n_t, (long) n_s, fresh_mask, row0,
+                (double) sv[0], (double) sv[1], (double) sv[2], (double) sv[3],
+                (double) sv[4], (double) sv[5], (double) sv[6], (double) sv[7],
+                (double) ov[0], (double) ov[1], (double) ov[2], (double) ov[3],
+                (double) ov[4], (double) ov[5], (double) ov[6], (double) ov[7]);
         }
 
         return;
@@ -373,5 +392,20 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     } else {
         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
                           out->nb[2], nc, nr, n_t, n_s, stream);
+    }
+
+    if (getenv("LLAMA_CONV_VDUMP") != nullptr) {
+        cudaStreamSynchronize(stream);
+        const int32_t row0 = 0;
+        float sv[8] = {0}, ov[8] = {0};
+        CUDA_CHECK(cudaMemcpyAsync(sv, (const char *) src0->data + (int64_t) row0 * src0->nb[1], 8 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(ov, out->data, 8 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        fprintf(stderr, "CONV_PVD: n_t=%ld n_s=%ld src0=[%.5g %.5g %.5g %.5g %.5g %.5g %.5g %.5g] out=[%.5g %.5g %.5g %.5g %.5g %.5g %.5g %.5g]\n",
+            (long) n_t, (long) n_s,
+            (double) sv[0], (double) sv[1], (double) sv[2], (double) sv[3],
+            (double) sv[4], (double) sv[5], (double) sv[6], (double) sv[7],
+            (double) ov[0], (double) ov[1], (double) ov[2], (double) ov[3],
+            (double) ov[4], (double) ov[5], (double) ov[6], (double) ov[7]);
     }
 }

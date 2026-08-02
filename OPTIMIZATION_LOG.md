@@ -3272,3 +3272,19 @@ compute itself (the per-seq ncols=2 FA node) or the verify batch's qkv. Next: du
 the verify FA node's kernel launch (grid/block + mask/K/V args) vs the decode's on
 the same position; also compare the verify batch's qkv (the MTP-head g_embd pairing)
 against the decode's qkv for the same token.
+
+## Verify corruption confirmed by same-condition comparison (2026-08-02)
+
+The verify batch = [draft-t+1, draft-t+2] (the draft's predicted tokens). The verify's
+logits[0] = P(t+2 | context + draft-t+1) - the SAME condition as the next decode step
+of the draft token - yet the distributions differ (verify top-1 13=10.38 vs the
+1-token forward top-1 417=10.00). So the verify's 2-token forward is CORRUPTED, not
+just a different-condition evaluation. Combined with the GDN-geometry-identical
+result, the corruption is inside the verify batch's 2-token attention path (the
+per-seq ncols=2 FA node) or its qkv/KV/mask for the 2-token batch.
+
+Next: bisect the 2-token FA path - run the same 2-token batch with the FA forced to
+the 1-token decomposition (n_tps=2 but per-token FA nodes) vs the ncols=2 batched
+node; and dump the verify's FA launch (mask/K/V) vs the decode's. The fattn-vec
+ncols=2 path (V_DOT2) is the prime suspect given the earlier ncols=2 padded-write bug
+in the same kernel family.

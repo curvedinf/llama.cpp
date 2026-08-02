@@ -3288,3 +3288,19 @@ the 1-token decomposition (n_tps=2 but per-token FA nodes) vs the ncols=2 batche
 node; and dump the verify's FA launch (mask/K/V) vs the decode's. The fattn-vec
 ncols=2 path (V_DOT2) is the prime suspect given the earlier ncols=2 padded-write bug
 in the same kernel family.
+
+## Verify FA launch comparison (2026-08-02)
+
+Layer-split MTP + launch trace: the decode and verify FAs use the SAME kernel
+(launch_fattn<256,2,1>) with the SAME grid {1,1,24} (24 heads, ncols=2) - the
+verify's ne01=2 (both columns real) vs the decode's ne01=1 (second column padded).
+The prefill FAs use {1,4,12}/{1,8,12}/{4,24,1}/{6,24,1} (the y/x token splits). The
+verify's 2nd column attends the cell-0 KV (the garbage), the 1st column attends the
+real KV - yet the 1st column's logits are wrong vs the same-condition 1-token forward
+(verify P(t+2|13) top-1=13 vs 1-token top-1=417). The corruption is inside the
+ncols=2 kernel's two-column processing (V_DOT2) or the verify batch's mask/qkv.
+
+Next: bisect by forcing the verify FA to per-token (ncols=1) nodes for the 2-token
+batch - if correct, the ncols=2 two-column path is the bug (audit the V_DOT2
+half2 masking/KQ handling for the column-1's garbage-KV contaminating column-0's
+softmax/normalization); if still wrong, the verify's qkv/mask is the bug.

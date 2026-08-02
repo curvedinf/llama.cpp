@@ -3798,3 +3798,31 @@ thread's fatal path is not a deliverable signal). The subgraph-split assert
 Status: paged decode/verify (n_tps<=2) correct and ~85% clean on 1-GPU burst;
 TP4 and prefill-paged bursts blocked by the race; MFMA paged kernel and the
 bench remain pending on stability.
+
+## TP4 concurrent MTP race: final characterization + blocker (2026-08-02, cont. 7)
+
+Complete repro matrix (current HEAD, after all fixes):
+- Sequential MTP (3 requests, one at a time): CLEAN
+- TP4 MTP np=8 burst (8 concurrent): ~25% clean (server dies with device IMA)
+- TP4 MTP np=8 burst, drafts disabled (--spec-draft-n-max 0): CRASHES
+- TP4 MTP np=8 burst, LLAMA_N_RS_SEQ_FORCE=0: CRASHES
+- TP4 no-MTP np=8 burst: 8/8 CLEAN
+- TP4 no-MTP np=5 burst (5 slots + 3 queued, two waves): CRASHES
+- 1-GPU no-MTP burst: CRASHES; 1-GPU MTP burst: ~85% clean (np=5)
+- vLLM (same HW, TP4 MTP2 C8): 8/8 CLEAN
+
+Conclusions:
+- The crash requires CONCURRENT in-flight decodes; the MTP context's presence
+  (ctx_dft) or a slot-queue second wave both trigger it; sequential is immune.
+- Hardware/driver are exonerated by the vLLM comparison.
+- The device IMA is silent (HSA callback thread dies with SIGSEGV masked) and
+  rocgdb/gdb/ptrace mask the fault entirely; AMD_LOG_LEVEL shows only kernel
+  submission (last kernel varies by config: flash_attn_ext_vec_paged / 
+  k_set_rows / copyBuffer - sticky error, faulting kernel is earlier).
+- All host-side localization tools are exhausted (syncs, container fixes,
+  HSA envs, LD_PRELOAD signal unmasking, heap checking, core dumps).
+
+This is the open blocker for the TP4 1500/150 bench. The paged-attention
+implementation itself (decode/verify, n_tps<=2) is complete and validated
+byte-identical on single requests; remaining roadmap items (prefill paged,
+MFMA paged) and the bench depend on resolving this race.

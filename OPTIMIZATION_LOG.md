@@ -3361,3 +3361,24 @@ state path (snapshot slots {1,0} vs {0}), or the verify batch's qkv. Next: force
 verify's FA to per-token (ncols=1) nodes via an env gate in build_attn_mha and
 re-test the 1-GPU MTP single - if clean, the ncols=2 FA path is the bug (audit the
 V_DOT2 two-column KQ/mask/softmax handling); if still wrong, the GDN nt=2 or qkv.
+
+## Per-token FA experiment: needs layer-level decomposition (2026-08-02)
+
+The env-gated per-token FA decomposition (build_attn_mha) aborts: the layer's
+token-dependent ops (the Qwen35 attn gate / rope MULs) are shaped [..., n_tps, ...]
+and cannot repeat into a per-token [D, 1, ...] view (ggml_can_repeat assert at
+ggml.c:2268). The per-token experiment therefore needs a layer-level decomposition
+(per-token q/g/rope/mask views through build_layer_attn) - larger than a quick gate.
+Static audit of the ncols=2 kernel's KV_max: it is per-BLOCK (one value for the
+block's columns), which for the 2-token verify means the loop runs to the max
+(t+2) length with the causal mask excluding the extra positions per column - the
+column-0 (real KV) processing looks correct, so the contamination mechanism is
+still unidentified.
+
+Next options: (a) the layer-level per-token gate (build_layer_attn), (b) compare
+the verify batch's qkv/g/mask CONTENT against the decode's for the same position
+(the layer-0 outputs!) via a small host-side dump in build_layer_attn (env-gated),
+(c) revert the fattn ncols=2 guard temporarily to check whether the verify hits the
+padded-write path (n_tps=2 should not, but the decode's n_tps=1-with-pad is
+guarded while the verify's exact-2 may expose the same write beyond the allocation
+in a different shape).

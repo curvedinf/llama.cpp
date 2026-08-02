@@ -3692,3 +3692,30 @@ the meta set_tensor scatter (offset math on per-device views), (b) a paged-view
 data-pointer overrun (batched-Q view / block-table view offsets), (c) the
 s_copy/k_idxs host leaves' write bounds. Experiment: disable the host zeroing
 (env gate) and re-run; then mprotect the arena region.
+
+## Concurrent MTP crash: staging-container cross-slot overwrite localized (2026-08-02, this session, cont. 2)
+
+Established facts (crash handler + META_TRACE probes):
+- The corrupted object at dispatch (SRC_NULL_ORIG) is the SUBGRAPH node itself
+  (bcj.nodes object, 0x71f3... region = container arena), not the graph node.
+  Its fields read as a partially-initialized different object (hex dump:
+  type/op=0, ne[1]=30720, nb={122880,122880,122880}, data=0x10e000...) - the
+  arena was overwritten by another tensor's creation while the subgraph still
+  referenced it.
+- The subgraph nodes are filled from bcj.nodes (meta backend line ~2441), which
+  resolves through simple_tensor (static -> uid -> staging fallback). Objects in
+  the staging container (stc_compute_current) are shared across graphs/slots and
+  are recycled at every rebuild - the async GPU execution of slot A's queued
+  graph overlaps slot B's CPU-side alloc into the same staging arena.
+- Experiments this session: staging-lookup exclusion (static overflow),
+  KEEP_STAGING (no recycle; no reliable effect), stc cap 256 (no effect),
+  LLAMA_GRAPH_CACHE_SIZE=1 (worse: rebuilds recycle more), LLAMA_UBATCH_SYNC
+  (syncs only ctx_tgt's sched - no effect), CPY src1 self-ref repair (removes
+  the null-src1 SIGSEGV; the abort variant remains).
+
+Remaining hypotheses: the cross-context overlap (ctx_dft verify graphs are not
+covered by UBATCH_SYNC - try LLAMA_UBATCH_SYNC + LLAMA_SYNC_DFT combined), or
+the staging arena itself must be per-graph (bigger change). The paged burst
+crash rate is ~60% (was ~75% at session start); no-paged baseline ~85% clean.
+
+Also fixed: SRC_NULL_HEX dump, CPY src[1] self-ref enforcement in SRC_REPLACE.

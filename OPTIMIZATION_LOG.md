@@ -3077,3 +3077,17 @@ or re-resolve srcs whose object is zeroed/not in a live container), and re-run t
 single-request + burst validation. The scoping's "never leave the original tensor as
 the src" was aimed at this class but its create-on-demand path regressed the first
 compute - the fix must resolve WITHOUT creating broken copies.
+
+## Dispatch-time src-link repair added; class persists (run-varying) (2026-08-02)
+
+Added an unconditional dispatch-time src repair in the meta's subgraph dispatch: any
+cached node src whose object has NULL buffer/data (the zeroed/recycled signature seen
+in SETROWS_SRC1_BAD) is re-resolved through the original graph node's copy lookup
+(SRC_REPAIR trace under LLAMA_META_TRACE). Build + single + burst test: 0 SRC_REPAIR
+firings, the single request still garbage, the burst still crashes (this run surfacing
+at ggml_backend_cuda_buffer_get_tensor - the run-varying victim again). The zeroed-src
+case is one manifestation; the underlying cached-subgraph object lifetime issue is
+deeper than a dispatch-time re-resolution (the broken object's address would pin the
+container - next catch should dump the src1 object address from SETROWS_SRC1_BAD and
+match it against the meta's container arenas to identify WHICH container's recycling
+produces it).

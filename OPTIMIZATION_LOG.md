@@ -3004,3 +3004,26 @@ ordering; if it still crashes, the class is the concurrent-cell allocation itsel
 Then: dump the per-GPU buffer map WITH the sched's growth history (META_BUFS print
 per alloc - the base changes show the growth), and check the kv-unified cell-0 stream
 mapping for the prefill.
+
+## ROOT CAUSE FOUND: src-scoping commit (7b8f30311) breaks the FIRST compute (2026-08-02)
+
+Bisect: reverted 7b8f30311 (meta src/view_src resolution scoped to the graph's own
+container + pre-init src-loop creating copies on demand) and rebuilt.
+- Single sequential request on the PRE-scoping build: CORRECT output
+  ("~ 11 # The Fasc..." for the abacus prompt), ZERO illegal-memory errors.
+- The scoping build: the same single request = GARBAGE output ("<think> Here's if 3",
+  the server's content-format parser 500s) under rocgdb, and the IMA crash on the
+  normal-speed run (surfaced by ncclGroupEnd of the first graph's allreduce).
+- So the CURRENT first-request crash/garbage class is the src-scoping REGRESSION,
+  not the old cross-uid class it was written to fix. The scoping's create-on-demand
+  src/view_src copies (own-container recursive init at the first compute) corrupt the
+  first graph's execution.
+- ALSO validated: the load-time split states are all correct (0 META_WARN), the
+  weight copies are right - the corruption is in the first compute's per-GPU copy
+  creation, i.e. the scoping's on-demand creation path.
+
+Next: surgical pin-down inside the scoping (its 4 hunks: view_src resolution,
+src resolution, preinit needs_init, pre-init src-loop) - disable the create-on-demand
+parts one at a time on the first-request repro; then fix the underlying copy-creation
+bug instead of reverting (the scoping's cross-uid fix may still be needed for other
+paths; test the burst on the pre-scoping build to see if the old class returns).

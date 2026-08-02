@@ -3421,3 +3421,18 @@ pool cells after the verify vs after the decode (the cells' content - the 2nd
 token's KV in cell 0 may be the garbage the 2nd column attends, and if the mask
 column for the 1st token accidentally includes cell 0's position, the 1st token's
 attention is contaminated).
+
+## kv-unified FA addressing note + next probe (2026-08-02)
+
+Static analysis of the dense FA k-row addressing under kv-unified could not be
+resolved conclusively (the pool is seq-broadcast with nb3=0; the kernel's k-loop row
+is the loop index; the seq's cells are [158+s, 159+s, ...] - the position-to-row
+mapping must be consistent since the no-MTP path is bit-exact). The MTP-specific
+fact stands: the verify batch's 2nd token (the speculative) is assigned cell 0 -
+whether the 2nd column's FA then attends cell 0's stale content (contaminating the
+1st column's softmax through the shared KV_max/KQ loop) is the empirical question.
+
+Next: dump the KV pool cells (the first ~16 cells of the k/v pools of layer 0) after
+the verify vs after the decode on the same position - the cell-0 content after the
+verify (the 2nd token's KV write) vs the expected; and verify the 1st token's mask
+column bounds (n_kv = t+1 for the 1st, t+2 for the 2nd) don't include cell 0.

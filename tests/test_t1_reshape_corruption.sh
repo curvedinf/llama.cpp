@@ -6,7 +6,7 @@ set -e
 
 BIN="/home/curved/llama.cpp-concurrency/build/bin"
 MODEL="/home/curved/models/qwen3.6-27b-mtp-gguf/Qwen3.6-27B-UD-Q6_K_XL.gguf"
-export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:$BIN"
+export LD_LIBRARY_PATH="/opt/rocm/lib:$BIN"
 
 PROMPT="Explain what happens when you boil water. Be concise."
 N=64

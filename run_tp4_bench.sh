@@ -22,7 +22,7 @@ UX_DYNAMIC_BUDGET="${UX_DYNAMIC_BUDGET:-0}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-1024}"
 SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 
-export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/opt/rocm/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
 # Prefix cache: disabled under tensor split. D4 (nr>1 snapshot readback in
 # get/set_tensor_async) only handles nr==1; enabling prefix cache under tensor
 # split triggers snapshot paths that crash. Re-enable after D4 is fixed.

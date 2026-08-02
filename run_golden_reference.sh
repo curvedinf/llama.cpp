@@ -24,7 +24,7 @@ UX_DYNAMIC_BUDGET="${UX_DYNAMIC_BUDGET:-0}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-1024}"
 SPEC_TYPE="${SPEC_TYPE:-none}"
 
-export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/opt/rocm/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
 # Prefix cache: disabled. The snapshot path crashes on meta-backend buffers (D4).
 export LLAMA_PREFIX_CACHE_DISABLE=1
 

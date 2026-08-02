@@ -21,7 +21,7 @@ CACHE_TYPE="${CACHE_TYPE:-q8_0}"
 GDN_F16="${GDN_F16:-0}"
 KV_PAGED="${KV_PAGED:-0}"
 
-export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="/opt/rocm/lib:${BIN_DIR}:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "${LOG_DIR}"
 

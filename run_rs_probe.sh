@@ -12,7 +12,7 @@ PORT=8091
 PROMPT="Explain what happens when you boil water. Be concise."
 N_PREDICT="${N_PREDICT:-16}"
 
-export LD_LIBRARY_PATH="/opt/rocm-7.2.0/lib:${BIN}"
+export LD_LIBRARY_PATH="/opt/rocm/lib:${BIN}"
 export LLAMA_PREFIX_CACHE_DISABLE=1
 export LLAMA_RS_DEBUG=1
 export LLAMA_LOGIT_DUMP=1

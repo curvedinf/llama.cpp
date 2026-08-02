@@ -2311,6 +2311,17 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
+    if (getenv("LLAMA_SETINP_TRACE") != nullptr) {
+        fprintf(stderr, "SETINP: dst=%s data=%p n_tokens=%u size=%u n_stream=%u idxs=[", dst->name, (void *) dst->data, n_tokens, sinfo.size(), sinfo.n_stream());
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                fprintf(stderr, "%s%lld", (s*sinfo.size() + i) ? "," : "",
+                        (long long) (sinfo.strm[s]*get_size() + sinfo.idxs[s][i]));
+            }
+        }
+        fprintf(stderr, "]\n");
+    }
+
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
@@ -2320,6 +2331,15 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
+    }
+
+    // KV diagnostic: read back the leaf right after the write, to detect a second writer
+    if (getenv("LLAMA_SETINP_WR") != nullptr) {
+        fprintf(stderr, "SETINP_WR: dst=%s data=%p leaf=[", dst->name, (void *) dst->data);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            fprintf(stderr, "%s%lld", i ? "," : "", (long long) data[i]);
+        }
+        fprintf(stderr, "]\n");
     }
 
     // KV diagnostic: dump the token-to-cell mapping for single-token (decode) ubatches

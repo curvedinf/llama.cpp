@@ -1593,6 +1593,13 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    {
+        // T1 diagnostic: force n_rs_seq off to test the recurrent copy-path divergence
+        const char * force = getenv("LLAMA_N_RS_SEQ_FORCE");
+        if (force != nullptr) {
+            cparams.n_rs_seq = (uint32_t) atoi(force);
+        }
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;

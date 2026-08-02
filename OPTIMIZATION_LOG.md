@@ -3488,3 +3488,45 @@ instrument set_input_k_idxs to print the sinfo.idxs it writes (the s/i loop + th
 idxs values) and compare against the find_slot trace for the same ubatch; and check
 the MTP/verify ubatch's prepare() call path (whether the k_idxs is refreshed for
 the verify batch or reused from the decode's).
+
+## ROOT CAUSE FOUND + FIXED: rs_z collision destroys carried GDN state; conv kernels not bit-exact (2026-08-02)
+
+1-GPU MTP (n_rs_seq=2) vs golden (LLAMA_N_RS_SEQ_FORCE=0) A/B with LLAMA_RS_DEBUG
+(RSPROBE full-store hashes + RS_STEP carried-state hashes + GDN_DUMP op-level
+input/output hashes + CONV_DUMP element dumps):
+
+- The warmup and chunk-1 (fresh seq, zero state) are bit-identical. The first
+  carried batch (chunk-2) diverges: layer-0 GDN (s) state differs, everything
+  cascades, logits differ from the 3rd prompt token on (271=15.65 vs 20.59 pre-fix).
+- Two independent defects, both needed for bit-exactness:
+
+  1. **rs_z collision (llama-memory-recurrent.cpp find_slot, K>1 branch).** With
+     every cell referenced (always at np=1), the rs_z selection falls back to
+     `rs_z = min`, which is the CARRIED cell's own row. The graph's rs_z zeroing
+     (build_rs / build_rs_store_zero keep) then zeroes the carried state before
+     the indexed GDN kernel reads the store directly (the conv gather copies the
+     row first, so only the GDN state is destroyed - the 47-row GDN divergence).
+     Fix: fresh cells read their OWN rows (src0 = i, zeroed before the op, K==1
+     style), rs_z = -1 (graph zeroing becomes a no-op). Also unguard the direct
+     host-side fresh-row zeroing (was n_rs_seq==0 only) and key can_reuse on
+     fresh_rows so the baked fresh_mask/zeroing views are never stale.
+
+  2. **Conv kernels not bit-exact (ssm-conv.cu).** The plain kernel (K>1 fallback)
+     and the indexed kernel (reference) compute the same products but the compiler
+     emits different FMA/reassociation schedules under -ffast-math -> 1-2 ulp
+     differences in state-dependent tokens (tokens 0,1 of a 4-token batch), which
+     is enough to corrupt MTP draft verification. Fixed by restructuring the plain
+     kernel to the identical static window + mul-add chain and compiling
+     ssm-conv.cu with -ffp-contract=off -fno-associative-math (appended after
+     -ffast-math). Confirmed: without the flags the two kernels disagree; with
+     them they are bit-exact for the same inputs.
+
+- Result: all RSPROBE state hashes match across the common graphs; the generated
+  text is IDENTICAL between the MTP run and the golden
+  ("\n\n<think>\n\n</think>\n\nWhen water is boiled, heat energy increases the
+  kinetic energy"). The MTP rollback machinery reads the correct snapshots
+  (s_copy=[2] -> slot-2 hash matches the golden's snapshot content). The only
+  remaining LOGIT_DUMP divergence is in the rejection paths, where the n_rs_seq=0
+  golden re-verifies from a non-rolled-back state by design.
+
+Next: TP4 burst validation (8/8) with MTP on, then the paged-attention roadmap.

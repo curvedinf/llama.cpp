@@ -577,6 +577,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     gsmpl->set_logits(ctx, idx);
 
+    if (getenv("LLAMA_LOGIT_DUMP") != nullptr && cur_p.data != nullptr) {
+        int best[3] = { 0, 1, 2 };
+        for (size_t i = 3; i < cur_p.size; ++i) {
+            for (int b = 0; b < 3; ++b) {
+                if (cur_p.data[i].logit > cur_p.data[best[b]].logit) {
+                    for (int b2 = 2; b2 > b; --b2) {
+                        best[b2] = best[b2 - 1];
+                    }
+                    best[b] = (int) i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "LOGIT_DUMP idx=%d:", idx);
+        for (int b = 0; b < 3; ++b) {
+            fprintf(stderr, " %d=%.6f", cur_p.data[best[b]].id, cur_p.data[best[b]].logit);
+        }
+        fprintf(stderr, "\n");
+    }
+
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 

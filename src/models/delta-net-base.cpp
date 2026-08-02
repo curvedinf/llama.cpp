@@ -501,7 +501,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         return ggml_ssm_conv_idx(ctx0, sx, conv_kernel, conv_states_all, inp->s_copy_main, fm_d2);
     }
 
-    // Fallback: n_rs_seq > 0 (speculative rollback path) — needs gather+concat
+    // Fallback: n_rs_seq > 0 (speculative rollback path) — needs gather+concat.
+    // The gather has no fresh_mask, so zero the fresh cells' rows explicitly
+    // (rs_z is no longer zeroed in this mode).
+    build_rs_store_zero(inp, conv_states_all, hparams.n_embd_r(), n_seqs, /*keep=*/false);
+
     const auto kv_head  = mctx_cur->get_head();
     const auto mem_size = mctx_cur->get_size();
 

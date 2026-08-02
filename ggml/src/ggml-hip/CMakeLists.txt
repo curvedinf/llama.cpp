@@ -160,3 +160,13 @@ endif()
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
 
 target_compile_options(ggml-hip PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:-ffast-math;-fno-finite-math-only>")
+
+# ssm-conv.cu: the plain and indexed conv kernels must be bit-exact for the
+# same inputs (the n_rs_seq>0 fallback path uses the plain kernel, the
+# reference uses the indexed one). -ffast-math enables FMA contraction and
+# FP reassociation, and the compiler schedules those differently per kernel -
+# 1-2 ulp differences in the conv output corrupt the MTP draft verification.
+# Pin the accumulation to the explicit left-associative mul+add chain
+# (appended after -ffast-math so they win).
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda/ssm-conv.cu
+    PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-associative-math")

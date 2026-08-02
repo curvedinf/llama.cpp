@@ -384,6 +384,10 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
     res &= direct == mctx->get_direct();
+    // the fresh-row set is baked into the graph (fresh_mask op params and the
+    // store-zeroing views); reuse with a different set skips/zeroes the wrong
+    // rows
+    res &= fresh_rows == mctx->get_fresh_rows();
 
     if (!res && debug > 0) {
         LLAMA_LOG_DEBUG("%s: rs mismatch: n_rs %lld/%u n_seqs %lld/%u extra %lld/%u head %u/%u rs_z %d/%d direct %d/%d\n",
@@ -1046,6 +1050,25 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
                 fprintf(stderr, "%s%d", i ? "," : "", fr[i]);
             }
             fprintf(stderr, "]");
+            // hash the full carried state row (r tensor, layer 0) read by this batch
+            {
+                ggml_tensor * r0 = mctx->get_recr()->get_r_l(0);
+                if (r0 && inp_rs->s_copy_main->ne[0] > 0) {
+                    const int32_t prow = data[0];
+                    if (prow >= 0 && prow < r0->ne[1]) {
+                        const size_t row_size = ggml_row_size(r0->type, r0->ne[0]);
+                        const size_t n_u32    = (row_size + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+                        std::vector<uint32_t> buf(n_u32);
+                        ggml_backend_tensor_get(r0, buf.data(), (size_t) prow * row_size, row_size);
+                        uint64_t h = 1469598103934665603ull;
+                        for (size_t j = 0; j < row_size / sizeof(uint32_t); ++j) {
+                            h ^= buf[j];
+                            h *= 1099511628211ull;
+                        }
+                        fprintf(stderr, " r0row%d=%016llx", prow, (unsigned long long) h);
+                    }
+                }
+            }
             // tag the batch's seq ids (first token per seq) to map positions to prompts
             if (ubatch != nullptr && ubatch->n_seqs > 0) {
                 fprintf(stderr, " seqids=[");

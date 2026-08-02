@@ -1472,7 +1472,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // sub-ubatch. Reading the store while the previous graph is still in flight
     // races the GPU, so synchronize first; these hashes are a reliable per-step
     // state fingerprint (the unsynchronized RS_STEP row probes are not).
-    if (getenv("LLAMA_RS_DEBUG") != nullptr && mctx != nullptr && llama_model_is_hybrid(&model)) {
+    if (getenv("LLAMA_RS_DEBUG") != nullptr && mctx != nullptr && llama_model_is_hybrid(&model) && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         ggml_backend_sched_synchronize(slot->sched.get());
 
         const auto * mem_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
@@ -1481,6 +1481,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         fprintf(stderr, "RSPROBE: n_t=%u n_seqs=%u seqs=[", ubatch.n_seq_tokens, ubatch.n_seqs);
         for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
             fprintf(stderr, "%s%d", s ? "," : "", ubatch.seq_id[s*ubatch.n_seq_tokens][0]);
+        }
+        fprintf(stderr, "] toks=[");
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            fprintf(stderr, "%s%d@%lld", i ? "," : "", (int) ubatch.token[i], (long long) ubatch.pos[i]);
         }
         fprintf(stderr, "]");
 

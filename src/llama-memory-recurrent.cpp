@@ -998,22 +998,20 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 }
                 rs_z = min; // unused by the K == 1 path
             } else {
-                // K > 1 (speculative rollback): keep the shared zero row for fresh cells.
+                // K > 1 (speculative rollback): fresh cells read their own rows,
+                // zeroed before the op like the K == 1 path. A shared rs_z row
+                // collides with a carried cell's state when every cell is
+                // referenced (refcount fallback to min): the graph's rs_z
+                // zeroing then destroys the carried state before the indexed
+                // GDN kernel reads the store - the n_rs_seq > 0 divergence.
+                // rs_z is unused in this mode; with rs_z = -1 the graph
+                // zeroing (build_rs / build_rs_store_zero keep) is a no-op.
                 rs_z = -1;
-                for (int i = min; i <= max_batch; ++i) {
-                    if (refcounts[i] == 0) {
-                        rs_z = i;
-                        break;
-                    }
-                }
-                if (rs_z < 0) {
-                    rs_z = min;
-                }
-                fresh_rows.clear();
+                fresh_rows.assign(n_seqs, -1);
                 for (int i = min; i <= max_batch; ++i) {
                     if (cells[i].src < 0) {
-                        GGML_ASSERT(rs_z >= 0);
-                        cells[i].src0 = rs_z;
+                        cells[i].src0 = i;
+                        fresh_rows[i - min] = i;
                     } else {
                         cells[i].src0 = cells[i].src;
                     }
@@ -1027,7 +1025,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // when the graph is later reused for a different fresh-row set (e.g. a new
             // request taking a different free row) the stale baked views zero the wrong
             // rows, leaving the fresh sequence to read a previous occupant's state.
-            if (n_rs_seq == 0) {
+            // Both K == 1 and K > 1 need this (the K > 1 fresh rows are the cells'
+            // own rows, which the gather-based conv path otherwise leaks).
+            {
                 for (int32_t row : fresh_rows) {
                     if (row < 0) {
                         continue;
@@ -1618,11 +1618,21 @@ bool llama_memory_recurrent_context::get_direct() const {
     // in-place state write-back is only valid when every sequence in the batch reads
     // and writes the same state row (steady state, no empty states, no shared rows)
     if (is_full || mem->n_rs_seq != 0) {
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "RS_DIRECT_SKIP: is_full=%d n_rs_seq=%u n=%u head=%u\n",
+                (int) is_full, mem->n_rs_seq, mem->n, mem->head);
+        }
         return false;
     }
 
     for (uint32_t i = 0; i < mem->n; ++i) {
         if (mem->cells[mem->head + i].src0 != (int32_t)(mem->head + i)) {
+            if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                fprintf(stderr, "RS_DIRECT: head=%u n=%u cell%d{pos=%d,src=%d,src0=%d} want_src0=%d\n",
+                    mem->head, mem->n, (int) i, mem->cells[mem->head + i].pos,
+                    mem->cells[mem->head + i].src, mem->cells[mem->head + i].src0,
+                    (int32_t)(mem->head + i));
+            }
             return false;
         }
     }

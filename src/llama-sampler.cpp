@@ -820,6 +820,29 @@ llama_token llama_sampler_sample(struct llama_sampler * smpl, struct llama_conte
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
+    if (getenv("LLAMA_LOGIT_DUMP") != nullptr) {
+        const float * raw = llama_get_logits_ith(ctx, idx);
+        if (raw != nullptr) {
+            int best[3] = { 0, 1, 2 };
+            for (int i = 3; i < n_vocab; ++i) {
+                for (int b = 0; b < 3; ++b) {
+                    if (raw[i] > raw[best[b]]) {
+                        for (int b2 = 2; b2 > b; --b2) {
+                            best[b2] = best[b2 - 1];
+                        }
+                        best[b] = i;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "LOGIT_DUMP idx=%d:", idx);
+            for (int b = 0; b < 3; ++b) {
+                fprintf(stderr, " %d=%.6f", best[b], raw[best[b]]);
+            }
+            fprintf(stderr, "\n");
+        }
+    }
+
     // use pre-allocated buffer from chain if available, otherwise allocate locally
     std::vector<llama_token_data> * cur_ptr;
     std::vector<llama_token_data> cur_local;

@@ -403,18 +403,34 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     if (getenv("LLAMA_SETROWS_TRACE") != nullptr) {
-        fprintf(stderr, "SETROWS: dst=%s ne={%ld,%ld,%ld,%ld} data=%p | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p idxs=[",
+        fprintf(stderr, "SETROWS: dst=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p voffs=%zu buf=%s base=%p size=%zu | src0=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p voffs=%zu buf=%s base=%p size=%zu | src1=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p",
             dst->name,
-            (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data,
+            (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], dst->data, dst->view_offs,
+            dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "none",
+            dst->buffer ? ggml_backend_buffer_get_base(dst->buffer) : nullptr,
+            dst->buffer ? ggml_backend_buffer_get_size(dst->buffer) : 0,
             src0->name,
             (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
-            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data,
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], src0->data, src0->view_offs,
+            src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "none",
+            src0->buffer ? ggml_backend_buffer_get_base(src0->buffer) : nullptr,
+            src0->buffer ? ggml_backend_buffer_get_size(src0->buffer) : 0,
             src1->name,
-            (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data);
-        const int32_t * idx_p = (const int32_t *) src1->data;
+            (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3], src1->data);
+        // read both contiguously and via the tensor's own strides; a strided-view src1
+        // would fool a flat read into showing phantom values
+        const int64_t * idx_p64 = (const int64_t *) src1->data;
         int64_t n_print = std::min(src1->ne[0], (int64_t) 32);
+        fprintf(stderr, " idxs=[");
         for (int64_t i = 0; i < n_print; ++i) {
-            fprintf(stderr, "%s%d", i ? "," : "", idx_p[i]);
+            fprintf(stderr, "%s%lld", i ? "," : "", (long long) idx_p64[i]);
+        }
+        fprintf(stderr, "] strided=[");
+        for (int64_t i = 0; i < n_print; ++i) {
+            const int64_t * p = (const int64_t *) ((const char *) src1->data + i*src1->nb[0]);
+            fprintf(stderr, "%s%lld", i ? "," : "", (long long) *p);
         }
         fprintf(stderr, "]\n");
     }
@@ -434,4 +450,35 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
+
+    if (getenv("LLAMA_KVDUMP") != nullptr && (strstr(dst->name, "cache_k_l3 ") != nullptr || strstr(dst->name, "cache_v_l3 ") != nullptr)) {
+        // dump the first q8 block's scale (d) of the first 8 written cells, layer 0
+        const int64_t * idx_p64 = src1->type == GGML_TYPE_I64 ? (const int64_t *) src1->data : nullptr;
+        const int32_t * idx_p32 = src1->type == GGML_TYPE_I32 ? (const int32_t *) src1->data : nullptr;
+        const int64_t n_cells = std::min<int64_t>(src1->ne[0], 8);
+        if (dst->type == GGML_TYPE_Q8_0 && (src1->type == GGML_TYPE_I32 || src1->type == GGML_TYPE_I64) && n_cells > 0 && dst->nb[1] > 0) {
+            const size_t cell_stride = dst->nb[1];
+            int64_t max_cell = 0;
+            for (int64_t i = 0; i < n_cells; ++i) {
+                max_cell = std::max(max_cell, idx_p64 ? idx_p64[i] : (int64_t) idx_p32[i]);
+            }
+            std::vector<uint8_t> tmp((size_t) (max_cell + 1) * cell_stride);
+            cudaMemcpyAsync(tmp.data(), (const char *) dst->data, tmp.size(), cudaMemcpyDeviceToHost, ctx.stream());
+            cudaStreamSynchronize(ctx.stream());
+            fprintf(stderr, "KVDUMP: %s cells=[", dst->name);
+            for (int64_t i = 0; i < n_cells; ++i) {
+                const int64_t cell = idx_p64 ? idx_p64[i] : (int64_t) idx_p32[i];
+                const size_t off = (size_t) cell * cell_stride;
+                float d = 0.0f;
+                if (off + 2 <= tmp.size()) {
+                    uint16_t d_raw;
+                    memcpy(&d_raw, tmp.data() + off, 2);
+                    d = ggml_fp16_to_fp32(d_raw);
+                }
+                fprintf(stderr, "%s%lld=%.6g", i ? "," : "", (long long) cell, (double) d);
+            }
+            fprintf(stderr, "]\n");
+        }
+    }
+
 }

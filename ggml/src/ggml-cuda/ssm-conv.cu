@@ -34,23 +34,31 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     for (size_t j = 0; j < d_conv; j++) {
         w[j] = w_block[tid * stride_w + j];
     }
+#pragma unroll
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        x[j] = x_block[tid * stride_x + j];
+    }
+    x[d_conv - 1] = x_block[tid * stride_x + d_conv - 1];
 
     float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
 
     for (int64_t i = 0; i < n_t; i++) {
-        float sumf = 0.0f;
-
-        if (i == 0) {
-            for (size_t j = 0; j < d_conv; j++) {
-                x[j] = x_block[tid * stride_x + j];
+        if (i > 0) {
+#pragma unroll
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                x[j] = x[j + 1];
             }
-        } else {
-            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
+            x[d_conv - 1] = x_block[tid * stride_x + i + d_conv - 1];
         }
 
+        // identical accumulation to ssm_conv_idx_f32 (same window layout and
+        // explicit non-contracted mul-add chain) so the two kernels are
+        // bit-exact for the same inputs
+#pragma clang fp_contract(off)
+        float sumf = 0.0f;
 #pragma unroll
         for (size_t j = 0; j < d_conv; j++) {
-            sumf += x[(i + j) % d_conv] * w[j];
+            sumf += x[j] * w[j];
         }
         sumf += b;
         y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
@@ -205,6 +213,7 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
             x[d_conv - 1] = x_row[i];
         }
 
+#pragma clang fp_contract(off)
         float sumf = 0.0f;
 #pragma unroll
         for (size_t j = 0; j < d_conv; j++) {
@@ -334,6 +343,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
                                          src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
         }
+
         return;
     }
 

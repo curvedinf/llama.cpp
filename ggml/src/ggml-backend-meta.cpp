@@ -2654,7 +2654,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 expected = orig->src[s];
                             }
                         }
+                        if (getenv("LLAMA_META_TRACE") != nullptr && expected == nullptr && cached->src[s] != nullptr) {
+                            fprintf(stderr, "SRC_NULL_ORIG: j=%zu i=%zu k2=%zu node=%s p=%p src%d orig_src=%p | cached_src=%p buf=%s data=%p ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu}\n",
+                                j, i, k2, orig->name, (void *) orig, s, (void *) orig->src[s], (void *) cached->src[s],
+                                orig->buffer ? ggml_backend_buffer_name(orig->buffer) : "-", (void *) orig->data,
+                                (long) orig->ne[0], (long) orig->ne[1], (long) orig->ne[2], (long) orig->ne[3],
+                                orig->nb[0], orig->nb[1], orig->nb[2], orig->nb[3]);
+                        }
                         if (cached->src[s] != expected) {
+                            if (expected == nullptr && cached->src[s] != nullptr) {
+                                // the original graph node is corrupted/recycled (its
+                                // src is gone - observed as garbage fields from an
+                                // arena out-of-bounds write), but the cached subgraph
+                                // still holds a valid object. Keep it: overwriting
+                                // with NULL made ggml_cuda_cpy dereference a null src1.
+                                if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                    fprintf(stderr, "SRC_KEEP: j=%zu i=%zu k2=%zu node=%s src%d cached=%p\n",
+                                        j, i, k2, orig->name, s, (void *) cached->src[s]);
+                                }
+                                continue;
+                            }
                             if (getenv("LLAMA_META_TRACE") != nullptr) {
                                 fprintf(stderr, "SRC_REPLACE: j=%zu i=%zu k2=%zu node=%s src%d cached=%p expected=%p\n",
                                     j, i, k2, orig->name, s, (void *) cached->src[s], (void *) expected);

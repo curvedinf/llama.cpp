@@ -2065,6 +2065,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_CPY:
+            if (getenv("LLAMA_CPY_TRACE") != nullptr) {
+                fprintf(stderr, "CPY_NODE: node=%p src0=%p src1=%p\n",
+                    (const void *) dst, (const void *) dst->src[0], (const void *) dst->src[1]);
+            }
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
             break;
         case GGML_OP_CONT:

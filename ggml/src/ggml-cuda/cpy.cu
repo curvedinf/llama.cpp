@@ -445,6 +445,12 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
     g_cpy_probe = getenv("LLAMA_CPY_TRACE") != nullptr ? 1 : 0;
     const char * cpydbg = getenv("LLAMA_CPY_TRACE");
+    if (cpydbg != nullptr) {
+        // pointer-only entry probe (never dereferences): a wild src0/src1 here is
+        // the stale-src SIGSEGV under concurrent MTP - the last line before the
+        // crash identifies the offending call
+        fprintf(stderr, "CPY_ENTRY: src0=%p src1=%p\n", (const void *) src0, (const void *) src1);
+    }
     if (cpydbg != nullptr && strstr(src1->name, "cache_") != nullptr) {
         fprintf(stderr, "CPY: src=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p nbytes=%zu | dst=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p nbytes=%zu\n",
             src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],

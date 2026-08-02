@@ -2925,3 +2925,40 @@ alloc; rerun the catch and match the register addresses against the map. The +0x
 offset likely identifies a layer/kv-unified slice boundary (the kv-unified pools are
 layer-sliced) - the stale pointer may be a VIEW_OFFS-miscalculated per-GPU copy
 (same family as the state-view strided copies) rather than a kernel index bug.
+
+## TP4 C8 crash: launch-machinery corruption confirmed (2026-08-02, continued)
+
+New evidence (rocgdb catch with SETROWS trace + META_BUFS buffer map + device memory reads):
+- The meta per-device buffers: weights buft (579 MB/GPU) + compute/KV buft (478 MB/GPU,
+  142.6 MB of which is the kv-unified pool; the per-layer K/V views stride 272 B/cell,
+  4,456,448 B/head).
+- SETROWS trace now prints nb + view_offs + buffer base/size: the l3/l7/.../l39 K writes
+  show the pool layout; all traced tensor pointers and strides are self-consistent.
+- The recurring HOST crash (thread 1, same ASLR'd offset 0x7ff03xxxx1d0 every run) has a
+  backtrace now: #0 in the ROCm runtime "??", #1 ggml_cuda_op_set_rows (set-rows.cu:416,
+  the k_set_rows_quant launch region), #2+ the normal compute path with
+  use_cuda_graph=false. So the HOST-side crash happens INSIDE the set_rows launch call -
+  the HIP runtime faults while launching k_set_rows_quant, i.e. the launch machinery
+  (arg block / runtime state) is itself corrupted, matching the device-side evidence
+  (first scalar args garbage: ne_total=0x3c010204, 0xf0f0f0f0 uninitialized pattern,
+  dst computed at pool+0xa7e0 which no valid arg set explains).
+- The device memory read of the (stale-address) leaf copy showed zeros - inconclusive
+  (the read addresses were from the previous run's allocation).
+
+Interpretation: the corruption targets the kernel-launch path (host-side arg block +
+runtime state) and manifests run-varying: device IMA in set_rows_quant/conv/SCALE/mmq
+(whichever reader hits the corrupted memory), host SIGSEGV in the runtime during the
+launch, rocBLAS Tensile lazy-init crash, wedged device. A host-side OOB write (e.g. the
+meta's multi-segment state scatter / per-GPU copy bookkeeping with a wrong size) is the
+prime suspect - it would corrupt the runtime's heap/arg blocks directly.
+
+Next slice:
+1. Identify the runtime function at the crash PC: catch with "info sharedlibrary" +
+   "info proc mappings" + "disassemble" around 0x7ff03xxxx1d0, and map the offset to
+   libamdhip64/libhsa-runtime64 (addr2line with the lib base).
+2. Audit the host-side copy sizes in the meta set/get_tensor paths (the multi-segment
+   scatter at ggml-backend-meta.cpp:1421-1539 in particular) for an OOB memcpy - the
+   state-store scatter (nr>1 segments) is the only host->device copy with custom slab
+   math.
+3. The C=4 first-burst crash is the simplest repro (no verify phase) - use it for the
+   runtime-function identification.

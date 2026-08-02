@@ -2962,3 +2962,45 @@ Next slice:
    math.
 3. The C=4 first-burst crash is the simplest repro (no verify phase) - use it for the
    runtime-function identification.
+
+## TP4 C8 crash: first-burst-always class; shape-dependence gone (2026-08-02, continued)
+
+This session's experiments:
+- LLAMA_META_ALWAYS_REBUILD=1 (per-uid copies re-created every compute): crash persists
+  -> NOT the cached-copy data staleness.
+- 7-token short prompts at C=8 (56-token first ubatch): CRASHES on the current build
+  (the historical "56-tok PASSES" boundary does not hold) -> NOT ubatch-size-dependent
+  on the current build; the class is "the first concurrent burst" (~always).
+- rocgdb catch (device trap run): the trap = k_set_rows_quant block (0,0,0) at the
+  FIRST prefill ubatch of the 8 concurrent slots (t=1.25s, right at the slots launch);
+  the loads are at the traced src0 + {0..128} - in bounds for a 160-token qkv slice.
+  Combined with the run-3 register forensics (dst at pool + cell158*272 = the CORRECT
+  cell offset - my earlier "+0xa7e0 mismatch" was comparing against the wrong SETROWS
+  line; the device executes with correct args), the trap fires on an in-bounds address
+  whose buffer mapping is gone - a use-after-free of the src0's per-GPU buffer.
+- si_addr of the recurring host SIGSEGV = the PC itself (0x7ff0363ff1d0, same relative
+  offset every run, inside the ROCm runtime during the set_rows launch - the runtime
+  code page executes but faults; "info proc mappings" unsupported under rocgdb batch).
+- The server runs --no-warmup: the burst is the FIRST compute of every kernel/stream/
+  graph. Single sequential requests work (the log's earlier validation), the first
+  concurrent burst dies.
+
+Remaining hypotheses ranked:
+1. The sched buffer GROWTH frees the old allocation while the cached per-GPU subgraph
+   nodes still reference its addresses (the first burst exercises the biggest graphs
+   first - the buffer grows mid-burst; the ALWAYS_REBUILD test re-creates the copies
+   but the copies' data derives from the CURRENT tensor->data, which is the NEW buffer
+   - should have fixed it, so this is weakened).
+2. First-launch class: the first concurrent burst = the first use of the concurrent
+   decode path under the kv-unified 2-stream cells - the cell [c,0,c+1,0,...] mapping
+   (stream B cells all 0) - a wrong-cell write corrupting the pool adjacency.
+3. The HIP runtime's first-launch path (code object / arg buffer) corrupted by a
+   host-side OOB in the meta's per-GPU-copy bookkeeping under the first concurrent
+   graphs.
+
+Next: the warmup disambiguation - run ONE sequential request (or drop --no-warmup)
+before the burst: if the burst then passes, the class is first-launch/first-graph
+ordering; if it still crashes, the class is the concurrent-cell allocation itself.
+Then: dump the per-GPU buffer map WITH the sched's growth history (META_BUFS print
+per alloc - the base changes show the growth), and check the kv-unified cell-0 stream
+mapping for the prefill.

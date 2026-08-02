@@ -3091,3 +3091,27 @@ deeper than a dispatch-time re-resolution (the broken object's address would pin
 container - next catch should dump the src1 object address from SETROWS_SRC1_BAD and
 match it against the meta's container arenas to identify WHICH container's recycling
 produces it).
+
+## Dispatch-time node/src replacement: ASAN burst PASSED once; normal still crashes (2026-08-02)
+
+The repair was rewritten to be pointer-compare-only (the first src-deref version
+crashed on the recycled cached node): per dispatch, every cached subgraph node is
+compared against the container's current copy of the original graph node (node
+replace), and every cached src against the expected copy of the original src (src
+replace). Results:
+- ASAN build + burst: FIRST PASSING BURST OF THE WHOLE HUNT - 8/8 ok (44s wall, the
+  ASAN slowness), with 6,884 SRC_REPLACEs logged. The stale srcs are SYSTEMATIC, not
+  rare: e.g. node=cache_k_l3 (view) src0 cached=<staging-object> expected=<uid/static
+  copy> on every dispatch - the build-time resolution returns the alloc-time STAGING
+  container objects, which are reset (recycled to zeroed/garbage tensors) at every
+  rebuild of ANY graph.
+- Normal build: still crashes (the IMA surfaced at a get_tensor readback) - one pass
+  on ASAN vs a crash on the normal is the run-varying timing; the dispatch-time
+  repair is necessary but not sufficient.
+
+ROOT identified: the build-time src resolution must not return the staging/current
+container objects. Next: exclude the current container from the resolution in
+init_tensor_impl (resolve only static + the graph's own uid container, creating the
+copy there when missing - the scoping's create path must be reworked to not corrupt
+the first compute, see the earlier regression entry). Then re-validate single +
+burst + perf.

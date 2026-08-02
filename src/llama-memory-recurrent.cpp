@@ -742,6 +742,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     for (uint32_t i = 0; i < size; ++i) {
         if (cells[i].seq_id.empty()) {
             cells[i].src = -1;
+            cells[i].src0 = -1;
         }
     }
 
@@ -831,6 +832,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
+                // the state row (src0) must travel with the cell: s_copy(i) reads
+                // src0 directly, so a stale leftover here made the gather read a
+                // foreign (or -1) row - the SIGBUS/IMA under concurrent MTP.
+                empty_cell.src0 = orig_cell.src0;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -1002,24 +1007,40 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 }
                 rs_z = min; // unused by the K == 1 path
             } else {
-                // K > 1 (speculative rollback): fresh cells read their own rows,
-                // zeroed before the op like the K == 1 path. A shared rs_z row
-                // collides with a carried cell's state when every cell is
-                // referenced (refcount fallback to min): the graph's rs_z
-                // zeroing then destroys the carried state before the indexed
-                // GDN kernel reads the store - the n_rs_seq > 0 divergence.
-                // rs_z is unused in this mode; with rs_z = -1 the graph
-                // zeroing (build_rs / build_rs_store_zero keep) is a no-op.
+                // K > 1 (speculative rollback): fresh cells get DISTINCT free rows
+                // (refcount == 0, like the K == 1 path), zeroed before the op. Using
+                // the cell index as the row collides with a carried cell's state row
+                // when compaction moves cells (a carried cell's src is extracted from
+                // its tail cell and can equal a fresh cell's index - observed as
+                // s_copy=[0,1,2,0,1] on merged 5-seq batches, corrupting every batch
+                // and crashing under concurrent MTP). A shared rs_z row collides with
+                // a carried cell's state when every cell is referenced (refcount
+                // fallback to min): the graph's rs_z zeroing then destroys the carried
+                // state before the indexed GDN kernel reads the store - the
+                // n_rs_seq > 0 divergence. rs_z is unused in this mode; with rs_z = -1
+                // the graph zeroing (build_rs / build_rs_store_zero keep) is a no-op.
                 rs_z = -1;
                 fresh_rows.assign(n_seqs, -1);
+                std::vector<int32_t> free_rows;
+                for (int i = 0; i < (int32_t) size; ++i) {
+                    if (refcounts[i] == 0) {
+                        free_rows.push_back(i);
+                    }
+                }
+                size_t fi = 0;
                 for (int i = min; i <= max_batch; ++i) {
                     if (cells[i].src < 0) {
-                        cells[i].src0 = i;
-                        fresh_rows[i - min] = i;
+                        GGML_ASSERT(fi < free_rows.size());
+                        cells[i].src0 = free_rows[fi++];
+                        fresh_rows[i - min] = cells[i].src0;
                     } else {
                         cells[i].src0 = cells[i].src;
                     }
-                    cells[i].src = i;
+                    // keep src pointing at the state row (src0), not the cell index:
+                    // compaction moves cells between batches, and the next batch
+                    // extracts src from the tail cell - a cell index would read a
+                    // foreign row (the K == 1 path already does this).
+                    cells[i].src = cells[i].src0;
                 }
             }
 

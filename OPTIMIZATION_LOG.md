@@ -3402,3 +3402,22 @@ Next: dump the state rows before/after the verify (the LLAMA_RS_DEBUG hashes are
 tool; they crashed once at startup - run them on the layer-split config where the
 startup crash did not occur) to compare the state-store rows across the verify vs
 the decode on the same position.
+
+## State-hash probe: verify post-state rows look correct; next-step read crashes (2026-08-02)
+
+Layer-split MTP + LLAMA_RS_DEBUG: the verify step's (n_t=2) post-state hashes are
+non-zero and internally consistent (r00/r01/r02, s00..s02 per layer; the unused
+slot-2 rows hash identically as zero across layers). The FOLLOWING step (n_t=1,
+ns=2 - the decode with the main+draft) crashes DURING the hash readback - the
+device memory is already corrupted by then. So the state-store rows after the
+verify are not obviously wrong; the corruption lands elsewhere (the verify's
+2-token compute: FA ncols=2 or the KV write/mask), and the next graph's read of
+the corrupted region crashes.
+
+Remaining targeted experiments: (1) compare the verify's layer-0 Qcur/Kcur/Vcur
+content vs the decode's for the same token (the qkv dump in build_layer_attn,
+env-gated); (2) the KV cells: the verify's 2nd token writes cell 0 - dump the KV
+pool cells after the verify vs after the decode (the cells' content - the 2nd
+token's KV in cell 0 may be the garbage the 2nd column attends, and if the mask
+column for the 1st token accidentally includes cell 0's position, the 1st token's
+attention is contaminated).

@@ -1811,6 +1811,11 @@ static void copy_tensor_async_ints(
 
         GGML_ASSERT(ggml_is_contiguous(tensor) && "sampled tokens tensor must be contiguous for async copy");
 
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "CPY_ASYNC_INT: %s dst=%p row=%u nbytes=%zu\n",
+                tensor->name, (void *) (sampled.data + row), row, (size_t) sizeof(sampled.data[row]));
+        }
+
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         ggml_backend_tensor_get_async(backend, tensor, sampled.data + row, 0, sizeof(sampled.data[row]));
     }
@@ -1840,6 +1845,10 @@ static void copy_tensor_async_floats(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         float * row_ptr = dst.data + (size_t) row * stride;
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "CPY_ASYNC_FLT: %s dst=%p row=%u stride=%zu nbytes=%zu\n",
+                tensor->name, (void *) row_ptr, row, stride, ggml_nbytes(tensor));
+        }
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
         // Update the actual number of logits/probabilities that were written for this row.
@@ -1871,6 +1880,10 @@ static void copy_tensor_async_candidates(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         llama_token * row_ptr = dst.data + (size_t) row * stride;
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "CPY_ASYNC_CAND: %s dst=%p row=%u stride=%zu nbytes=%zu\n",
+                tensor->name, (void *) row_ptr, row, stride, ggml_nbytes(tensor));
+        }
         ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
         // Update the actual number of candidates that were written.
@@ -2116,6 +2129,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
+            if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                fprintf(stderr, "CPY_ASYNC_LOGITS: %s dst=%p n_outputs=%u n_vocab=%u nbytes=%zu\n",
+                    t_logits->name, (void *) logits_out, n_outputs, n_vocab, (size_t) n_outputs*n_vocab*sizeof(float));
+            }
+
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
@@ -2243,6 +2261,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+
+                if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                    fprintf(stderr, "CPY_ASYNC_NEXTN: %s dst=%p n_rows=%lld n_embd=%u nbytes=%zu\n",
+                        t_h_nextn->name, (void *) embd_nextn_out, (long long) n_rows, n_embd,
+                        (size_t) n_rows*n_embd*sizeof(float));
+                }
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));

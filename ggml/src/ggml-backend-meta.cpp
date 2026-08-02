@@ -1395,6 +1395,27 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
     }
 
+    // T1 fix: zero-init freshly created per-GPU copies of graph INPUT tensors.
+    // The input uploads race the compute's reads on different streams, and a
+    // kernel can observe the mirror before its upload lands - uninitialized
+    // allocator content then surfaces as garbage row indices (observed as
+    // corrupted out_ids / s_copy / k_idxs -> HSA aperture faults). Zeroing makes
+    // any stale read in-bounds (row 0) instead of a wild pointer.
+    if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+        for (size_t j = 0; j < n_simple_bufs; j++) {
+            ggml_tensor * t_ij = simple_tensors[j];
+            if (t_ij->view_src != nullptr) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(t_ij);
+            if (nbytes == 0) {
+                continue;
+            }
+            std::vector<uint8_t> zeros(nbytes, 0);
+            ggml_backend_tensor_set(t_ij, zeros.data(), 0, nbytes);
+        }
+    }
+
     stc.simple_tensors[ggml_meta_tensor_key_of(tensor)] = simple_tensors;
 
     return GGML_STATUS_SUCCESS;
@@ -1549,8 +1570,10 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     ggml_backend_meta_buffer_init_tensor_impl(buf_ctx->stc_static, tensor);
                     simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 }
-                if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
-                    fprintf(stderr, "SETTENSOR_MIRROR: %s j=%zu simple=%p data=%p (%.6f)\n", tensor->name, j, (void *) simple_tensor,
+                if (getenv("LLAMA_META_TRACE") != nullptr) {
+                    fprintf(stderr, "SETTENSOR_MIRROR: %s ne={%lld,%lld,%lld,%lld} j=%zu simple=%p data=%p (%.6f)\n", tensor->name,
+                        (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+                        j, (void *) simple_tensor,
                         (void *) simple_tensor->data, simple_tensor->data != nullptr ? ((const float *) simple_tensor->data)[0] : 0.0f);
                 }
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);

@@ -2671,6 +2671,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "IN_KQMASK: %s buf=%p nbytes=%zu\n", dst->name, (void *) dst->data, ggml_nbytes(dst));
+    }
+
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 

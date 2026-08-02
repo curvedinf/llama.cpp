@@ -79,6 +79,10 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "IN_EMBD_TOK: %s buf=%p nbytes=%zu\n", tokens->name, (void *) tokens->data,
+                (size_t) n_tokens*ggml_element_size(tokens));
+        }
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
@@ -87,6 +91,10 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 
         const int64_t n_tokens = ubatch->n_tokens;
 
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "IN_EMBD_HID: %s buf=%p nbytes=%zu\n", embd->name, (void *) embd->data,
+                (size_t) n_tokens*n_embd*ggml_element_size(embd));
+        }
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
 }
@@ -213,6 +221,17 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
+    // T1 diagnostic: verify the fill matches the tensor extent; a stale tail
+    // (counted < n_outputs) or a wrong branch feeds garbage row ids into the
+    // MTP head's get_rows and walks off the hidden-state buffer.
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "OUTIDS: graph_n=%u ubatch_nt=%lld buf=%p data=[", n_outputs, (long long) n_tokens, (void *) data);
+        for (int i = 0; i < (int) n_outputs; ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+        }
+        fprintf(stderr, "]\n");
+    }
+
     if (n_outputs == n_tokens) {
         for (int i = 0; i < n_tokens; ++i) {
             data[i] = i;
@@ -229,6 +248,14 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
         if (ubatch->output[i]) {
             data[n_outputs++] = i;
         }
+    }
+
+    if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+        fprintf(stderr, "OUTIDS_FILLED: graph_n=%u counted=%d data=[", n_outputs, n_outputs);
+        for (int i = 0; i < (int) n_outputs; ++i) {
+            fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+        }
+        fprintf(stderr, "]\n");
     }
 }
 

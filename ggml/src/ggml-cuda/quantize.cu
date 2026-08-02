@@ -19,6 +19,13 @@ static __global__ void quantize_q8_1(
     const int64_t i2 = blockIdx.z - i3*ne2.z;
     const int64_t i1 = blockIdx.y;
 
+    // T1 diagnostic: shape print for the (ne0~393216, ne1=5) suspect shape seen
+    // in the faulting HSA dispatch grid=[1536,5,1]
+    if (i0 == 0 && i1 == 0 && i2 == 0 && i3 == 0 && ne1 == 5 && ne0 >= 262144) {
+        printf("Q81_FIVE: ne00=%lld s01=%lld s02=%lld s03=%lld ne0=%lld ne1=%u grid=(%u,%u,%u)\n",
+            ne00, s01, s02, s03, ne0, ne1, gridDim.x, gridDim.y, gridDim.z);
+    }
+
     const int64_t & i00 = i0;
     const int64_t & i01 = i1;
     const int64_t & i02 = i2;

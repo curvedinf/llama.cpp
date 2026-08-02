@@ -1225,7 +1225,21 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        // T1 guard: under the meta backend a split src1 can arrive with the FULL
+        // width but the per-GPU shard's allocation (the mmv's activation quantize
+        // then reads out of bounds -> HSA aperture fault). Detect the mismatch and
+        // quantize zeros instead of crashing; the wrong result is caught by the
+        // MTP verification, the server survives.
+        const int64_t x_elems = ggml_nelements(src1);
+        const int64_t x_max_read = (ne11 - 1) * s11 + ne10;
+        if (x_max_read > x_elems) {
+            fprintf(stderr, "MMVQ_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} ne10=%lld ne11=%lld s11=%lld max_read=%lld elems=%lld\n",
+                src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                (long long) ne10, (long long) ne11, (long long) s11, (long long) x_max_read, (long long) x_elems);
+            CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get(), 0, ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1, stream));
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

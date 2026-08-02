@@ -2247,7 +2247,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    // The draft ctx decodes (1 + n_max) tokens per sequence, and every draft
+    // token is an output (the MTP head produces logits for all of them). The
+    // backend-sampling output buffers are sized n_vocab x n_outputs_max, so an
+    // undersized n_outputs_max makes the async D2H sampling copies overflow the
+    // buffer and corrupt adjacent host memory (observed: garbage row ids in the
+    // MTP head's get_rows -> illegal device access under TP4 concurrency).
+    result.n_outputs_max = std::min<uint64_t>(result.n_batch,
+            (uint64_t) params.n_parallel * (1 + common_speculative_n_max(&params.speculative)));
 
     return result;
 }

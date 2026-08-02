@@ -135,6 +135,12 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
+            if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+                fprintf(stderr, "MMQ_Q: src1=%s ne={%lld,%lld,%lld,%lld} nb1=%zu data=%p ne10=%lld pad=%lld ne11=%lld ne12=%lld ne13=%lld nbytes=%zu\n",
+                    src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                    (size_t) src1->nb[1], (const void *) src1->data, (long long) ne10, (long long) ne10_padded,
+                    (long long) ne11, (long long) ne12, (long long) ne13, ggml_nbytes(src1));
+            }
             if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
@@ -201,6 +207,13 @@ void ggml_cuda_mul_mat_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
+
+        if (getenv("LLAMA_RS_DEBUG") != nullptr) {
+            fprintf(stderr, "MMQ_ID: src1=%s ne={%lld,%lld,%lld,%lld} nb1=%zu data=%p ne10=%lld pad=%lld ne11_flat=%lld n_expert_used=%lld ne12=%lld\n",
+                src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                (size_t) src1->nb[1], (const void *) src1->data, (long long) ne10, (long long) ne10_padded,
+                (long long) ne11_flat, (long long) n_expert_used, (long long) ne12);
+        }
 
         if (dedup_bcast) {
             // quantize each token once, scatter its block to all n_expert_used slots

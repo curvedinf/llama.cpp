@@ -340,6 +340,21 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             fprintf(stderr, "\n");
         }
 
+        // T1 guard: the kernel reads/writes state channels r*(nc-1)+c for r<nr
+        // and row sidx[bidx]. Under the meta backend a full-width nr can arrive
+        // with a sharded store (per-GPU ne[0] smaller) -> OOB. Detect and skip
+        // (zero the output) instead of faulting; the MTP verification catches
+        // the wrong result, the server survives.
+        if (nr * (nc - 1) > src2->ne[0] || n_s > src2->ne[1]) {
+            fprintf(stderr, "CONV_GUARD: nr=%ld n_t=%ld n_s=%ld nc=%ld store_ne={%ld,%ld} src2=%s buf=%s size=%zu\n",
+                (long) nr, (long) n_t, (long) n_s, (long) nc,
+                (long) src2->ne[0], (long) src2->ne[1], src2->name,
+                src2->buffer ? ggml_backend_buffer_name(src2->buffer) : "none",
+                src2->buffer ? ggml_backend_buffer_get_size(src2->buffer) : 0);
+            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(out), stream));
+            return;
+        }
+
         if (fuse_silu) {
             ssm_conv_idx_f32_cuda<true>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
                                         src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);

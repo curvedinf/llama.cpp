@@ -3719,3 +3719,25 @@ the staging arena itself must be per-graph (bigger change). The paged burst
 crash rate is ~60% (was ~75% at session start); no-paged baseline ~85% clean.
 
 Also fixed: SRC_NULL_HEX dump, CPY src[1] self-ref enforcement in SRC_REPLACE.
+
+## Concurrent MTP crash: current-uid resolution fix - crash rate 60% -> 15% (2026-08-02, this session, cont. 3)
+
+Root cause of the bulk class: same-shape graphs share tensor keys, and the meta
+backend's container lookup (get_simple_tensor_container) traversed ALL uid
+containers - it could resolve a tensor to ANOTHER graph's container whose
+objects are reset/evicted at any time. The cached sub-graphs then read recycled
+metadata (garbage node fields / null srcs / the ggml_cuda_cpy SIGSEGV+abort).
+
+Fix (cf09c840f):
+- get_simple_tensor_container: static -> current graph's uid (current_uid set
+  per graph_compute) -> other uids -> staging.
+- preinit_tensor: only THIS graph's uid container counts as initialized (other
+  uids no longer suppress re-creation into the current uid; same for srcs).
+
+1-GPU tensor-split MTP burst (np=5): crash rate ~60% -> ~15% (paged on,
+5/6 clean); no-paged baseline unchanged (~85% clean).
+
+Remaining class (~15%): binbcast (ADD) abort at a CUDA_CHECK (device IMA) -
+suspected async sched-buffer reuse or a residual container path. Next: probe
+the ADD node's src objects at dispatch like SRC_NULL_ORIG, or HIP_LAUNCH_BLOCKING
+to confirm the async component.

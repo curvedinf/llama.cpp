@@ -495,6 +495,11 @@ struct ggml_backend_meta_buffer_context {
                 return kv.second;
             }
         }
+        // staging fallback (see ggml_backend_meta_buffer_init_tensor): alloc-time
+        // copies land here and are re-created in the graph's uid container by the
+        // pre-init. Lookups must prefer static/uids; the staging objects are only
+        // valid until the next rebuild, so callers that keep references (the cached
+        // sub-graphs) must re-resolve through simple_tensor at dispatch time.
         if (getenv("LLAMA_META_TRACE") != nullptr && (strstr(tensor->name, "leaf_61") != nullptr || strstr(tensor->name, "leaf_63") != nullptr)) {
             fprintf(stderr, "STC_LOOKUP: %s p=%p -> CURRENT(staging)\n", tensor->name, (void *) tensor);
         }
@@ -2091,11 +2096,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // cached sub-graphs of the other graphs with dangling per-GPU tensors.
             auto it_stc = buf_ctx->stc_compute.find(cgraph->uid);
             if (it_stc == buf_ctx->stc_compute.end()) {
-                if (buf_ctx->stc_compute.size() >= 32) {
-                    // cap the container map: evict the oldest uid. Safe because every
-                    // graph's per-GPU tensors live in its own uid container - nothing
-                    // else references them - and the evicted graph rebuilds on its next
-                    // compute.
+                // cap the container map: evict the oldest uid. The evicted graph's
+                // cached sub-graphs still reference its per-GPU tensors (bcj.nodes /
+                // cgraph_main nodes are filled from them on the next dispatch), so
+                // evicting a graph that the llama graph cache still reuses makes the
+                // next dispatch resolve its tensors to NULL (and the CPY nodes then
+                // crash with a null src). The cap must stay above the graph cache
+                // size; LLAMA_META_STC_CAP overrides it.
+                const size_t stc_cap = buf_ctx->stc_compute.size() >= (size_t) atoi(getenv("LLAMA_META_STC_CAP") ? getenv("LLAMA_META_STC_CAP") : "256");
+                if (stc_cap) {
                     buf_ctx->stc_compute.erase(buf_ctx->stc_compute.begin());
                 }
                 // Fresh container sized for this graph's per-GPU tensor metadata (one
@@ -2114,11 +2123,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 stc.simple_tensors.clear();
             }
             // Discard the alloc-time staging copies; the pre-init re-creates the
-            // graph's tensors in its own uid container.
-            for (ggml_context_ptr & ctx : buf_ctx->stc_compute_current.ctxs) {
-                ggml_reset(ctx.get());
+            // graph's tensors in its own uid container. LLAMA_META_KEEP_STAGING
+            // disables the recycle: cached sub-graphs (bcj.nodes) can still
+            // reference staging objects when the uid lookup misses, and recycling
+            // then overwrites live node metadata (observed as garbage fields /
+            // null srcs in the CPY nodes under concurrent MTP).
+            if (getenv("LLAMA_META_KEEP_STAGING") == nullptr) {
+                for (ggml_context_ptr & ctx : buf_ctx->stc_compute_current.ctxs) {
+                    ggml_reset(ctx.get());
+                }
+                buf_ctx->stc_compute_current.simple_tensors.clear();
             }
-            buf_ctx->stc_compute_current.simple_tensors.clear();
         }
         size_t n_subgraphs  = 0;
         size_t max_tmp_size = 0;
@@ -2654,12 +2669,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 expected = orig->src[s];
                             }
                         }
+                        // CPY dst self-reference: the op's src[1] IS the output
+                        // tensor. The original's src[1] can be unresolved (recycled
+                        // arena / build order), but the copy's link must be itself -
+                        // ggml_cuda_cpy dereferences it as the dst.
+                        if (orig->op == GGML_OP_CPY && s == 1) {
+                            expected = cached;
+                        }
                         if (getenv("LLAMA_META_TRACE") != nullptr && expected == nullptr && cached->src[s] != nullptr) {
                             fprintf(stderr, "SRC_NULL_ORIG: j=%zu i=%zu k2=%zu node=%s p=%p src%d orig_src=%p | cached_src=%p buf=%s data=%p ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu}\n",
                                 j, i, k2, orig->name, (void *) orig, s, (void *) orig->src[s], (void *) cached->src[s],
                                 orig->buffer ? ggml_backend_buffer_name(orig->buffer) : "-", (void *) orig->data,
                                 (long) orig->ne[0], (long) orig->ne[1], (long) orig->ne[2], (long) orig->ne[3],
                                 orig->nb[0], orig->nb[1], orig->nb[2], orig->nb[3]);
+                            fprintf(stderr, "SRC_NULL_HEX: p=%p", (void *) orig);
+                            const uint8_t * ob = (const uint8_t *) orig;
+                            for (int hx = 0; hx < 96; hx += 8) {
+                                fprintf(stderr, " %016lx", *(const unsigned long *)(ob + hx));
+                            }
+                            fprintf(stderr, "\n");
                         }
                         if (cached->src[s] != expected) {
                             if (expected == nullptr && cached->src[s] != nullptr) {

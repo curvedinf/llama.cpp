@@ -3342,3 +3342,22 @@ question; the fix candidates remain (a) the kv-unified allocation for the draft
 stream's cells, (b) the acceptance criterion. Next: run with the SPC_TRC-level
 verbosity (-lv 5) on the layer-split config to capture the accepted count and the
 draft/verify tokens for the first step.
+
+## Verify teacher-forcing confirmed: verify's P(t+1) is the corrupted same-condition (2026-08-02)
+
+The acceptance = common_sampler_sample_and_accept_n: draft[i] vs the sampled id from
+the verify's logits[i], where the verify logits are TEACHER-FORCING: logits[0] =
+P(t+1|context) (the prediction of the batch's first token, NOT P(t+2|13) as I
+misread earlier). So the verify's logits[0] is the SAME condition as the plain
+decode's P(t+1), and the plain decode (1-GPU, no MTP) gives 11=20.47 while the
+verify gives 13=10.38 - the verify's 2-token batch forward is corrupted for the
+FIRST token, at the same condition. The acceptance then correctly compares the
+draft's t+1 against this (corrupted) P(t+1): the draft's garbage (13) matches the
+corrupted verify's top-1 (13) and is accepted - so fixing the verify's 2-token
+forward fixes both the acceptance and the output.
+
+The 2-token batch's per-op candidates: the per-seq ncols=2 FA node, the GDN nt=2
+state path (snapshot slots {1,0} vs {0}), or the verify batch's qkv. Next: force the
+verify's FA to per-token (ncols=1) nodes via an env gate in build_attn_mha and
+re-test the 1-GPU MTP single - if clean, the ncols=2 FA path is the bug (audit the
+V_DOT2 two-column KQ/mask/softmax handling); if still wrong, the GDN nt=2 or qkv.

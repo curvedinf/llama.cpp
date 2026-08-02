@@ -3472,3 +3472,19 @@ main's next cells, not the recycled cell 0.
 
 Next: fix find_slot for the 2-stream case (the draft's stream head / allocation),
 then re-validate the 1-GPU MTP single (expect bit-exact vs golden) and the burst.
+
+## Allocation vs set_input mismatch: find_slot gives [0,1], set_input produces [0,0] (2026-08-02)
+
+LLAMA_KV_FIND_TRACE + SETROWS in the SAME run: find_slot allocates the correct
+consecutive cells ([0,1], [0,1,2,3,4,5], [6..9], [10]) but the SETROWS idxs (the
+k_idxs leaf content, produced by set_input_k_idxs from the same sinfo) are
+[0,0], [0,0,1,0,2,0], [6,0,7,0], [10] - every ODD position is 0 instead of the
+allocated cell. So the allocation is fine; the k_idxs DATA differs from sinfo.idxs.
+set_input_k_idxs writes data[s*size+i] = offs + sinfo.idxs[s][i] (n_stream=1 ->
+s=0 only): the odd positions' zeros mean the sinfo used at set_input time differs
+from the find_slot's, OR the k_idxs leaf is written twice (the 2nd write using a
+different/empty sinfo), OR the MTP path passes a different ubatch's sinfo. Next:
+instrument set_input_k_idxs to print the sinfo.idxs it writes (the s/i loop + the
+idxs values) and compare against the find_slot trace for the same ubatch; and check
+the MTP/verify ubatch's prepare() call path (whether the k_idxs is refreshed for
+the verify batch or reused from the decode's).

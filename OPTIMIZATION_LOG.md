@@ -3050,3 +3050,30 @@ single request correct, burst class isolated as the next target).
 Next: the burst class on the pre-scoping baseline - the rocgdb catch to see whether
 the trap is the same set_rows_quant (i.e. the class is NOT the scoping's cross-uid
 src-links but something the scoping only shifted), then hunt it from the clean base.
+
+## Burst class: ASAN build exposes the concrete signature - ZEROED src1 at dispatch (2026-08-02)
+
+Built build-asan (HIP gfx908 + -fsanitize=address on all host code; linked OK) and ran
+the C=8 burst. The ASAN run hit a HOST assert instead of the usual IMA, and the
+SETROWS_SRC1_BAD print caught the smoking gun:
+
+  SETROWS_SRC1_BAD: dst=cache_k_l3 (view) ne={256,16384,1,1} data=... 
+  | src1= type=0 ne={0,0,0,0} nb={0,0,0,0} data=(nil) buf=none
+
+The KV-write op's src1 (the k-idxs leaf) at dispatch = a ZEROED ggml_tensor object
+(empty name, type 0 = F32 default, zero ne, NULL data, NULL buffer). This is the
+"valid args" mystery solved: the host trace prints the CURRENT tensors while the
+DEVICE executes with a NULL/garbage idxs pointer, and the runtime's launch path
+crashes on the NULL-arg handling (the recurring host SIGSEGV at set-rows.cu:416).
+The dispatch-time audits never saw it: STALE_SRC/PTRCHECK skip srcs with NULL data.
+
+Interpretation: the cached per-GPU subgraph's src link dangles into a reset container
+arena (the alloc-time/staging container is reset at every rebuild of any graph; the
+global lookup returns its recycled objects). ASAN found no host-side OOB write - the
+corruption is object-lifetime, not memory writes.
+
+Next: fix the src-link lifetime (make the dispatch refresh/validate node srcs - flag
+or re-resolve srcs whose object is zeroed/not in a live container), and re-run the
+single-request + burst validation. The scoping's "never leave the original tensor as
+the src" was aimed at this class but its create-on-demand path regressed the first
+compute - the fix must resolve WITHOUT creating broken copies.

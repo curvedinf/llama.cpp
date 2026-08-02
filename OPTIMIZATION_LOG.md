@@ -3304,3 +3304,25 @@ Next: bisect by forcing the verify FA to per-token (ncols=1) nodes for the 2-tok
 batch - if correct, the ncols=2 two-column path is the bug (audit the V_DOT2
 half2 masking/KQ handling for the column-1's garbage-KV contaminating column-0's
 softmax/normalization); if still wrong, the verify's qkv/mask is the bug.
+
+## MTP acceptance-flow audit (2026-08-02)
+
+The draft-mtp flow: the draft decodes the deferred boundary pair (token[P+1],
+g_embd[P]) + chained (token, prenorm) pairs in ctx_dft; the verify runs the target
+(process()) on the verify batch [draft-t+1, draft-t+2]; accept() picks the g_embd row
+from verify_g. The verify's logits[i] are the target's predictions AFTER position i
+(P(t+i+2|...)), so the acceptance of the draft's token i compares against the logits
+of the PREVIOUS position. The output's first token being the garbage draft token
+suggests the acceptance is accepting the draft's garbage (the draft's attention is
+degenerate - its KV cells are all 0 in the unified idxs) and/or the output selection
+is shifted by one position. The verify-only (n-max=0) is correct, so the verify's
+own compute is fine; the corruption enters exactly with the draft's own decode.
+
+Next: trace the acceptance decision (SPC_TRC / the speculative debug) for the first
+verify - the draft tokens vs the verify logits vs the accepted count - on the
+layer-split config; and check the draft's KV cells: the draft ctx's kv-unified
+allocation giving all draft tokens cell 0 means the draft's attention attends a
+single rolling cell - the draft's garbage is EXPECTED there, but the acceptance must
+reject it (the verify's P(t+1) is correct). If the acceptance accepts garbage, the
+fix is in the acceptance criterion; if the draft's cell-0 KV is unintended, the fix
+is in the kv-unified allocation for the draft stream.

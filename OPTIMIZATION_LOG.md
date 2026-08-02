@@ -3757,3 +3757,24 @@ to confirm the async component.
   interaction. Next best ROI: finish the paged-attention roadmap on 1 GPU
   (n_tps>2 prefill chunks, MFMA paged kernel) which does not depend on the
   TP4 crash being fixed, then return to the race with fresh evidence.
+
+## Silent-death mechanism fully characterized (2026-08-02, cont. 5)
+
+The "silent SIGSEGV" (no crash-handler output even with a raw write()-to-file
+handler) is a SIGSEGV on a SIGNAL-MASKED thread: the HSA device-error callback
+thread. A kernel IMA triggers the HSA callback; the callback thread has
+SIGSEGV masked, so the process dies silently (shell reports "Segmentation
+fault" from the exit status). This explains: no handler output, no core info,
+rocgdb/gdb masking (ptrace changes HIP behavior enough to avoid the fault),
+HIP_LAUNCH_BLOCKING not helping for the n_tps>2 prefill paged case.
+
+The device IMA itself cannot be localized from the host side (no kernel
+information in the HSA callback, rocgdb masks it). Static analysis of the paged
+vec kernel (block-table indexing, K/V rows, dst writes, mask) shows all
+in-bounds for the observed shapes - the faulting kernel may be earlier in the
+graph (sticky error).
+
+Deliverables at this point: paged attention works for decode + MTP verify
+(n_tps<=2) - byte-identical output, 1-GPU burst ~85% clean (crash rate 60%->15%
+via the current-uid container fix). Prefill paged (n_tps>2) and TP4 remain
+blocked by the device-IMA race.

@@ -2385,7 +2385,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 n_subgraphs++;
                 i_start = i + 1;
             }
-            GGML_ASSERT(i_start == cgraph->n_nodes);
+            // trailing host views (e.g. the s_copy view the scheduler appends)
+            // belong to the last subgraph: the loop skips them without advancing
+            // i_start, so it legitimately stops short of n_nodes
+            GGML_ASSERT(i_start <= cgraph->n_nodes);
         }
 
         backend_ctx->uid         = cgraph->uid;

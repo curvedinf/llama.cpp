@@ -17,12 +17,14 @@
 #include <exception>
 #include <signal.h>
 #include <execinfo.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static void crash_handler(int sig) {
-    fprintf(stderr, "CRASH: signal %d (%s)\n", sig, strsignal(sig));
-    void * bt[32];
-    int n = backtrace(bt, 32);
-    backtrace_symbols_fd(bt, n, STDERR_FILENO);
+    // raw write only, no backtrace: a stack-overflow fault leaves no room for
+    // backtrace() and it would die silently - the write still goes out
+    const char msg[] = "CRASH: signal caught\n";
+    int fd = open("/tmp/crash_marker", O_WRONLY|O_CREAT|O_APPEND, 0644); if (fd >= 0) { write(fd, msg, sizeof(msg)-1); close(fd); }
     _exit(1);
 }
 #include <thread> // for std::thread::hardware_concurrency

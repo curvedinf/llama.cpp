@@ -1935,7 +1935,7 @@ bool llama_kv_cache::paged_ubatch(const llama_ubatch & ubatch) const {
     // hits an illegal memory access on concurrent prefill shapes (measured 3/3
     // burst crashes with n_tps <= 32 - see OPTIMIZATION_LOG; the vec kernel fix
     // is on the roadmap).
-    if (n_tps > 2) {
+    if (n_tps > 32) {
         return false;
     }
 

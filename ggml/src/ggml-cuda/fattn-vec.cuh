@@ -900,6 +900,16 @@ static void launch_fattn_vec_paged(
     const dim3 block_dim(WARP_SIZE, nwarps, 1);
     const dim3 blocks_num(ntiles_x, parallel_blocks, Q->ne[2]*Q->ne[3]);
 
+    if (getenv("LLAMA_FA_TRACE") != nullptr) {
+        fprintf(stderr, "FA_PAGED: Q ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | K ne={%ld,%ld,%ld,%ld} data=%p | bt ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p | mask ne0=%ld | grid={%d,%d,%d} n_kv_log=%d dst_nbytes=%zu\n",
+            (long) Q->ne[0], (long) Q->ne[1], (long) Q->ne[2], (long) Q->ne[3],
+            Q->nb[0], Q->nb[1], Q->nb[2], Q->nb[3], (const void *) Q->data,
+            (long) K->ne[0], (long) K->ne[1], (long) K->ne[2], (long) K->ne[3], (const void *) K->data,
+            (long) dst->src[5]->ne[0], (long) dst->src[5]->ne[1], (long) dst->src[5]->ne[2], (long) dst->src[5]->ne[3],
+            dst->src[5]->nb[0], dst->src[5]->nb[1], dst->src[5]->nb[2], dst->src[5]->nb[3], (const void *) dst->src[5]->data,
+            (long) mask->ne[0], blocks_num.x, blocks_num.y, blocks_num.z, n_kv_log, (size_t) ggml_nbytes(KQV));
+    }
+
     // Scratch from the op's own tensor allocation (graph-capture safe, see above):
     char   * scratch      = (char *) KQV->data + ggml_cuda_fattn_vec_paged_scratch_offset(dst);
     float  * dst_tmp      = (float  *) scratch;

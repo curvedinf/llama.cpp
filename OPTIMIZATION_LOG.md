@@ -3242,3 +3242,19 @@ Next: instrument the verify graph's first-token path - compare the verify's GDN
 launch (nt=2) against the decode's (nt=1) on the same token position (state row,
 sidx, snapshot slots), and the verify's first-token FA mask (the causal mask for the
 2-token batch). The layer-split config keeps this simple (no meta).
+
+## Verify-vs-decode GDN comparison: identical geometry (2026-08-02)
+
+Layer-split MTP + GDN_PTRS: 192 GDN launches (48 recurrent layers x 4 batch shapes:
+nt=6/4 = the prefill chunks, nt=2 = the verify, nt=1 = the decode). ALL share
+state_ne={128,128,48,3} (the golden-ref np=1 -> mem_size=1 -> 3 rows) and sidx=0
+(the state-at-t row) - the verify's GDN is geometrically identical to the decode's
+(2-token vs 1-token, same state row, same snapshot slots). So the verify's first-token
+corruption is NOT in the GDN; the divergence must be in the verify's 2-token FA path
+(the per-seq ncols=2 FA nodes) or the KV write/mask of the verify batch.
+
+Next: compare the verify's FA node args (mask columns, K/V cells, ncols=2 kernel path)
+against the decode's single-token FA on the same position - or run the verify batch
+with the draft tokens' KV cells allocated to real cells instead of cell 0 (the
+degenerate 1-cell window is still the most suspicious remaining mechanism for the
+verify's 2nd token, and the 1st token's logits may be dragged by the same batch).

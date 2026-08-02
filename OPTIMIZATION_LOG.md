@@ -3258,3 +3258,17 @@ against the decode's single-token FA on the same position - or run the verify ba
 with the draft tokens' KV cells allocated to real cells instead of cell 0 (the
 degenerate 1-cell window is still the most suspicious remaining mechanism for the
 verify's 2nd token, and the 1st token's logits may be dragged by the same batch).
+
+## Verify batch cell allocation + snapshot-write audit (2026-08-02)
+
+find_slot allocates per-seq; the verify batch's 2-token/seq gets [c_s, 0] - the 1st
+token a real cell, the 2nd (speculative) token cell 0 for every seq (either the
+kv-unified design for speculative tokens or a bug). The GDN snapshot-write slots for
+nt=2 vs nt=1 (K=3): nt=2 writes slots {1,0} for tokens {t+1,t+2}, nt=1 writes slot 0 -
+the final (most-recent) slot lands in the same row either way. The verify's first
+token (real cell, correct mask, correct state) still produces wrong logits vs the
+identical-position decode - so the divergence is inside the 2-token FA/attention
+compute itself (the per-seq ncols=2 FA node) or the verify batch's qkv. Next: dump
+the verify FA node's kernel launch (grid/block + mask/K/V args) vs the decode's on
+the same position; also compare the verify batch's qkv (the MTP-head g_embd pairing)
+against the decode's qkv for the same token.

@@ -3153,3 +3153,18 @@ backend). The 4-GPU prefill corruption and the burst IMA are the same root, ampl
 Next: bisect the MTP path - draft n-max (1 vs 2), the draft's recurrent-state store
 (the draft ctx is a second hybrid context on the same backend), and the verify graph's
 state rollback. The no-MTP 1-GPU config is the clean baseline for every test.
+
+## MTP bisect: corruption is draft-length-independent, deterministic (2026-08-02)
+
+1-GPU MTP with SPEC_DRAFT_N_MAX=1: SAME garbage, and the first decode logits are
+IDENTICAL to the n-max=2 run (13=10.374990, 2342=10.027945, 3349=9.982420 - bit
+identical). The corruption is the MTP machinery itself (draft context / verify
+graphs), not the draft length. The verify's own logits are dumped too (idx=1/idx=2
+positions) and are garbage. The draft's KV cells are the kv-unified stream-B cells
+(all 0 in the [c,0,c+1,0,...] idxs pattern) - the draft's attention sees a single
+rolling cell.
+
+Next probes queued: the verify graph's recurrent-state rollback (snapshot row
+selection under the meta backend - the draft+verify both read the state store through
+the meta's per-GPU copies) via LLAMA_RS_DEBUG + GDN_PTRS on the 1-GPU MTP single;
+and the kv-unified stream-B cell mapping for the draft context.

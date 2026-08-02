@@ -3778,3 +3778,23 @@ Deliverables at this point: paged attention works for decode + MTP verify
 (n_tps<=2) - byte-identical output, 1-GPU burst ~85% clean (crash rate 60%->15%
 via the current-uid container fix). Prefill paged (n_tps>2) and TP4 remain
 blocked by the device-IMA race.
+
+## vLLM comparison: hardware/driver EXONERATED - the race is in this fork (2026-08-02, cont. 6)
+
+Ran the reference vLLM stack (vllm-gfx908, Qwen3.6-27B-GPTQ-8bit-MTP2, TP4,
+--tensor-parallel-size 4, --max-num-seqs 8, MTP2): 8 concurrent requests ALL
+complete correctly on the same 4x MI100 + ROCm 7.2.0. The device IMA race is
+therefore NOT a hardware/driver fault - it is a bug in this fork (async
+use-after-free or kernel OOB under concurrent MTP).
+
+Additional attempts this round (all negative): HSA env (AMD_LOG_LEVEL=3 shows
+only kernel-submission logs - last compute kernel before the crash varies:
+flash_attn_ext_vec_paged for q8_0 KV, k_set_rows for f16 KV - sticky error),
+HSA_ENABLE_INTERRUPT, HSA_XNACK, GPU_MAX_HW_QUEUES=1, LD_PRELOAD shim
+unmasking SIGSEGV in pthread_sigmask (handler still never runs - the HSA
+thread's fatal path is not a deliverable signal). The subgraph-split assert
+(i_start == n_nodes) hit by paged graphs was fixed (trailing host views).
+
+Status: paged decode/verify (n_tps<=2) correct and ~85% clean on 1-GPU burst;
+TP4 and prefill-paged bursts blocked by the race; MFMA paged kernel and the
+bench remain pending on stability.

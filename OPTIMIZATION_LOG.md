@@ -3826,3 +3826,34 @@ This is the open blocker for the TP4 1500/150 bench. The paged-attention
 implementation itself (decode/verify, n_tps<=2) is complete and validated
 byte-identical on single requests; remaining roadmap items (prefill paged,
 MFMA paged) and the bench depend on resolving this race.
+
+## 2026-08-02 — TP4 MTP crash investigation: from silent death to guarded platform
+
+**Context**: TP4 (4x MI100, ROCm 7.14) concurrent MTP burst (8 reqs) crashes with
+HSA MEMORY_APERTURE_VIOLATION. vLLM same HW 8/8 clean -> bug in this fork.
+
+**Root-cause family established** (multiple runs, AMD_LOG + geometry matching):
+1. The MTP-head gather (bailingmoe2 last layer, `get_rows(h_nextn, out_ids)`)
+   read **garbage indices** (float-bit values) from the out_ids per-GPU mirror ->
+   OOB. The mirrors' pre-set content was allocator garbage (the input upload
+   races/lags the compute read); the host out_ids buffer also showed float
+   garbage pre-fill (uninitialized allocator reuse).
+2. Faulting kernels vary per run but all are recurrent-path ops with FULL dims
+   on sharded buffers: mmq quantize (grid [640-896,20,1]/128), plain quantize
+   ([512/1024,768,1]/256), and the gather ([6,5,1]/256). The [896,20,1]/128
+   matches ssm_conv_idx_f32 grid=(n_s, nr/128) exactly (threads=128).
+3. LLAMA_N_RS_SEQ_FORCE=0 does NOT avoid it (the copy path stays active when
+   cells are reused: direct=0 with src0!=head+i).
+
+**Committed hardening (9be0c1f93)**:
+- meta: zero-init per-GPU input copies (stale reads become in-bounds zeros)
+- getrows: device-side OOB clamp+print on gathered indices
+- mmq/mmvq/ssm_conv: host-side bounds guards (skip+zero instead of OOB launch)
+- speculative.cpp: draft ctx n_outputs_max = n_parallel*(1+n_max) (was 8)
+
+**Effect**: bursts survive 10-100x longer (some requests now complete with
+content), the garbage-index gathers are gone. A residual recurrent-path fault
+(wg=256, grid [1024,768,1] family — rms_norm/unary/quantize candidates) still
+kills the server ~30s in; next step is identifying that kernel via its launch
+site (the plain-quantize launch is single+guarded, so it is likely a
+rms_norm_f32<256> or unary_gated_op_kernel with a sharded operand).

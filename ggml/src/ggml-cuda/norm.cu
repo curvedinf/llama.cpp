@@ -508,6 +508,18 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    // T1 guard: full-dims-on-shard views (meta backend) make the strided reads
+    // walk out of bounds; skip (zero dst) instead of faulting.
+    const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
+    const int64_t x_elems = ggml_nelements(src0);
+    if (x_max_read > x_elems) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld\n",
+            src0->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems);
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+        return;
+    }
+
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
@@ -566,6 +578,24 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    // T1 guard: full-dims-on-shard views (meta backend) make the strided reads
+    // walk out of bounds; skip (zero dst) instead of faulting. Cover the mul
+    // operand too (its strides come from the same split state).
+    const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
+    const int64_t x_elems = ggml_nelements(rms_norm_src);
+    const int64_t mul_max_read = (int64_t)(mul_nsamples-1)*mul_s03 + (int64_t)(mul_nchannels-1)*mul_s02 +
+                                 (int64_t)(mul_nrows-1)*mul_s01 + mul_ncols;
+    const int64_t mul_elems = ggml_nelements(mul_src);
+    if (x_max_read > x_elems || mul_max_read > mul_elems) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_elems=%ld\n",
+            rms_norm_src->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems,
+            mul_src->name, (long) mul_ncols, (long) mul_nrows, (long) mul_nchannels, (long) mul_nsamples,
+            (long) mul_max_read, (long) mul_elems);
+        CUDA_CHECK(cudaMemsetAsync(mul_tensor->data, 0, ggml_nbytes(mul_tensor), stream));
+        return;
+    }
 
     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
                           ne00, ne01, ne02, ne03,
@@ -643,6 +673,24 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+    // T1 guard: full-dims-on-shard views (meta backend) make the strided reads
+    // walk out of bounds; skip (zero dst) instead of faulting. Cover the mul
+    // operand too (its strides come from the same split state).
+    const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
+    const int64_t x_elems = ggml_nelements(rms_norm_src);
+    const int64_t mul_max_read = (int64_t)(mul_nsamples-1)*mul_s03 + (int64_t)(mul_nchannels-1)*mul_s02 +
+                                 (int64_t)(mul_nrows-1)*mul_s01 + mul_ncols;
+    const int64_t mul_elems = ggml_nelements(mul_src);
+    if (x_max_read > x_elems || mul_max_read > mul_elems) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_elems=%ld\n",
+            rms_norm_src->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems,
+            mul_src->name, (long) mul_ncols, (long) mul_nrows, (long) mul_nchannels, (long) mul_nsamples,
+            (long) mul_max_read, (long) mul_elems);
+        CUDA_CHECK(cudaMemsetAsync(mul_tensor->data, 0, ggml_nbytes(mul_tensor), stream));
+        return;
+    }
 
     const size_t ts_add = ggml_type_size(add_src->type);
     GGML_ASSERT(add_src->nb[0] == ts_add);

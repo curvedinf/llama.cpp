@@ -345,12 +345,13 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         // with a sharded store (per-GPU ne[0] smaller) -> OOB. Detect and skip
         // (zero the output) instead of faulting; the MTP verification catches
         // the wrong result, the server survives.
-        if (nr * (nc - 1) > src2->ne[0] || n_s > src2->ne[1]) {
-            fprintf(stderr, "CONV_GUARD: nr=%ld n_t=%ld n_s=%ld nc=%ld store_ne={%ld,%ld} src2=%s buf=%s size=%zu\n",
+        const int64_t src0_max_read = (int64_t)(n_s-1)*src0->nb[2] + (int64_t)(nr-1)*src0->nb[1] + n_t*(int64_t)src0->nb[0];
+        if (nr * (nc - 1) > src2->ne[0] || n_s > src2->ne[1] || src0_max_read > (int64_t) ggml_nbytes(src0)) {
+            fprintf(stderr, "CONV_GUARD: nr=%ld n_t=%ld n_s=%ld nc=%ld store_ne={%ld,%ld} src0=%s ne={%ld,%ld,%ld,%ld} nb1=%zu nb2=%zu nbytes=%zu max_read=%ld\n",
                 (long) nr, (long) n_t, (long) n_s, (long) nc,
-                (long) src2->ne[0], (long) src2->ne[1], src2->name,
-                src2->buffer ? ggml_backend_buffer_name(src2->buffer) : "none",
-                src2->buffer ? ggml_backend_buffer_get_size(src2->buffer) : 0);
+                (long) src2->ne[0], (long) src2->ne[1], src0->name,
+                (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+                (size_t) src0->nb[1], (size_t) src0->nb[2], ggml_nbytes(src0), (long) src0_max_read);
             CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(out), stream));
             return;
         }

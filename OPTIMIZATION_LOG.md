@@ -3186,3 +3186,25 @@ mapping for the draft context, (b) the verify graph's recurrent-state rollback
 cell allocation for the draft stream and the verify's snapshot-row bookkeeping in the
 code (llama-kv-cache.cpp kv-unified + llama-memory-recurrent.cpp rollback), and/or
 run the 1-GPU MTP single with the SPEC_DRAFT... offload variations.
+
+## ROOT SCOPE REDUCED: the MTP path itself is broken (2026-08-02)
+
+The decisive control: LAYER-SPLIT + MTP (the golden reference config, no meta backend,
+no tensor split) produces the SAME garbage ("A. B. . .") with BIT-IDENTICAL logits to
+the 1-GPU tensor-split MTP (561=12.410543, 13=10.379278, 2342=10.096198, ...). The
+layer-split without MTP is bit-exact correct. Therefore:
+
+  THE ENTIRE CRASH/GARBAGE CLASS IS A FORK MTP-IMPLEMENTATION BUG - the draft/verify
+  machinery (spec-draft-mtp + the recurrent-state rollback), independent of the meta
+  backend, the tensor split, the GPU count, and the concurrency.
+
+This explains everything: the identical first-decode corruption across every config,
+the deterministic logits, and why the meta-backend fixes (src replacement, NULL-src,
+container lifetime) only ever produced one lucky ASAN pass. The MTP path to audit:
+- the verify graph's 2-token batch (n_tps=2) vs the 1-token decode path,
+- the MTP head (the 65th layer) forward - its GDN/attention/weights,
+- the draft context's KV cells (kv-unified stream-B all-0 pattern),
+- the recurrent-state rollback for the speculative tokens.
+Debug on the layer-split config (simplest, no meta). Compare the verify's first-token
+logits against the plain decode's (which are correct) to bisect which input/op of the
+verify graph diverges.

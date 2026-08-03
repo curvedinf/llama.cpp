@@ -89,6 +89,7 @@ case "${1:-start}" in
       LLAMA_UX_DYNAMIC_BUDGET="${UX_DYNAMIC_BUDGET}" \
       LLAMA_PREFILL_CHUNK="${PREFILL_CHUNK}" \
       LLAMA_N_RS_SEQ_FORCE="${LLAMA_N_RS_SEQ_FORCE:-}" \
+      AMD_LOG_LEVEL="${AMD_LOG_LEVEL:-}" \
       LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
         "${BIN_DIR}/llama-server" "${COMMON_ARGS[@]}" \
         >"${log}" 2>&1 </dev/null &

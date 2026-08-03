@@ -3857,3 +3857,41 @@ content), the garbage-index gathers are gone. A residual recurrent-path fault
 kills the server ~30s in; next step is identifying that kernel via its launch
 site (the plain-quantize launch is single+guarded, so it is likely a
 rms_norm_f32<256> or unary_gated_op_kernel with a sharded operand).
+
+## 2026-08-03 (TP4 MTP crash: root-cause chain + partial fix, session 2)
+
+Committed 1baf774a5. Root cause chain (all evidence-backed):
+
+1. The set_input fill landed in the volatile staging container while the
+   dispatch resolved the graph's own uid-container copies - the MTP-head and
+   RS-state gathers read recycled arena content (+-0.0625 float bits) as row
+   ids (GRV_OOB device prints). FIX: dispatch-time input re-sync (SRC_SYNC):
+   resolve input copies from the graph's uid container only, create on
+   demand, re-sync input-flagged leafs from the original host buffer.
+   Verified: GRV_OOB 48->0, requests produce real text (was empty).
+2. The rms_norm/mmvq guards compared stride-based max_read against
+   nelements - false-fired 952x/run on valid non-contiguous QG-fused views
+   and zeroed every Qcur norm (empty responses even without a crash). FIX:
+   compare against the stride span (ggml_nbytes). 952 fires -> 0.
+3. Residual crash (survives all fixes, ASAN-clean): HSA aperture fault in
+   the recurrent path, queue dumps show conv_idx-family grids with
+   n_s = n_rs*128 (384/640/768/896 = 3/5/6/7 seqs x 128) while the wrapper
+   sees sane n_s (CONV_DISP) and all guards stay silent - device-side
+   corruption of a GTT buffer (the +-0.0625 pattern also appears in the
+   out_ids host buffer, i.e. a device OOB write lands there). Bisected:
+   graphs-off, always-rebuild, comm-off (RCCL -> fallback) all still crash.
+   The fallback run shows the illegal access detected at cpy_tensor_async.
+   Next: identify the first OOB writer (KV q8_0 quantize with stale block
+   counts is a candidate - the +-0.0625 = q8_0 scale magnitudes).
+4. 1-GPU MTP probe (run_rs_probe_asan.sh): no crash, but mtp_n2 vs
+   LLAMA_N_RS_SEQ_FORCE=0 diverge at step 4 (first draft-verified token):
+   mtp rotates to state cell 2 (s_copy=[2]) while force0 stays on cell 0;
+   r0/s0 hashes and LOGIT_DUMP diverge, mtp samples EOS. Hypothesis:
+   snapshot-lag - the draft ctx computes from the prefix-end-anchored
+   32-aligned snapshot while acceptance compares against the live state
+   (llama-memory-hybrid.cpp:323-368). Next: verify with a step-level
+   snapshot-vs-live state comparison.
+
+TP4 burst status: 1-2/8 requests complete with real text (was 0/8 instant
+death); residual fault kills the server ~4-5 min in. 1500 PP / 150 TG still
+blocked.

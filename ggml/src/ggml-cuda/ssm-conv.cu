@@ -288,6 +288,12 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     const int64_t n_t = out->ne[1];                 // tokens per sequence
     const int64_t n_s = out->ne[2];                 // number of sequences in the batch
 
+    if (getenv("LLAMA_CONV_EVENT") != nullptr) {
+        fprintf(stderr, "CONV_DISP: idx=%d nr=%ld n_t=%ld n_s=%ld out=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            (dst->src[2] != nullptr), (long) nr, (long) n_t, (long) n_s, out->name,
+            (long) out->ne[0], (long) out->ne[1], (long) out->ne[2], (long) out->ne[3], out->data);
+    }
+
     if (dst->src[2] != nullptr) {
         // indexed in-place form (ggml_ssm_conv_idx)
         const struct ggml_tensor * src2 = dst->src[2]; // state store [(d_conv - 1)*d_inner, n_rows]

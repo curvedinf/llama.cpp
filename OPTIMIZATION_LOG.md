@@ -3939,3 +3939,22 @@ blocked.
   the load's warmup decode) - suspected H2D-into-reserve during CUDA graph
   capture (the 1-GPU probe is capture-free). Next: use the ASYNC set in the
   MIRRORED branch (capture-safe) or skip the re-point under capture.
+
+## 2026-08-03 (session 2 continued: leaf-name sync = mirror-fill root cause)
+
+- ROOT CAUSE of the sidx corruption FOUND: the dispatch-time input sync
+  (SRC_SYNC) gated on GGML_TENSOR_FLAG_INPUT, but the graph-cache copies
+  carry flags=0 (observed via SETTENSOR_MIRROR), so the sync NEVER ran and
+  the input mirrors stayed at recycled content (+-0.0625 = q8_0-scale
+  bits). The GDN/conv sidx clamps then fired 152k times per burst.
+  FIX (922a6c1dc): fall back to the meta's 'leaf_' naming.
+  VERIFIED: traced burst = 0 queue errors, 0 sidx fires, real generated
+  text (13 tokens, repetitive think-loop), full window. First fully
+  crash-free run.
+- NEW blocker: clean (untraced) runs hang at model load (deterministic
+  2/2; graphs-off also hangs) - the server dies at ~15 log lines after
+  the META_ALLOC prints, before the first decode (OUTIDS_FILLED never
+  reached). The heavy META_TRACE timing lets the load pass - a race at
+  the model-upload/meta-init phase. gdb attach attempt at the hang did
+  not complete (server died before the attach point). NEXT: attach gdb
+  at the load hang, or bisect the load path (upload vs first graph).

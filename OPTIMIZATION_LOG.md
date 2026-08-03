@@ -3958,3 +3958,18 @@ blocked.
   the model-upload/meta-init phase. gdb attach attempt at the hang did
   not complete (server died before the attach point). NEXT: attach gdb
   at the load hang, or bisect the load path (upload vs first graph).
+
+## 2026-08-03 (session 2 continued: load segfault fixed; ASAN ruled out)
+
+- Committed 89acddfc4: the dispatch-time input sync's SOURCE pointer was
+  corrupted (0x100000000000a080 - the graph-cache object's data AND buffer
+  fields both hit by a host OOB write; gdb core backtrace confirmed the
+  memcpy source segfault at ggml-cuda.cu:799). The sync now requires a
+  canonical user-space pointer + in-buffer offset. Verified: the direct
+  server load passes (was deterministic SIGSEGV at 15 log lines).
+- First-request crash remains (gather [512,768] family) - the same
+  corrupted-original class. ASAN is ruled out as a tool: the HIP memory
+  mappings (anonymous /dev/zero, /dev/dri) make ASAN's shadow
+  deallocation fail (error code 22) before any report.
+- NEXT: gdb hardware watchpoint on the corrupted tensor field to capture
+  the writer's stack, or bisect the graph-cache arena writers.

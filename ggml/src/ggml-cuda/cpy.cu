@@ -464,6 +464,32 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
 
+    // bounds guard for the quantize cpys: the f32->q8_0 kernel launches
+    // ne/QK8_0 blocks and writes num_blocks * sizeof(block_q8_0) bytes into
+    // src1 - a corrupted ne (recycled node metadata) overruns the cache
+    // allocation and spills q8_0 scales (+-0.0625) into the input mirrors
+    if (src0->type == GGML_TYPE_F32 && ggml_is_quantized(src1->type)) {
+        const size_t qtype_size = ggml_type_size(src1->type);
+        const size_t qblk_size  = ggml_blck_size(src1->type);
+        const size_t write_n    = (size_t) ne / qblk_size * qtype_size;
+        const size_t dst_n      = ggml_nbytes(src1);
+        bool dst_inbuf = true;
+        if (src1->buffer != nullptr && src1->data != nullptr) {
+            const char * dbase = (const char *) ggml_backend_buffer_get_base(src1->buffer);
+            const size_t  dsize = ggml_backend_buffer_get_size(src1->buffer);
+            const ptrdiff_t doff = (const char *) src1->data - dbase;
+            dst_inbuf = dbase != nullptr && doff >= 0 && (size_t) doff + write_n <= dsize;
+        }
+        if (write_n > dst_n || !dst_inbuf) {
+            fprintf(stderr, "CPY_Q_GUARD: src=%s ne={%ld,%ld,%ld,%ld} type=%d nbytes=%zu | dst=%s ne={%ld,%ld,%ld,%ld} type=%d nbytes=%zu write=%zu\n",
+                src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
+                (int) src0->type, (size_t) ggml_nbytes(src0),
+                src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+                (int) src1->type, dst_n, write_n);
+            return;
+        }
+    }
+
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
     const int64_t ne02 = src0->ne[2];

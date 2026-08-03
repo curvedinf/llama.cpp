@@ -2869,8 +2869,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 // input leafs are host-filled by set_input by
                                 // construction; the "host buffer" check is wrong
                                 // for meta-buffer inputs (s_copy etc.) whose data
-                                // region is host-addressable but not flagged host
-                                if (expected != nullptr && (is_input || is_leaf) && orig->src[s]->data != nullptr && expected->data != nullptr) {
+                                // region is host-addressable but not flagged host.
+                                // The original's data pointer itself can be
+                                // corrupted (0x100000000000a080 observed - a host
+                                // OOB write hits the graph-cache object) - the
+                                // memcpy source must be validated against the
+                                // buffer before the sync, or it segfaults.
+                                bool src_inbuf = true;
+                                if (orig->src[s]->buffer != nullptr && orig->src[s]->data != nullptr) {
+                                    const char * obase = (const char *) ggml_backend_buffer_get_base(orig->src[s]->buffer);
+                                    const size_t  osize = ggml_backend_buffer_get_size(orig->src[s]->buffer);
+                                    const ptrdiff_t ooff = (const char *) orig->src[s]->data - obase;
+                                    // the graph-cache object itself can be corrupted
+                                    // (data AND buffer fields - a host OOB write hits
+                                    // the arena): require a canonical user-space data
+                                    // pointer and an in-buffer offset
+                                    const uintptr_t udata = (uintptr_t) orig->src[s]->data;
+                                    src_inbuf = obase != nullptr && (udata >> 47) == 0 && ooff >= 0 &&
+                                        (size_t) ooff + ggml_nbytes(expected) <= osize;
+                                }
+                                if (expected != nullptr && (is_input || is_leaf) && src_inbuf &&
+                                        orig->src[s]->data != nullptr && expected->data != nullptr) {
                                     if (getenv("LLAMA_META_TRACE") != nullptr) {
                                         fprintf(stderr, "SRC_SYNC: j=%zu i=%zu k2=%zu node=%s src%d orig=%s copy=%p nbytes=%zu\n",
                                             j, i, k2, orig->name, s, orig->src[s]->name, (void *) expected, ggml_nbytes(expected));

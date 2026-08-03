@@ -2857,11 +2857,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                 const bool is_input = (orig->src[s]->flags & GGML_TENSOR_FLAG_INPUT) != 0 ||
                                     (orig->src[s]->view_src != nullptr &&
                                      (orig->src[s]->view_src->flags & GGML_TENSOR_FLAG_INPUT) != 0);
+                                // the graph-cache copies lose the input flag (the
+                                // mirrors carry flags=0, observed via SETTENSOR_MIRROR),
+                                // so fall back to the meta's leaf naming for the
+                                // dispatch-time sync
+                                const bool is_leaf = strstr(orig->src[s]->name, "#leaf_") != nullptr ||
+                                                     strncmp(orig->src[s]->name, "leaf_", 5) == 0 ||
+                                                     (orig->src[s]->view_src != nullptr &&
+                                                      (strstr(orig->src[s]->view_src->name, "#leaf_") != nullptr ||
+                                                       strncmp(orig->src[s]->view_src->name, "leaf_", 5) == 0));
                                 // input leafs are host-filled by set_input by
                                 // construction; the "host buffer" check is wrong
                                 // for meta-buffer inputs (s_copy etc.) whose data
                                 // region is host-addressable but not flagged host
-                                if (expected != nullptr && is_input && orig->src[s]->data != nullptr && expected->data != nullptr) {
+                                if (expected != nullptr && (is_input || is_leaf) && orig->src[s]->data != nullptr && expected->data != nullptr) {
                                     if (getenv("LLAMA_META_TRACE") != nullptr) {
                                         fprintf(stderr, "SRC_SYNC: j=%zu i=%zu k2=%zu node=%s src%d orig=%s copy=%p nbytes=%zu\n",
                                             j, i, k2, orig->name, s, orig->src[s]->name, (void *) expected, ggml_nbytes(expected));

@@ -4009,3 +4009,13 @@ blocked.
 - Committed c9df550c2 (GR_STALE). The [512,768] fault's grid matches the
   mmq quantize (ne1=512, block_num_y=768, ne0=786432) but the guarded
   site fires 0x - the fault is elsewhere/misattributed.
+
+## 2026-08-03 (session 2 continued: GDN sidx = state-like; adjacency suspect)
+
+- The GDN sidx clamps (130k/run) read STATE-LIKE values (+-0.16..1.1,
+  grid H=12 n_seqs=7 sane) - cascade stage 2: a state kernel writes OOB
+  into the reserve tail, which then feeds every subsequent sidx read.
+  The state (KV buffer, 162MB) and the compute buffer (20MB) are pool
+  allocations; if adjacent, the state's OOB writes (the 28-seq grid seen
+  in queue dumps) land in the compute buffer's reserve. NEXT: verify
+  buffer adjacency, then guard the state kernel's slot writes.

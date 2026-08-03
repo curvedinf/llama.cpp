@@ -2097,7 +2097,11 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                 if (chunk_size_j == 0) {
                     continue;
                 }
-                ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
+                // SYNC fill (same rationale as the MIRRORED branch): the async
+                // H2D reads the host buffer at the GPU's pace while the next
+                // set_input overwrites it - sharded inputs (s_copy etc.) end up
+                // with stale mirrors (the +-0.0625 sidx corruption)
+                ggml_backend_tensor_set_2d(simple_backend, simple_tensor, (const char *) data + offset_j, offset, chunk_size_j,
                     i_stop - i_start, chunk_size_j, chunk_size_full);
                 offset_j += chunk_size_j;
             }
@@ -3135,6 +3139,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+    // env-gated full sync: the concurrent MTP corruption (stale +-0.0625 sidx
+    // mirrors) is timing-sensitive - traced runs are clean, which points at an
+    // async-overlap race. Serialize every subgraph compute to test that theory.
+    if (getenv("LLAMA_META_SYNC") != nullptr) {
+        ggml_backend_meta_synchronize(backend);
     }
     return GGML_STATUS_SUCCESS;
 }

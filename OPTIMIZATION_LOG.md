@@ -3997,3 +3997,15 @@ blocked.
   corruption is an async-overlap race in the meta dispatch, confirmed.
   The residual gather fault (grid [512,768], the corrupted-metadata
   class) persists independently.
+
+## 2026-08-03 (session 2 continued: cascade stages identified)
+
+- The sidx mirror corruption has two stages: (1) +-0.0625 (q8_0-scale
+  bits) = the fill never landing; (2) state-like values (+-0.7..1.1) = a
+  GDN/conv with a stale sidx writing its state OOB into the reserve tail,
+  which then feeds the NEXT sidx read. The sync-fill (LLAMA_META_SYNC +
+  sync set_async) reduces stage-1 but the burst still shows 0-41k fires
+  (variance) - the fill race persists at a deeper level.
+- Committed c9df550c2 (GR_STALE). The [512,768] fault's grid matches the
+  mmq quantize (ne1=512, block_num_y=768, ne0=786432) but the guarded
+  site fires 0x - the fault is elsewhere/misattributed.

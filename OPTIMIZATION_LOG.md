@@ -3973,3 +3973,19 @@ blocked.
   deallocation fail (error code 22) before any report.
 - NEXT: gdb hardware watchpoint on the corrupted tensor field to capture
   the writer's stack, or bisect the graph-cache arena writers.
+
+## 2026-08-03 (session 2 continued: sync-fill; race persists)
+
+- Committed b3f25d4f6: the meta get_base sentinel (0x1000000000000000,
+  // FIXME) explained the 'corrupted' 0x1000... addresses - they are
+  legitimate meta-buffer addresses. The sync source must be host-backed.
+  The MIRRORED + AXIS-0/1/2 fills are now SYNCHRONOUS (the async H2D read
+  the host buffer at the GPU's pace while the next set_input overwrote it).
+- Single-request run: FULLY WORKS (19 tokens, draft acceptance 0.111,
+  zero corruption). The corruption is strictly concurrency-induced.
+- Bursts: 1-5/8 responses with real content; 120k GDN/conv sidx clamps
+  (the +-0.0625 stale mirrors) and 7 residual queue errors persist in
+  untraced runs; traced runs are clean (timing perturbs the race).
+  The sync-fill did NOT stop the corruption - the stale-mirror writer is
+  on another path (next: compare the kernel's sidx address vs the fill
+  target address under the crash config).

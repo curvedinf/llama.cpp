@@ -1254,6 +1254,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         return GGML_STATUS_SUCCESS;
     }
 
+    if (getenv("LLAMA_META_TRACE") != nullptr && (tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+        fprintf(stderr, "INIT_INPUT: %s p=%p flags=%x static=%d\n",
+            tensor->name, (void *) tensor, tensor->flags, (int) (&stc == &buf_ctx->stc_static));
+    }
+
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(stc, tensor, /*assume_sync =*/ true);
     GGML_ASSERT(ggml_nelements(tensor) == 0 || split_state.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
     GGML_ASSERT(split_state.n_segments <= 16);
@@ -1382,6 +1387,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     tensor->name, j, (void *) t_ij->data,
                     (void *) ggml_backend_buffer_get_base(simple_buf), off, stc.input_bump);
             }
+        } else if (getenv("LLAMA_META_TRACE") != nullptr && simple_buf != nullptr &&
+                (tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+            fprintf(stderr, "STATIC_INPUT_SKIP: %s j=%zu view=%d is_static=%d base=%p off=%zu\n",
+                tensor->name, j, (int) (t_ij->view_src != nullptr),
+                (int) (&stc == &buf_ctx->stc_static),
+                (void *) ggml_backend_buffer_get_base(simple_buf),
+                size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer)));
         }
         t_ij->extra = tensor->extra;
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1599,10 +1611,36 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
                 }
                 if (getenv("LLAMA_META_TRACE") != nullptr) {
-                    fprintf(stderr, "SETTENSOR_MIRROR: %s ne={%lld,%lld,%lld,%lld} j=%zu simple=%p data=%p (%.6f)\n", tensor->name,
+                    fprintf(stderr, "SETTENSOR_MIRROR: %s ne={%lld,%lld,%lld,%lld} j=%zu simple=%p data=%p flags=%x vsrc=%p (%.6f)\n", tensor->name,
                         (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
                         j, (void *) simple_tensor,
-                        (void *) simple_tensor->data, simple_tensor->data != nullptr ? ((const float *) simple_tensor->data)[0] : 0.0f);
+                        (void *) simple_tensor->data, tensor->flags, (void *) tensor->view_src,
+                        simple_tensor->data != nullptr ? ((const float *) simple_tensor->data)[0] : 0.0f);
+                }
+                // re-point mirrored copies into the dedicated reserve region: the
+                // offset formula places them at the same device offsets as compute
+                // tensors of other cached graphs, and the async subgraph pipeline
+                // overwrites the mirror between the sync and the kernel read
+                // (garbage +-0.0625 sidx/out_ids). The mirrors carry flags=0 (the
+                // input flag lives on the llama-side original), so apply to every
+                // mirrored copy. Idempotent per tensor: once in the reserve, leave
+                // it there.
+                if (simple_tensor->view_src != nullptr) {
+                    // the view's data pointer is baked at creation; refresh it
+                    // from the (re-pointed) view source copy
+                    simple_tensor->data = (char *) simple_tensor->view_src->data + simple_tensor->view_offs;
+                } else {
+                    const char * rbase = (const char *) ggml_backend_buffer_get_base(simple_tensor->buffer);
+                    const ptrdiff_t cur_off = (const char *) simple_tensor->data - rbase;
+                    if (cur_off < (ptrdiff_t) buf_ctx->static_input_base) {
+                        const size_t off = buf_ctx->static_input_base + buf_ctx->stc_static.input_bump;
+                        buf_ctx->stc_static.input_bump += ggml_nbytes(simple_tensor);
+                        simple_tensor->data = (char *) rbase + off;
+                        if (getenv("LLAMA_META_TRACE") != nullptr) {
+                            fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p off=%zu bump=%zu\n",
+                                tensor->name, j, (void *) simple_tensor->data, off, buf_ctx->stc_static.input_bump);
+                        }
+                    }
                 }
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }

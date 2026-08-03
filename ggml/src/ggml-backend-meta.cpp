@@ -2950,7 +2950,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (cached->view_src != nullptr && orig->view_src != nullptr &&
                             ggml_backend_buffer_is_meta(orig->view_src->buffer)) {
                         ggml_tensor * cur_vsrc = ggml_backend_meta_buffer_simple_tensor(orig->view_src, j);
-                        if (cur_vsrc != nullptr && cur_vsrc != cached->view_src) {
+                        // refresh UNCONDITIONALLY: the view's data pointer is baked
+                        // at creation, but the view source's data can move (the
+                        // static-input reserve re-point) without the object
+                        // changing - the view then reads the old colliding offset
+                        // (the stale +-0.0625 sidx under concurrent TP4 MTP)
+                        if (cur_vsrc != nullptr && (cur_vsrc != cached->view_src ||
+                                cached->data != (char *) cur_vsrc->data + cached->view_offs)) {
                             if (getenv("LLAMA_META_TRACE") != nullptr) {
                                 fprintf(stderr, "VIEW_REFRESH: j=%zu i=%zu k2=%zu node=%s vsrc=%p -> %p data=%p -> %p\n",
                                     j, i, k2, orig->name, (void *) cached->view_src, (void *) cur_vsrc,

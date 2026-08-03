@@ -1380,7 +1380,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (t_ij->view_src == nullptr && simple_buf != nullptr &&
                 &stc == &buf_ctx->stc_static && (tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
             const size_t off = buf_ctx->static_input_base + stc.input_bump;
-            stc.input_bump += ggml_nbytes(t_ij);
+            stc.input_bump += GGML_PAD(ggml_nbytes(t_ij), 4096);
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf) + off;
             if (getenv("LLAMA_META_TRACE") != nullptr) {
                 fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p base=%p off=%zu bump=%zu\n",
@@ -1634,7 +1634,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     const ptrdiff_t cur_off = (const char *) simple_tensor->data - rbase;
                     if (cur_off < (ptrdiff_t) buf_ctx->static_input_base) {
                         const size_t off = buf_ctx->static_input_base + buf_ctx->stc_static.input_bump;
-                        buf_ctx->stc_static.input_bump += ggml_nbytes(simple_tensor);
+                        buf_ctx->stc_static.input_bump += GGML_PAD(ggml_nbytes(simple_tensor), 4096);
                         simple_tensor->data = (char *) rbase + off;
                         if (getenv("LLAMA_META_TRACE") != nullptr) {
                             fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p off=%zu bump=%zu\n",

@@ -3989,3 +3989,11 @@ blocked.
   The sync-fill did NOT stop the corruption - the stale-mirror writer is
   on another path (next: compare the kernel's sidx address vs the fill
   target address under the crash config).
+
+## 2026-08-03 (session 2 continued: race CONFIRMED via full sync)
+
+- LLAMA_META_SYNC (full backend sync per meta graph compute) drops the
+  GDN/conv sidx clamps from 120k to 0 per burst - the stale-mirror
+  corruption is an async-overlap race in the meta dispatch, confirmed.
+  The residual gather fault (grid [512,768], the corrupted-metadata
+  class) persists independently.

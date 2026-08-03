@@ -2104,9 +2104,14 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
+            // SYNC fill: the async H2D reads the host buffer at the GPU's pace,
+            // and the next set_input overwrites it before the copy lands - the
+            // mirrors then hold stale/recycled content (the +-0.0625 sidx
+            // corruption under concurrent TP4 MTP). Inputs are small; the sync
+            // cost is negligible.
             for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_tensor_set_async(
-                    ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+                ggml_backend_tensor_set(
+                    ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
         } break;
         default: {
@@ -2867,28 +2872,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                                       (strstr(orig->src[s]->view_src->name, "#leaf_") != nullptr ||
                                                        strncmp(orig->src[s]->view_src->name, "leaf_", 5) == 0));
                                 // input leafs are host-filled by set_input by
-                                // construction; the "host buffer" check is wrong
-                                // for meta-buffer inputs (s_copy etc.) whose data
-                                // region is host-addressable but not flagged host.
-                                // The original's data pointer itself can be
-                                // corrupted (0x100000000000a080 observed - a host
-                                // OOB write hits the graph-cache object) - the
-                                // memcpy source must be validated against the
-                                // buffer before the sync, or it segfaults.
-                                bool src_inbuf = true;
-                                if (orig->src[s]->buffer != nullptr && orig->src[s]->data != nullptr) {
-                                    const char * obase = (const char *) ggml_backend_buffer_get_base(orig->src[s]->buffer);
-                                    const size_t  osize = ggml_backend_buffer_get_size(orig->src[s]->buffer);
-                                    const ptrdiff_t ooff = (const char *) orig->src[s]->data - obase;
-                                    // the graph-cache object itself can be corrupted
-                                    // (data AND buffer fields - a host OOB write hits
-                                    // the arena): require a canonical user-space data
-                                    // pointer and an in-buffer offset
-                                    const uintptr_t udata = (uintptr_t) orig->src[s]->data;
-                                    src_inbuf = obase != nullptr && (udata >> 47) == 0 && ooff >= 0 &&
-                                        (size_t) ooff + ggml_nbytes(expected) <= osize;
-                                }
-                                if (expected != nullptr && (is_input || is_leaf) && src_inbuf &&
+                                // construction. The sync source must be a
+                                // host-readable buffer: meta-buffer tensors carry
+                                // the meta's virtual base (0x1000000000000000
+                                // sentinel, not host-mapped) - copying from it
+                                // segfaults. Their fill goes through the MIRRORED
+                                // set path instead.
+                                const bool src_host = orig->src[s]->buffer != nullptr &&
+                                    ggml_backend_buffer_is_host(orig->src[s]->buffer);
+                                if (expected != nullptr && (is_input || is_leaf) && src_host &&
                                         orig->src[s]->data != nullptr && expected->data != nullptr) {
                                     if (getenv("LLAMA_META_TRACE") != nullptr) {
                                         fprintf(stderr, "SRC_SYNC: j=%zu i=%zu k2=%zu node=%s src%d orig=%s copy=%p nbytes=%zu\n",

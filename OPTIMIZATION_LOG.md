@@ -3923,3 +3923,19 @@ blocked.
   per-GPU buffers) or serialize the input sync vs the subgraph pipeline;
   (b) TP4 MTP acceptance still returns empty content even crash-free -
   investigate the draft ctx's sharded state/verification separately.
+
+## 2026-08-03 (session 2 continued: static-input reserve engaged)
+
+- The init-time reservation never engaged: mirrored copies carry flags=0
+  (the input flag lives on the llama-side original). Moved the re-point to
+  the MIRRORED fill site: every mirrored copy moves into the 16MB/GPU
+  reserve past the meta buffer's size (idempotent), views refresh their
+  baked data pointer from the re-pointed source. Committed 3d8744b27.
+- HSA requires 4096-aligned H2D destinations: GGML_PAD the bump and the
+  reserve base (committed e144b2066; base pad landed uncommitted).
+- Verified: CONV_SIDX_OOB drops to 0 (the +-0.0625 sidx garbage is gone);
+  1-GPU probe fully clean with the reserve. The TP4 load now fails with
+  hipMemcpyAsync 'invalid argument' on the reserve H2D (device 0, during
+  the load's warmup decode) - suspected H2D-into-reserve during CUDA graph
+  capture (the 1-GPU probe is capture-free). Next: use the ASYNC set in the
+  MIRRORED branch (capture-safe) or skip the re-point under capture.

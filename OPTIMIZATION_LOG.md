@@ -3895,3 +3895,31 @@ Committed 1baf774a5. Root cause chain (all evidence-backed):
 TP4 burst status: 1-2/8 requests complete with real text (was 0/8 instant
 death); residual fault kills the server ~4-5 min in. 1500 PP / 150 TG still
 blocked.
+
+## 2026-08-03 (session 2 continued: race confirmed, sidx garbage captured)
+
+- 1-GPU MTP divergence = PROBE ARTIFACT: mtp_n2 vs LLAMA_N_RS_SEQ_FORCE=0
+  produce byte-identical 16-token outputs ("When water is boiled, heat
+  energy increases the kinetic energy"). The "step-4 divergence" was the
+  misaligned comparison of the draft's 3-token batches vs the target's
+  2-token batches (RS_STEP r-hashes land at different slots). The 1-GPU MTP
+  pipeline is CORRECT.
+- TP4 residual crash: captured the corruption in the open. Device-side guard
+  in ssm_conv_idx_f32 (CONV_SIDX_OOB): the sidx mirror holds +-0.0625 float
+  bits (0x3D800000) as the state row id while src2_rows=8 - the kernel would
+  fault on the store access; the clamp keeps it alive. Fires only under
+  specific timing (0 fires in the cleanest run). mmq quantize got the same
+  span guard (grid=[512,768,1] family = quantize_mmq_q8_1 over a corrupted
+  786432-wide src1).
+- CRASH-FREE RUN: graphs off + META_TRACE + CONV_TRACE = 0 queue errors for
+  the full window (first clean run). The trace envs' host-side timing
+  perturbs the race. Conclusion: the residual crash is a TIMING RACE in the
+  meta dispatch (the async subgraph pipeline + input-region writes), not a
+  deterministic metadata bug. The cross-graph device-offset collisions in
+  the shared per-GPU buffers are the structural suspect; the static input
+  container shares the offset formula (data = base + orig_offset).
+- Committed 073c74c46 (device-side sidx clamp + mmq span guard).
+- NEXT: (a) fix the region stability (dedicated static-input reserve in the
+  per-GPU buffers) or serialize the input sync vs the subgraph pipeline;
+  (b) TP4 MTP acceptance still returns empty content even crash-free -
+  investigate the draft ctx's sharded state/verification separately.

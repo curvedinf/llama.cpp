@@ -172,7 +172,7 @@ template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                         const float * __restrict__ bias, float * __restrict__ src2,
                                         const int32_t * __restrict__ sidx, const int fresh_mask, const int src0_nb1, const int src0_nb2,
-                                        const int src1_nb1, const int src2_nb1, float * __restrict__ dst,
+                                        const int src1_nb1, const int src2_nb1, const int32_t src2_rows, float * __restrict__ dst,
                                         const int dst_nb1, const int dst_nb2, const int64_t n_t) {
     const int tid  = threadIdx.x;
     const int bidx = blockIdx.x;
@@ -180,7 +180,17 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
 
     const int r = bidy * split_d_inner + tid;
 
-    const int32_t row = sidx[bidx];
+    int32_t row = sidx[bidx];
+    // device-side row guard: a garbage sidx (stale mirror content, captured
+    // replay of a reset container) walks the store reads/writes out of the
+    // allocation - clamp and report instead of faulting
+    if (row < 0 || row >= src2_rows) {
+        if (tid == 0 && bidy == 0) {
+            printf("CONV_SIDX_OOB: bidx=%d row=%d src2_rows=%d fresh_mask=%x grid=(%d,%d)\n",
+                bidx, row, (int) src2_rows, fresh_mask, (int) gridDim.x, (int) gridDim.y);
+        }
+        row = 0;
+    }
     const bool fresh = (fresh_mask >> bidx) & 1;
     float * s_row = (float *) ((char *) src2 + (int64_t) row * src2_nb1);
 
@@ -245,7 +255,7 @@ static __global__ void ssm_conv_idx_f32(const float * __restrict__ src0, const f
 template <bool apply_silu>
 static void ssm_conv_idx_f32_cuda(const float * src0, const float * src1, const float * bias, float * src2,
                                   const int32_t * sidx, const int fresh_mask, const int src0_nb1, const int src0_nb2, const int src1_nb1,
-                                  const int src2_nb1, float * dst, const int dst_nb1, const int dst_nb2,
+                                  const int src2_nb1, const int64_t n_rows_store, float * dst, const int dst_nb1, const int dst_nb2,
                                   const int64_t nc, const int64_t nr, const int64_t n_t, const int64_t n_s,
                                   cudaStream_t stream) {
     const int threads = 128;
@@ -255,7 +265,7 @@ static void ssm_conv_idx_f32_cuda(const float * src0, const float * src1, const 
         constexpr int kNC = decltype(NC)::value;
         const dim3 blocks(n_s, (nr + threads - 1) / threads, 1);
         ssm_conv_idx_f32<apply_silu, threads, kNC><<<blocks, threads, 0, stream>>>(
-            src0, src1, bias, src2, sidx, fresh_mask, src0_nb1, src0_nb2, src1_nb1, src2_nb1, dst, dst_nb1, dst_nb2, n_t);
+            src0, src1, bias, src2, sidx, fresh_mask, src0_nb1, src0_nb2, src1_nb1, src2_nb1, (int32_t) n_rows_store, dst, dst_nb1, dst_nb2, n_t);
     };
 
     switch (nc) {
@@ -433,10 +443,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
         if (fuse_silu) {
             ssm_conv_idx_f32_cuda<true>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
-                                        src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
+                                        src2->nb[1], src2->ne[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
         } else {
             ssm_conv_idx_f32_cuda<false>(src0_d, src1_d, bias_d, src2_d, sidx_d, fresh_mask, src0->nb[1], src0->nb[2], src1->nb[1],
-                                         src2->nb[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
+                                         src2->nb[1], src2->ne[1], dst_d, out->nb[1], out->nb[2], nc, nr, n_t, n_s, stream);
         }
 
         if (getenv("LLAMA_CONV_VDUMP") != nullptr) {

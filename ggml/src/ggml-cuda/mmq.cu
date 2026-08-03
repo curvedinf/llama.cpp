@@ -147,8 +147,23 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                // span guard: the quantize reads ne10*ne11*ne12*ne13 elements at
+                // strides s11..s13 - a stale/corrupted src1 (full-dims metadata
+                // on a shard, e.g. the RS state gather dst) walks out of the
+                // allocation. Skip + zero the temp instead of faulting.
+                const int64_t q_max_read = (ne13-1)*s13 + (ne12-1)*s12 + (ne11-1)*s11 + ne10;
+                const int64_t q_span = (int64_t)(ggml_nbytes(src1) / ts_src1);
+                if (q_max_read > q_span) {
+                    fprintf(stderr, "MMQ_Q_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} nb={%zu,%zu,%zu,%zu} ne10=%lld ne11=%lld ne12=%lld ne13=%lld max_read=%lld span=%lld data=%p\n",
+                        src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+                        (size_t) src1->nb[0], (size_t) src1->nb[1], (size_t) src1->nb[2], (size_t) src1->nb[3],
+                        (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                        (long long) q_max_read, (long long) q_span, src1->data);
+                    CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get(), 0, ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block, stream));
+                } else {
+                    quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                           ne11, ne12, ne13, stream);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
         }

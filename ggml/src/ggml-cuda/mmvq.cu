@@ -1231,11 +1231,14 @@ void ggml_cuda_mul_mat_vec_q(
         // quantize zeros instead of crashing; the wrong result is caught by the
         // MTP verification, the server survives.
         const int64_t x_elems = ggml_nelements(src1);
-        const int64_t x_max_read = (ne11 - 1) * s11 + ne10;
-        if (x_max_read > x_elems) {
-            fprintf(stderr, "MMVQ_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} ne10=%lld ne11=%lld s11=%lld max_read=%lld elems=%lld\n",
+        // span (nbytes) is the bound for non-contiguous views; cover all dims
+        const int64_t x_max_read = (ne13 - 1) * s13 + (ne12 - 1) * s12 + (ne11 - 1) * s11 + ne10;
+        const int64_t x_span = (int64_t)(ggml_nbytes(src1) / ts_src1);
+        if (x_max_read > x_span) {
+            fprintf(stderr, "MMVQ_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} ne10=%lld ne11=%lld ne12=%lld ne13=%lld s11=%lld s12=%lld s13=%lld max_read=%lld span=%lld nelems=%lld\n",
                 src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
-                (long long) ne10, (long long) ne11, (long long) s11, (long long) x_max_read, (long long) x_elems);
+                (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
+                (long long) s11, (long long) s12, (long long) s13, (long long) x_max_read, (long long) x_span, (long long) x_elems);
             CUDA_CHECK(cudaMemsetAsync(src1_q8_1.get(), 0, ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1, stream));
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);

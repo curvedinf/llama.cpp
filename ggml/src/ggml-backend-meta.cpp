@@ -1309,10 +1309,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
-        if (getenv("LLAMA_META_TRACE") != nullptr && tensor->op == GGML_OP_RESHAPE && tensor->ne[0] == 786432) {
-            fprintf(stderr, "META_CREATE: %s p=%p -> t_ij=%p data=%p ne={%ld,%ld,%ld,%ld} src_ne={%ld,%ld,%ld,%ld} split(axis=%d ne=[", tensor->name, (void*) tensor, (void*) t_ij, (void*) t_ij->data,
+        if (getenv("LLAMA_META_TRACE") != nullptr && ((tensor->op == GGML_OP_RESHAPE && tensor->ne[0] == 786432) || strstr(tensor->name, "Qcur") != nullptr)) {
+            fprintf(stderr, "META_CREATE: %s p=%p -> t_ij=%p data=%p ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} src_ne={%ld,%ld,%ld,%ld} src_nb={%zu,%zu,%zu,%zu} split(axis=%d ne=[", tensor->name, (void*) tensor, (void*) t_ij, (void*) t_ij->data,
                 (long) ne[0], (long) ne[1], (long) ne[2], (long) ne[3],
-                (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3], split_state.axis);
+                nb[0], nb[1], nb[2], nb[3],
+                (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3],
+                tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3], split_state.axis);
             for (size_t k = 0; k < n_simple_bufs; k++) fprintf(stderr, "%s%ldx%u", k ? "," : "", (long) split_state.ne[k], split_state.nr[0]);
             fprintf(stderr, "]) stc=%s vsrc=%p voffs=%zu\n", (&stc == &buf_ctx->stc_static) ? "static" : "compute",
                 (void*) tensor->view_src, tensor->view_offs);
@@ -2091,7 +2093,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = getenv("LLAMA_META_ALWAYS_REBUILD") != nullptr || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    // A missing uid container means the STC cap evicted this graph while the
+    // llama graph cache still uses it: the cached subgraph nodes then alias
+    // recycled container memory (alien ne -> the 384/768-row gather/conv
+    // launches). Rebuild re-creates the container so the dispatch resolves
+    // owned copies instead of the aliases.
+    bool needs_rebuild = getenv("LLAMA_META_ALWAYS_REBUILD") != nullptr || (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    if (!needs_rebuild && cgraph->uid != 0) {
+        std::set<ggml_backend_buffer_t> used_buffers;
+        for (int i = 0; i < cgraph->n_leafs; i++) {
+            if (cgraph->leafs[i] != nullptr && ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
+                used_buffers.emplace(cgraph->leafs[i]->buffer);
+            }
+        }
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i] != nullptr && ggml_backend_buffer_is_meta(cgraph->nodes[i]->buffer)) {
+                used_buffers.emplace(cgraph->nodes[i]->buffer);
+            }
+        }
+        for (ggml_backend_buffer_t buf : used_buffers) {
+            ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
+            if (buf_ctx->stc_compute.find(cgraph->uid) == buf_ctx->stc_compute.end()) {
+                needs_rebuild = true;
+                break;
+            }
+        }
+    }
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2699,7 +2726,62 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         ggml_tensor * expected = nullptr;
                         if (orig->src[s] != nullptr) {
                             if (ggml_backend_buffer_is_meta(orig->src[s]->buffer)) {
-                                expected = ggml_backend_meta_buffer_simple_tensor(orig->src[s], j);
+                                // resolve WITHOUT the volatile staging fallback:
+                                // the staging container is reset by every other
+                                // graph's rebuild, so a copy found only there is
+                                // garbage by dispatch time. If no owned copy
+                                // exists, create one in THIS graph's uid container
+                                // and re-sync input leafs from the original (its
+                                // host buffer still holds the set_input fill).
+                                ggml_backend_meta_buffer_context * sbuf_ctx =
+                                    (ggml_backend_meta_buffer_context *) orig->src[s]->buffer->context;
+                                const ggml_meta_tensor_key src_key = ggml_meta_tensor_key_of(orig->src[s]);
+                                auto it_st = sbuf_ctx->stc_static.simple_tensors.find(src_key);
+                                if (it_st != sbuf_ctx->stc_static.simple_tensors.end()) {
+                                    expected = it_st->second[j];
+                                } else {
+                                    auto it_uid = sbuf_ctx->stc_compute.find(cgraph->uid);
+                                    if (it_uid != sbuf_ctx->stc_compute.end()) {
+                                        auto it_src = it_uid->second.simple_tensors.find(src_key);
+                                        if (it_src != it_uid->second.simple_tensors.end()) {
+                                            expected = it_src->second[j];
+                                        }
+                                    }
+                                }
+                                if (expected == nullptr) {
+                                    auto it_uid = sbuf_ctx->stc_compute.find(cgraph->uid);
+                                    if (it_uid != sbuf_ctx->stc_compute.end() && !it_uid->second.ctxs.empty()) {
+                                        if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                            fprintf(stderr, "SRC_CREATE: j=%zu i=%zu k2=%zu node=%s src%d orig=%s\n",
+                                                j, i, k2, orig->name, s, orig->src[s]->name);
+                                        }
+                                        ggml_backend_meta_buffer_init_tensor_impl(it_uid->second, orig->src[s]);
+                                        auto it_src = it_uid->second.simple_tensors.find(src_key);
+                                        if (it_src != it_uid->second.simple_tensors.end()) {
+                                            expected = it_src->second[j];
+                                        }
+                                    }
+                                }
+                                // input leafs (and views of input leafs) must carry
+                                // the set_input fill in the copy the kernel reads.
+                                // The async fill can land in the volatile staging
+                                // container (or a previous build's copy) - re-sync
+                                // here from the original's buffer, which always
+                                // holds the current fill.
+                                const bool is_input = (orig->src[s]->flags & GGML_TENSOR_FLAG_INPUT) != 0 ||
+                                    (orig->src[s]->view_src != nullptr &&
+                                     (orig->src[s]->view_src->flags & GGML_TENSOR_FLAG_INPUT) != 0);
+                                // input leafs are host-filled by set_input by
+                                // construction; the "host buffer" check is wrong
+                                // for meta-buffer inputs (s_copy etc.) whose data
+                                // region is host-addressable but not flagged host
+                                if (expected != nullptr && is_input && orig->src[s]->data != nullptr && expected->data != nullptr) {
+                                    if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                        fprintf(stderr, "SRC_SYNC: j=%zu i=%zu k2=%zu node=%s src%d orig=%s copy=%p nbytes=%zu\n",
+                                            j, i, k2, orig->name, s, orig->src[s]->name, (void *) expected, ggml_nbytes(expected));
+                                    }
+                                    ggml_backend_tensor_set(expected, orig->src[s]->data, 0, ggml_nbytes(expected));
+                                }
                             } else {
                                 // src outside the meta buffer is shared as-is - a
                                 // nullptr here made the device op dereference a null
@@ -2746,6 +2828,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                                     j, i, k2, orig->name, s, (void *) cached->src[s], (void *) expected);
                             }
                             cached->src[s] = expected;
+                        }
+                    }
+                    // a view's data pointer is baked at creation against the view
+                    // source's per-GPU copy; a container rebuild re-creates that
+                    // copy at a new device address, leaving the view reading
+                    // recycled arena memory (observed as ±0.0625 garbage row ids
+                    // in the RS s_copy gather, then OOB conv sidx and gather
+                    // faults). Refresh view_src and the data pointer from the
+                    // current copy of the original's view source.
+                    if (cached->view_src != nullptr && orig->view_src != nullptr &&
+                            ggml_backend_buffer_is_meta(orig->view_src->buffer)) {
+                        ggml_tensor * cur_vsrc = ggml_backend_meta_buffer_simple_tensor(orig->view_src, j);
+                        if (cur_vsrc != nullptr && cur_vsrc != cached->view_src) {
+                            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                fprintf(stderr, "VIEW_REFRESH: j=%zu i=%zu k2=%zu node=%s vsrc=%p -> %p data=%p -> %p\n",
+                                    j, i, k2, orig->name, (void *) cached->view_src, (void *) cur_vsrc,
+                                    (void *) cached->data, (void *) ((char *) cur_vsrc->data + cached->view_offs));
+                            }
+                            cached->view_src = cur_vsrc;
+                            cached->data = (char *) cur_vsrc->data + cached->view_offs;
                         }
                     }
                 }

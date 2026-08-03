@@ -340,19 +340,88 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
             fprintf(stderr, "\n");
         }
 
+        // stale-copy early-out: n_s can only be the batch's sequence count
+        // (<= n_parallel); an impossible n_s means the executed node carries
+        // recycled/garbage metadata - skip the launch entirely and dump the
+        // full provenance (the launch itself faults or hangs otherwise)
+        if (n_s > 64) {
+            const int32_t * sidx_p = (const int32_t *) src3->data;
+            fprintf(stderr, "CONV_STALE: nr=%ld n_t=%ld n_s=%ld nc=%ld fresh=%x | out=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src0=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | src1=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | src2=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | src3=%s ne={%ld,%ld,%ld,%ld} data=%p | sidx=[",
+                (long) nr, (long) n_t, (long) n_s, (long) nc, fresh_mask,
+                out->name, (long) out->ne[0], (long) out->ne[1], (long) out->ne[2], (long) out->ne[3],
+                out->nb[0], out->nb[1], out->nb[2], out->nb[3], out->data,
+                out->buffer ? ggml_backend_buffer_name(out->buffer) : "none",
+                out->buffer ? ggml_backend_buffer_get_base(out->buffer) : nullptr,
+                out->buffer ? ggml_backend_buffer_get_size(out->buffer) : 0,
+                src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+                src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "none",
+                src0->buffer ? ggml_backend_buffer_get_base(src0->buffer) : nullptr,
+                src0->buffer ? ggml_backend_buffer_get_size(src0->buffer) : 0,
+                src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data,
+                src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "none",
+                src1->buffer ? ggml_backend_buffer_get_base(src1->buffer) : nullptr,
+                src1->buffer ? ggml_backend_buffer_get_size(src1->buffer) : 0,
+                src2->name, (long) src2->ne[0], (long) src2->ne[1], (long) src2->ne[2], (long) src2->ne[3], src2->data,
+                src2->buffer ? ggml_backend_buffer_name(src2->buffer) : "none",
+                src2->buffer ? ggml_backend_buffer_get_base(src2->buffer) : nullptr,
+                src2->buffer ? ggml_backend_buffer_get_size(src2->buffer) : 0,
+                src3->name, (long) src3->ne[0], (long) src3->ne[1], (long) src3->ne[2], (long) src3->ne[3], src3->data);
+            const int64_t n_sidx = std::min<int64_t>(src3->ne[0], 32);
+            for (int64_t i = 0; i < n_sidx; ++i) {
+                fprintf(stderr, "%s%d", i ? "," : "", sidx_p[i]);
+            }
+            fprintf(stderr, "]\n");
+            return;
+        }
+
         // T1 guard: the kernel reads/writes state channels r*(nc-1)+c for r<nr
         // and row sidx[bidx]. Under the meta backend a full-width nr can arrive
         // with a sharded store (per-GPU ne[0] smaller) -> OOB. Detect and skip
         // (zero the output) instead of faulting; the MTP verification catches
         // the wrong result, the server survives.
         const int64_t src0_max_read = (int64_t)(n_s-1)*src0->nb[2] + (int64_t)(nr-1)*src0->nb[1] + n_t*(int64_t)src0->nb[0];
-        if (nr * (nc - 1) > src2->ne[0] || n_s > src2->ne[1] || src0_max_read > (int64_t) ggml_nbytes(src0)) {
-            fprintf(stderr, "CONV_GUARD: nr=%ld n_t=%ld n_s=%ld nc=%ld store_ne={%ld,%ld} src0=%s ne={%ld,%ld,%ld,%ld} nb1=%zu nb2=%zu nbytes=%zu max_read=%ld\n",
+        const int64_t src1_max_read = (int64_t)(nr-1)*src1->nb[1] + nc*(int64_t)src1->nb[0];
+        const int64_t dst_max_write = (int64_t)(n_s-1)*out->nb[2] + (int64_t)(n_t-1)*out->nb[1] + nr*(int64_t)out->nb[0];
+        // metadata can be self-consistent while the BUFFER is a per-GPU shard
+        // (full dims on shard data) - compare the access range against the
+        // buffer base+size, the definitive bound
+        const auto buf_has = [](const ggml_tensor * t, size_t max_access) -> bool {
+            if (t->buffer == nullptr || t->data == nullptr) {
+                return true;
+            }
+            const char * base = (const char *) ggml_backend_buffer_get_base(t->buffer);
+            const size_t  size = ggml_backend_buffer_get_size(t->buffer);
+            if (base == nullptr) {
+                return true;
+            }
+            const ptrdiff_t off = (const char *) t->data - base;
+            return off >= 0 && (size_t) off + max_access <= size;
+        };
+        const bool guard_buf = !buf_has(src0, src0_max_read) || !buf_has(src1, src1_max_read) ||
+                               !buf_has(out,  dst_max_write) ||
+                               !buf_has(src2, (size_t)(src2->ne[1]-1)*src2->nb[1] + (size_t)(nr*(nc-1))*src2->nb[0]);
+        if (nr * (nc - 1) > src2->ne[0] || n_s > src2->ne[1] || src0_max_read > (int64_t) ggml_nbytes(src0) ||
+                src1_max_read > (int64_t) ggml_nbytes(src1) || dst_max_write > (int64_t) ggml_nbytes(out) || guard_buf) {
+            fprintf(stderr, "CONV_GUARD: nr=%ld n_t=%ld n_s=%ld nc=%ld store_ne={%ld,%ld} src0=%s ne={%ld,%ld,%ld,%ld} nb1=%zu nb2=%zu nbytes=%zu max_read=%ld | src1=%s ne={%ld,%ld,%ld,%ld} nb1=%zu nbytes=%zu w_max_read=%ld | out=%s nbytes=%zu dst_max_write=%ld bufguard=%d\n",
                 (long) nr, (long) n_t, (long) n_s, (long) nc,
                 (long) src2->ne[0], (long) src2->ne[1], src0->name,
                 (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3],
-                (size_t) src0->nb[1], (size_t) src0->nb[2], ggml_nbytes(src0), (long) src0_max_read);
-            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(out), stream));
+                (size_t) src0->nb[1], (size_t) src0->nb[2], ggml_nbytes(src0), (long) src0_max_read,
+                src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3],
+                (size_t) src1->nb[1], ggml_nbytes(src1), (long) src1_max_read,
+                out->name, ggml_nbytes(out), (long) dst_max_write, (int) guard_buf);
+            // clamp the zero to the buffer range: out can be full-dims on a
+            // shard, and zeroing ggml_nbytes(out) from a shard pointer faults
+            size_t zero_n = ggml_nbytes(out);
+            if (out->buffer != nullptr) {
+                const char * base = (const char *) ggml_backend_buffer_get_base(out->buffer);
+                const size_t  size = ggml_backend_buffer_get_size(out->buffer);
+                const ptrdiff_t off = (const char *) out->data - base;
+                if (base != nullptr && off >= 0) {
+                    zero_n = std::min(zero_n, size - (size_t) off);
+                }
+            }
+            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, zero_n, stream));
             return;
         }
 
@@ -400,6 +469,29 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
         GGML_ASSERT(bias->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(bias));
         GGML_ASSERT(ggml_nelements(bias) == nr);
+    }
+
+    // stale-copy early-out (non-indexed path, n_rs_seq>0 rollback): n_s is the
+    // batch's sequence count (<= n_parallel); an impossible value means the
+    // executed node carries recycled/garbage metadata - dump provenance and
+    // skip instead of launching a faulting kernel
+    if (n_s > 64) {
+        fprintf(stderr, "CONV_STALE: nr=%ld n_t=%ld n_s=%ld nc=%ld | out=%s ne={%ld,%ld,%ld,%ld} nb={%zu,%zu,%zu,%zu} data=%p buf=%s base=%p size=%zu | src0=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu | src1=%s ne={%ld,%ld,%ld,%ld} data=%p buf=%s base=%p size=%zu\n",
+            (long) nr, (long) n_t, (long) n_s, (long) nc,
+            out->name, (long) out->ne[0], (long) out->ne[1], (long) out->ne[2], (long) out->ne[3],
+            out->nb[0], out->nb[1], out->nb[2], out->nb[3], out->data,
+            out->buffer ? ggml_backend_buffer_name(out->buffer) : "none",
+            out->buffer ? ggml_backend_buffer_get_base(out->buffer) : nullptr,
+            out->buffer ? ggml_backend_buffer_get_size(out->buffer) : 0,
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+            src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "none",
+            src0->buffer ? ggml_backend_buffer_get_base(src0->buffer) : nullptr,
+            src0->buffer ? ggml_backend_buffer_get_size(src0->buffer) : 0,
+            src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data,
+            src1->buffer ? ggml_backend_buffer_name(src1->buffer) : "none",
+            src1->buffer ? ggml_backend_buffer_get_base(src1->buffer) : nullptr,
+            src1->buffer ? ggml_backend_buffer_get_size(src1->buffer) : 0);
+        return;
     }
 
     if (fuse_silu) {

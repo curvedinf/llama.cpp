@@ -1,5 +1,22 @@
 #include "norm.cuh"
 #include <cstdint>
+#include <algorithm>
+
+// clamp a zero-fill to the tensor's buffer range: a full-dims tensor can carry
+// a per-GPU shard data pointer (meta backend), and zeroing ggml_nbytes would
+// itself fault - the guards below rely on this
+static void ggml_cuda_guard_zero(cudaStream_t stream, const ggml_tensor * t, float * data) {
+    size_t n = ggml_nbytes(t);
+    if (t->buffer != nullptr) {
+        const char * base = (const char *) ggml_backend_buffer_get_base(t->buffer);
+        const size_t  size = ggml_backend_buffer_get_size(t->buffer);
+        const ptrdiff_t off = (const char *) data - base;
+        if (base != nullptr && off >= 0 && (size_t) off < size) {
+            n = std::min(n, size - (size_t) off);
+        }
+    }
+    CUDA_CHECK(cudaMemsetAsync(data, 0, n, stream));
+}
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -511,12 +528,15 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // T1 guard: full-dims-on-shard views (meta backend) make the strided reads
     // walk out of bounds; skip (zero dst) instead of faulting.
     const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
-    const int64_t x_elems = ggml_nelements(src0);
-    if (x_max_read > x_elems) {
-        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld\n",
+    // the bound is the stride span (nbytes), not nelements: non-contiguous
+    // views (QG-fused strides) have nelements < span - comparing against
+    // nelements false-fired on every valid view and zeroed the norm output
+    const int64_t x_span = (int64_t)(ggml_nbytes(src0) / ts0);
+    if (x_max_read > x_span) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld span=%ld nelems=%ld\n",
             src0->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
-            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems);
-        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_span, (long) ggml_nelements(src0));
+        ggml_cuda_guard_zero(stream, dst, dst_d);
         return;
     }
 
@@ -583,17 +603,17 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // walk out of bounds; skip (zero dst) instead of faulting. Cover the mul
     // operand too (its strides come from the same split state).
     const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
-    const int64_t x_elems = ggml_nelements(rms_norm_src);
+    const int64_t x_span = (int64_t)(ggml_nbytes(rms_norm_src) / ts0);
     const int64_t mul_max_read = (int64_t)(mul_nsamples-1)*mul_s03 + (int64_t)(mul_nchannels-1)*mul_s02 +
                                  (int64_t)(mul_nrows-1)*mul_s01 + mul_ncols;
-    const int64_t mul_elems = ggml_nelements(mul_src);
-    if (x_max_read > x_elems || mul_max_read > mul_elems) {
-        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_elems=%ld\n",
+    const int64_t mul_span = (int64_t)(ggml_nbytes(mul_src) / ts_mul);
+    if (x_max_read > x_span || mul_max_read > mul_span) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld span=%ld nelems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_span=%ld mul_nelems=%ld\n",
             rms_norm_src->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
-            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems,
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_span, (long) ggml_nelements(rms_norm_src),
             mul_src->name, (long) mul_ncols, (long) mul_nrows, (long) mul_nchannels, (long) mul_nsamples,
-            (long) mul_max_read, (long) mul_elems);
-        CUDA_CHECK(cudaMemsetAsync(mul_tensor->data, 0, ggml_nbytes(mul_tensor), stream));
+            (long) mul_max_read, (long) mul_span, (long) ggml_nelements(mul_src));
+        ggml_cuda_guard_zero(stream, mul_tensor, (float *) mul_tensor->data);
         return;
     }
 
@@ -678,17 +698,17 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
     // walk out of bounds; skip (zero dst) instead of faulting. Cover the mul
     // operand too (its strides come from the same split state).
     const int64_t x_max_read = (ne03-1)*s03 + (ne02-1)*s02 + (ne01-1)*s01 + ne00;
-    const int64_t x_elems = ggml_nelements(rms_norm_src);
+    const int64_t x_span = (int64_t)(ggml_nbytes(rms_norm_src) / ts0);
     const int64_t mul_max_read = (int64_t)(mul_nsamples-1)*mul_s03 + (int64_t)(mul_nchannels-1)*mul_s02 +
                                  (int64_t)(mul_nrows-1)*mul_s01 + mul_ncols;
-    const int64_t mul_elems = ggml_nelements(mul_src);
-    if (x_max_read > x_elems || mul_max_read > mul_elems) {
-        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld elems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_elems=%ld\n",
+    const int64_t mul_span = (int64_t)(ggml_nbytes(mul_src) / ts_mul);
+    if (x_max_read > x_span || mul_max_read > mul_span) {
+        fprintf(stderr, "RMSNORM_GUARD: src0=%s ne={%ld,%ld,%ld,%ld} s01=%ld s02=%ld s03=%ld max_read=%ld span=%ld nelems=%ld | mul=%s ne={%ld,%ld,%ld,%ld} mul_max_read=%ld mul_span=%ld mul_nelems=%ld\n",
             rms_norm_src->name, (long) ne00, (long) ne01, (long) ne02, (long) ne03,
-            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_elems,
+            (long) s01, (long) s02, (long) s03, (long) x_max_read, (long) x_span, (long) ggml_nelements(rms_norm_src),
             mul_src->name, (long) mul_ncols, (long) mul_nrows, (long) mul_nchannels, (long) mul_nsamples,
-            (long) mul_max_read, (long) mul_elems);
-        CUDA_CHECK(cudaMemsetAsync(mul_tensor->data, 0, ggml_nbytes(mul_tensor), stream));
+            (long) mul_max_read, (long) mul_span, (long) ggml_nelements(mul_src));
+        ggml_cuda_guard_zero(stream, mul_tensor, (float *) mul_tensor->data);
         return;
     }
 

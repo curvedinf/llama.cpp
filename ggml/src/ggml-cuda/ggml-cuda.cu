@@ -806,6 +806,14 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_cuda_set_device(ctx->device);
     ggml_backend_cuda_context * cuda_ctx = g_cuda_ctx_by_device[ctx->device];
     cudaStream_t stream = cuda_ctx ? cuda_ctx->stream() : cudaStreamPerThread;
+    if (getenv("LLAMA_GETTENSOR_TRACE") != nullptr) {
+        fprintf(stderr, "GETTENSOR: %s ne={%ld,%ld,%ld,%ld} data=%p off=%zu size=%zu buf=%s base=%p bufsize=%zu\n",
+            tensor->name, (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2], (long) tensor->ne[3],
+            tensor->data, offset, size,
+            tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "none",
+            tensor->buffer ? ggml_backend_buffer_get_base(tensor->buffer) : nullptr,
+            tensor->buffer ? ggml_backend_buffer_get_size(tensor->buffer) : 0);
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }

@@ -394,6 +394,20 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
+    // stale-size guard: the kernel iterates ne11*ne12_fdv.z flat rows into dst
+    // (grid.y = ne11). A recycled node's ne11 can be n_rs*128 (768 observed) -
+    // the dst writes walk the allocation. Skip + zero instead of faulting.
+    const int64_t dst_flat_rows = dst->ne[1] * dst->ne[2] * dst->ne[3];
+    if (ne11 * ne12 > dst_flat_rows || ne11 > 64 || ne12 > 64) {
+        fprintf(stderr, "GR_STALE: src0=%s ne={%ld,%ld,%ld,%ld} data=%p | src1=%s ne={%ld,%ld,%ld,%ld} data=%p ne11=%ld ne12=%ld dst_flat=%ld | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            src0->name, (long) src0->ne[0], (long) src0->ne[1], (long) src0->ne[2], (long) src0->ne[3], src0->data,
+            src1->name, (long) src1->ne[0], (long) src1->ne[1], (long) src1->ne[2], (long) src1->ne[3], src1->data,
+            (long) ne11, (long) ne12, (long) dst_flat_rows,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+        return;
+    }
+
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, src0->ne[1], nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }

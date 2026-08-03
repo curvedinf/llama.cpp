@@ -277,6 +277,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int64_t n_tokens = nev2;
     const int64_t n_seqs   = nev3;
 
+    if (getenv("LLAMA_GDN_DISP") != nullptr) {
+        fprintf(stderr, "GDN_DISP: S_v=%ld H=%ld n_tokens=%ld n_seqs=%ld K=%d | v=%s ne={%ld,%ld,%ld,%ld} data=%p | state=%s ne={%ld,%ld,%ld,%ld} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            (long) S_v, (long) H, (long) n_tokens, (long) n_seqs, ggml_get_op_params_i32(dst, 0),
+            src_v->name, (long) src_v->ne[0], (long) src_v->ne[1], (long) src_v->ne[2], (long) src_v->ne[3], src_v->data,
+            src_state->name, (long) src_state->ne[0], (long) src_state->ne[1], (long) src_state->ne[2], (long) src_state->ne[3], src_state->data,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+    }
+
     const bool kda = (src_g->ne[0] == S_v);
 
     GGML_ASSERT(neq1 == nek1);
@@ -381,6 +389,23 @@ static void ggml_cuda_op_gated_delta_net_idx_impl(ggml_backend_cuda_context & ct
     const int64_t H        = nev1;
     const int64_t n_tokens = nev2;
     const int64_t n_seqs   = nev3;
+
+    // stale-size guard: n_seqs is the batch's sequence count (<= n_parallel);
+    // an impossible value means the executed node carries recycled/garbage
+    // metadata (observed as 28 = 7*K for a 7-seq batch, faulting the GDN's
+    // state slot access). Skip the launch and dump the provenance.
+    if (n_seqs > 16 || n_tokens > 1024 || H > 4096 || S_v > 512) {
+        fprintf(stderr, "GDN_STALE: S_v=%ld H=%ld n_tokens=%ld n_seqs=%ld | v=%s ne={%ld,%ld,%ld,%ld} data=%p | state=%s ne={%ld,%ld,%ld,%ld} data=%p | sidx=%s ne={%ld,%ld,%ld,%ld} data=%p | dst=%s ne={%ld,%ld,%ld,%ld} data=%p\n",
+            (long) S_v, (long) H, (long) n_tokens, (long) n_seqs,
+            src_v->name, (long) src_v->ne[0], (long) src_v->ne[1], (long) src_v->ne[2], (long) src_v->ne[3], src_v->data,
+            src_state->name, (long) src_state->ne[0], (long) src_state->ne[1], (long) src_state->ne[2], (long) src_state->ne[3], src_state->data,
+            src_sidx ? src_sidx->name : "-",
+            src_sidx ? (long) src_sidx->ne[0] : 0, src_sidx ? (long) src_sidx->ne[1] : 0,
+            src_sidx ? (long) src_sidx->ne[2] : 0, src_sidx ? (long) src_sidx->ne[3] : 0,
+            src_sidx ? src_sidx->data : nullptr,
+            dst->name, (long) dst->ne[0], (long) dst->ne[1], (long) dst->ne[2], (long) dst->ne[3], dst->data);
+        return;
+    }
 
     const bool kda       = (src_g->ne[0] == S_v);
     const bool state_f16 = (src_state->type == GGML_TYPE_F16);

@@ -1234,7 +1234,16 @@ void ggml_cuda_mul_mat_vec_q(
         // span (nbytes) is the bound for non-contiguous views; cover all dims
         const int64_t x_max_read = (ne13 - 1) * s13 + (ne12 - 1) * s12 + (ne11 - 1) * s11 + ne10;
         const int64_t x_span = (int64_t)(ggml_nbytes(src1) / ts_src1);
-        if (x_max_read > x_span) {
+        // buffer-range check: full-dims metadata on a shard buffer has a
+        // consistent span yet the quantize walks the allocation
+        bool x_inbuf = true;
+        if (src1->buffer != nullptr && src1->data != nullptr) {
+            const char * xbase = (const char *) ggml_backend_buffer_get_base(src1->buffer);
+            const size_t  xsize = ggml_backend_buffer_get_size(src1->buffer);
+            const ptrdiff_t xoff = (const char *) src1->data - xbase;
+            x_inbuf = xbase != nullptr && xoff >= 0 && (size_t) xoff + (size_t) x_max_read * ts_src1 <= xsize;
+        }
+        if (x_max_read > x_span || !x_inbuf) {
             fprintf(stderr, "MMVQ_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} ne10=%lld ne11=%lld ne12=%lld ne13=%lld s11=%lld s12=%lld s13=%lld max_read=%lld span=%lld nelems=%lld\n",
                 src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
                 (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,

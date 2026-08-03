@@ -153,7 +153,16 @@ void ggml_cuda_mul_mat_q(
                 // allocation. Skip + zero the temp instead of faulting.
                 const int64_t q_max_read = (ne13-1)*s13 + (ne12-1)*s12 + (ne11-1)*s11 + ne10;
                 const int64_t q_span = (int64_t)(ggml_nbytes(src1) / ts_src1);
-                if (q_max_read > q_span) {
+                // buffer-range check: full-dims metadata on a shard buffer has a
+                // consistent span yet the access walks the allocation
+                bool q_inbuf = true;
+                if (src1->buffer != nullptr && src1->data != nullptr) {
+                    const char * qbase = (const char *) ggml_backend_buffer_get_base(src1->buffer);
+                    const size_t  qsize = ggml_backend_buffer_get_size(src1->buffer);
+                    const ptrdiff_t qoff = (const char *) src1->data - qbase;
+                    q_inbuf = qbase != nullptr && qoff >= 0 && (size_t) qoff + (size_t) q_max_read * ts_src1 <= qsize;
+                }
+                if (q_max_read > q_span || !q_inbuf) {
                     fprintf(stderr, "MMQ_Q_GUARD: src1=%s ne={%lld,%lld,%lld,%lld} nb={%zu,%zu,%zu,%zu} ne10=%lld ne11=%lld ne12=%lld ne13=%lld max_read=%lld span=%lld data=%p\n",
                         src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
                         (size_t) src1->nb[0], (size_t) src1->nb[1], (size_t) src1->nb[2], (size_t) src1->nb[3],

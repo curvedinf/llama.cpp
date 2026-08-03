@@ -1630,15 +1630,26 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                     // from the (re-pointed) view source copy
                     simple_tensor->data = (char *) simple_tensor->view_src->data + simple_tensor->view_offs;
                 } else {
-                    const char * rbase = (const char *) ggml_backend_buffer_get_base(simple_tensor->buffer);
-                    const ptrdiff_t cur_off = (const char *) simple_tensor->data - rbase;
-                    if (cur_off < (ptrdiff_t) buf_ctx->static_input_base) {
-                        const size_t off = buf_ctx->static_input_base + buf_ctx->stc_static.input_bump;
-                        buf_ctx->stc_static.input_bump += GGML_PAD(ggml_nbytes(simple_tensor), 4096);
-                        simple_tensor->data = (char *) rbase + off;
-                        if (getenv("LLAMA_META_TRACE") != nullptr) {
-                            fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p off=%zu bump=%zu\n",
-                                tensor->name, j, (void *) simple_tensor->data, off, buf_ctx->stc_static.input_bump);
+                    // input leafs only (the meta names them "leaf_*"): model
+                    // tensors live in the static range of the buffer, which
+                    // compute tensors never alias - re-pointing them (as done
+                    // for every mirrored copy) put the load-time H2D at an
+                    // address the HSA driver rejected ("invalid argument")
+                    const bool is_input_leaf = strstr(tensor->name, "#leaf_") != nullptr ||
+                                               strncmp(tensor->name, "leaf_", 5) == 0;
+                    if (is_input_leaf) {
+                        const char * rbase = (const char *) ggml_backend_buffer_get_base(simple_tensor->buffer);
+                        const ptrdiff_t cur_off = (const char *) simple_tensor->data - rbase;
+                        if (cur_off < (ptrdiff_t) buf_ctx->static_input_base) {
+                            const size_t off = buf_ctx->static_input_base + buf_ctx->stc_static.input_bump;
+                            buf_ctx->stc_static.input_bump += GGML_PAD(ggml_nbytes(simple_tensor), 4096);
+                            simple_tensor->data = (char *) rbase + off;
+                            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                                fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p off=%zu bump=%zu bufsize=%zu base=%p\n",
+                                    tensor->name, j, (void *) simple_tensor->data, off, buf_ctx->stc_static.input_bump,
+                                    ggml_backend_buffer_get_size(simple_tensor->buffer),
+                                    (void *) ggml_backend_buffer_get_base(simple_tensor->buffer));
+                            }
                         }
                     }
                 }
@@ -1882,16 +1893,19 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     // cannot clobber them anymore (the TP4 MTP timing race - the async
     // subgraph pipeline writes the colliding offset over the synced input).
     const size_t alloc_size = size + 128 + 16*1024*1024;
+    fprintf(stderr, "META_ALLOC: n_bufs=%zu size=%zu alloc_size=%zu\n", n_simple_bufts, size, alloc_size);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), alloc_size));
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
+    fprintf(stderr, "META_ALLOC: max_size=%zu\n", max_size);
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params, n_simple_bufts, bufs);
-    // the static-input reserve starts at the meta buffer's size (the buffers
-    // are allocated past it); the reserve is never handed out to compute
-    // tensors, so the input mirrors there cannot be aliased
-    buf_ctx->static_input_base = max_size;
+    // the static-input reserve = the allocation's tail (last 16 MB): the
+    // buffers are alloc_size = size + 128 + 16 MB, so [max_size - 16 MB,
+    // max_size) is past every compute tensor ([0, size)) but inside the
+    // allocation - an H2D past the reported size is rejected by the driver
+    buf_ctx->static_input_base = GGML_PAD(max_size - 16*1024*1024, 4096);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }

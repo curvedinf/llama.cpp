@@ -430,6 +430,12 @@ static ggml_meta_tensor_key ggml_meta_tensor_key_of(const ggml_tensor * t) {
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
     std::map<ggml_meta_tensor_key, std::vector<ggml_tensor *>> simple_tensors;
+    // bump allocator for the static container's INPUT copies: they live in the
+    // dedicated reserve region past the meta buffer's size, so no compute
+    // tensor can ever alias them (the async subgraph pipeline writes the
+    // colliding offset and clobbers the input mirror - the garbage sidx /
+    // out_ids under concurrent TP4 MTP)
+    size_t input_bump = 0;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -459,6 +465,10 @@ struct ggml_backend_meta_buffer_context {
     uint64_t current_uid = 0;
     ggml_init_params stc_params;
     size_t n_simple_bufts = 0;
+    // base of the static-input reserve region (== the meta buffer's size);
+    // the per-device buffers are sized past this so the reserve never aliases
+    // compute tensors
+    size_t static_input_base = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
     // FIXME
@@ -1357,6 +1367,22 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
                 + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
         }
+        // static-container INPUT copies live in the dedicated reserve region
+        // (past the meta buffer's size): the offset formula above aliases the
+        // compute tensors of other cached graphs, and the async subgraph
+        // pipeline writes the colliding offset over the input mirror (the
+        // +-0.0625 garbage sidx/out_ids under concurrent TP4 MTP)
+        if (t_ij->view_src == nullptr && simple_buf != nullptr &&
+                &stc == &buf_ctx->stc_static && (tensor->flags & GGML_TENSOR_FLAG_INPUT)) {
+            const size_t off = buf_ctx->static_input_base + stc.input_bump;
+            stc.input_bump += ggml_nbytes(t_ij);
+            t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf) + off;
+            if (getenv("LLAMA_META_TRACE") != nullptr) {
+                fprintf(stderr, "STATIC_INPUT: %s j=%zu data=%p base=%p off=%zu bump=%zu\n",
+                    tensor->name, j, (void *) t_ij->data,
+                    (void *) ggml_backend_buffer_get_base(simple_buf), off, stc.input_bump);
+            }
+        }
         t_ij->extra = tensor->extra;
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             t_ij->src[i] = tensor->src[i];
@@ -1813,13 +1839,21 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     // boundary by up to 16 bytes, which faults on HIP (HSA aperture violation -
     // the batch-size-dependent C>=6 concurrent crash: whichever graph layout
     // places the tail at the buffer end faults). Pad every per-device buffer.
-    const size_t alloc_size = size + 128;
+    // The static-input reserve (16 MB/GPU) gives the stable input mirrors a
+    // dedicated region past the meta buffer's size: cross-graph offset reuse
+    // cannot clobber them anymore (the TP4 MTP timing race - the async
+    // subgraph pipeline writes the colliding offset over the synced input).
+    const size_t alloc_size = size + 128 + 16*1024*1024;
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), alloc_size));
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, params, n_simple_bufts, bufs);
+    // the static-input reserve starts at the meta buffer's size (the buffers
+    // are allocated past it); the reserve is never handed out to compute
+    // tensors, so the input mirrors there cannot be aliased
+    buf_ctx->static_input_base = max_size;
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
